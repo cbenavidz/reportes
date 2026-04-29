@@ -163,8 +163,8 @@ st.dataframe(
     hide_index=True,
     use_container_width=True,
     column_config={
-        "Total": st.column_config.NumberColumn(format="$%.0f"),
-        "Saldo": st.column_config.NumberColumn(format="$%.0f"),
+        "Total": st.column_config.NumberColumn(format="$%,.0f"),
+        "Saldo": st.column_config.NumberColumn(format="$%,.0f"),
         "Días vencido": st.column_config.NumberColumn(format="%.0f"),
     },
 )

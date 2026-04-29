@@ -541,8 +541,8 @@ else:
         use_container_width=True,
         height=420,
         column_config={
-            "Monto": st.column_config.NumberColumn(format="$%.0f"),
-            "Saldo": st.column_config.NumberColumn(format="$%.0f"),
+            "Monto": st.column_config.NumberColumn(format="$%,.0f"),
+            "Saldo": st.column_config.NumberColumn(format="$%,.0f"),
             "Plazo (d)": st.column_config.NumberColumn(
                 format="%d",
                 help="Plazo nominal otorgado en el documento "

@@ -132,8 +132,8 @@ st.dataframe(
     use_container_width=True,
     height=500,
     column_config={
-        "Saldo": st.column_config.NumberColumn(format="$%.0f"),
-        "Vencido": st.column_config.NumberColumn(format="$%.0f"),
+        "Saldo": st.column_config.NumberColumn(format="$%,.0f"),
+        "Vencido": st.column_config.NumberColumn(format="$%,.0f"),
         "Score": st.column_config.NumberColumn(format="%.1f"),
     },
 )
@@ -175,6 +175,6 @@ else:
         hide_index=True,
         use_container_width=True,
         column_config={
-            "Saldo": st.column_config.NumberColumn(format="$%.0f"),
+            "Saldo": st.column_config.NumberColumn(format="$%,.0f"),
         },
     )

@@ -140,8 +140,8 @@ with col2:
         hide_index=True,
         use_container_width=True,
         column_config={
-            "saldo_total": st.column_config.NumberColumn("Saldo total", format="$%.0f"),
-            "monto_vencido": st.column_config.NumberColumn("Vencido", format="$%.0f"),
+            "saldo_total": st.column_config.NumberColumn("Saldo total", format="$%,.0f"),
+            "monto_vencido": st.column_config.NumberColumn("Vencido", format="$%,.0f"),
             "score_promedio": st.column_config.NumberColumn("Score prom.", format="%.1f"),
             "dias_mora_prom": st.column_config.NumberColumn("Mora prom. (días)", format="%.1f"),
             "pct_clientes": st.column_config.NumberColumn("% clientes", format="%.1f%%"),
@@ -222,9 +222,9 @@ st.dataframe(
     height=600,
     column_config={
         "Score": st.column_config.ProgressColumn(format="%.1f", min_value=0, max_value=100),
-        "Saldo": st.column_config.NumberColumn(format="$%.0f"),
-        "Vencido": st.column_config.NumberColumn(format="$%.0f"),
-        "Límite crédito": st.column_config.NumberColumn(format="$%.0f"),
+        "Saldo": st.column_config.NumberColumn(format="$%,.0f"),
+        "Vencido": st.column_config.NumberColumn(format="$%,.0f"),
+        "Límite crédito": st.column_config.NumberColumn(format="$%,.0f"),
         "% a tiempo": st.column_config.NumberColumn(format="%.0f%%"),
         "Plazo otorg. (d)": st.column_config.NumberColumn(format="%.0f"),
         "DSO (d)": st.column_config.NumberColumn(format="%.0f"),

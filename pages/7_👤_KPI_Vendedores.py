@@ -324,8 +324,8 @@ st.dataframe(
     use_container_width=True,
     height=min(580, 40 * len(tabla) + 50),
     column_config={
-        "Saldo": st.column_config.NumberColumn(format="$%.0f"),
-        "Vencido": st.column_config.NumberColumn(format="$%.0f"),
+        "Saldo": st.column_config.NumberColumn(format="$%,.0f"),
+        "Vencido": st.column_config.NumberColumn(format="$%,.0f"),
         "% vencido": st.column_config.NumberColumn(format="%.1f%%"),
         "% a tiempo": st.column_config.NumberColumn(format="%.0f%%"),
         "DSO pond. (d)": st.column_config.NumberColumn(format="%.0f"),
@@ -333,8 +333,8 @@ st.dataframe(
         "Score prom.": st.column_config.ProgressColumn(
             format="%.1f", min_value=0, max_value=100,
         ),
-        "Ventas crédito": st.column_config.NumberColumn(format="$%.0f"),
-        "Ticket prom.": st.column_config.NumberColumn(format="$%.0f"),
+        "Ventas crédito": st.column_config.NumberColumn(format="$%,.0f"),
+        "Ticket prom.": st.column_config.NumberColumn(format="$%,.0f"),
         "Plazo otorg. (d)": st.column_config.NumberColumn(format="%.0f"),
     },
 )
@@ -458,8 +458,8 @@ else:
         hide_index=True,
         use_container_width=True,
         column_config={
-            "Saldo": st.column_config.NumberColumn(format="$%.0f"),
-            "Vencido": st.column_config.NumberColumn(format="$%.0f"),
+            "Saldo": st.column_config.NumberColumn(format="$%,.0f"),
+            "Vencido": st.column_config.NumberColumn(format="$%,.0f"),
             "Score": st.column_config.NumberColumn(format="%.1f"),
         },
     )

@@ -143,10 +143,6 @@ INVOICE_LINE_FIELDS = [
     "quantity",
     "price_unit",
     "price_subtotal",          # subtotal sin signo (siempre positivo)
-    # ⚠️ price_subtotal_signed YA viene con signo correcto en account.move.line:
-    #     - positivo en out_invoice
-    #     - negativo en out_refund (NC restan automáticamente al sumar)
-    "price_subtotal_signed",
     "price_total",
     "discount",
     "date",                    # fecha contable (típicamente = invoice_date)
@@ -154,6 +150,11 @@ INVOICE_LINE_FIELDS = [
     "move_type",               # heredado del move padre
     "display_type",            # 'product' / 'line_section' / 'line_note' / etc.
 ]
+# Nota: `price_subtotal_signed` no existe en account.move.line en algunas
+# versiones de Odoo (Odoo 19 lo quitó). Lo construimos en post-procesamiento
+# multiplicando `price_subtotal` por el signo del move_type:
+#   out_invoice → +1, out_refund → −1
+# Así las NC restan automáticamente al sumar ventas.
 
 
 # ---------------------------------------------------------------------------
@@ -648,9 +649,22 @@ def _normalize_invoice_lines(records: list[dict]) -> pd.DataFrame:
 
     # Tipos numéricos
     for col in ["quantity", "price_unit", "price_subtotal",
-                "price_subtotal_signed", "price_total", "discount"]:
+                "price_total", "discount"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    # Construimos `price_subtotal_signed` manualmente porque algunas versiones
+    # de Odoo (incluyendo Odoo 19) no exponen ese campo en account.move.line.
+    #   out_invoice → +price_subtotal
+    #   out_refund  → −price_subtotal (NC restan al sumar)
+    #   otros tipos → +price_subtotal (defensa por si entra algo raro)
+    if "move_type" in df.columns and "price_subtotal" in df.columns:
+        sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
+        df["price_subtotal_signed"] = df["price_subtotal"] * sign
+    elif "price_subtotal" in df.columns:
+        df["price_subtotal_signed"] = df["price_subtotal"]
+    else:
+        df["price_subtotal_signed"] = 0.0
 
     # Fecha
     if "date" in df.columns:
