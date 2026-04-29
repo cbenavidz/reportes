@@ -584,8 +584,15 @@ def extract_invoice_lines(
         return df
 
     # Enriquecer con categoría de producto (un solo round-trip por todos los
-    # product_id distintos)
-    product_ids = df["product_id"].dropna().astype(int).unique().tolist()
+    # product_id distintos). Defensa contra NaN: algunas líneas pueden no
+    # tener product_id (descuentos, líneas manuales) y `int(NaN)` lanza error.
+    product_ids = (
+        df["product_id"]
+        .dropna()
+        .astype(int)
+        .unique()
+        .tolist()
+    )
     if product_ids:
         try:
             prod_records = client.search_read(
@@ -599,17 +606,34 @@ def extract_invoice_lines(
                 cid, cname = _unpack_m2o(p.get("categ_id"))
                 cat_map[int(p["id"])] = (cid, cname)
                 code_map[int(p["id"])] = p.get("default_code") or None
-            df["product_categ_id"] = (
-                df["product_id"].map(lambda i: cat_map.get(int(i), (None, None))[0])
-                if not df.empty else None
+            logger.info(
+                "Enriquecimiento productos: %d productos, %d categorías únicas",
+                len(cat_map),
+                len({c for c, _ in cat_map.values() if c}),
             )
-            df["product_categ_name"] = (
-                df["product_id"].map(lambda i: cat_map.get(int(i), (None, None))[1])
-                if not df.empty else None
-            )
-            df["product_default_code"] = df["product_id"].map(code_map)
+
+            def _cat_id(i):
+                if pd.isna(i):
+                    return None
+                return cat_map.get(int(i), (None, None))[0]
+
+            def _cat_name(i):
+                if pd.isna(i):
+                    return None
+                return cat_map.get(int(i), (None, None))[1]
+
+            def _code(i):
+                if pd.isna(i):
+                    return None
+                return code_map.get(int(i))
+
+            df["product_categ_id"] = df["product_id"].map(_cat_id)
+            df["product_categ_name"] = df["product_id"].map(_cat_name)
+            df["product_default_code"] = df["product_id"].map(_code)
         except Exception as exc:  # noqa: BLE001
-            logger.warning("No se pudo enriquecer categoría de productos: %s", exc)
+            logger.warning(
+                "No se pudo enriquecer categoría de productos: %s", exc, exc_info=True
+            )
             df["product_categ_id"] = None
             df["product_categ_name"] = None
             df["product_default_code"] = None
