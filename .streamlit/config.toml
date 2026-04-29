@@ -1,0 +1,23 @@
+# Configuración global de Streamlit. Aplica tanto en local como en
+# Streamlit Cloud. Las credenciales NUNCA van aquí — van en secrets.toml.
+
+[server]
+# Opcional: subir el límite del cuerpo de subida si en algún momento
+# subes Excel grandes. 200 MB es seguro para cargas típicas de cartera.
+maxUploadSize = 200
+
+# Headless = sin abrir browser local automáticamente. Útil en cloud.
+headless = true
+
+[browser]
+# Telemetría de uso a Streamlit. Apagada por privacidad.
+gatherUsageStats = false
+
+[theme]
+# Tema claro estilo dashboard ejecutivo. Cambia si quieres otro look.
+base = "light"
+primaryColor = "#1f4e79"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#1a1a1a"
+font = "sans serif"

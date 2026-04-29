@@ -1,0 +1,65 @@
+# Variables de entorno y secretos
+.env
+*.env
+!.env.example
+config/auth_config.yaml
+secrets/
+
+# Archivos personales con credenciales (notas, API keys sueltas, etc.)
+# CRÍTICO: nunca commitear archivos que contengan API keys o passwords.
+*.rtf
+*credenciales*
+*credencial*
+*api_key*
+*apikey*
+Calve_*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Cache local
+cache/
+*.cache
+*.pkl
+
+# Logs
+*.log
+logs/
+
+# Excel temporales
+~$*.xlsx
