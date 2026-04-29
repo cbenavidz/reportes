@@ -56,12 +56,157 @@ SALES_MOVE_TYPES = ("out_invoice", "out_refund")
 SALES_VALID_STATES = ("posted",)
 
 
+# Patrones de productos que NO son ingresos operacionales reales (recaudos
+# a terceros, papeles, trámites, etc.) y por lo tanto NO deben aparecer en
+# el informe de ventas como ventas de la empresa.
+#
+# El match es case-insensitive y se aplica vía regex contra:
+#   - product_name         (nombre del producto)
+#   - product_default_code (referencia interna)
+#   - name                 (descripción de la línea, por si la editaron)
+#
+# Caso del negocio: "SOAT1 PAPELES MOTOS 125<CC<180" — la empresa cobra el
+# SOAT al cliente y se lo entrega a la aseguradora; no es un ingreso real
+# de la operación. Lo mismo aplica a tarjeta de propiedad, tránsitos, etc.
+EXCLUDED_SALES_PATTERNS: tuple[str, ...] = (
+    r"\bSOAT\b",
+    r"PAPELES\s+MOTOS",
+)
+
+
 def _ensure_datetime(s: pd.Series) -> pd.Series:
     return pd.to_datetime(s, errors="coerce")
 
 
 def _safe_div(num: float, den: float) -> float:
     return float(num) / float(den) if den else 0.0
+
+
+def adjust_invoices_for_excluded_products(
+    invoices: pd.DataFrame,
+    invoice_lines: pd.DataFrame,
+    extra_patterns: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Devuelve una copia de `invoices` con `amount_total_signed` ajustado
+    para descontar las líneas de productos excluidos (SOAT, papeles, etc.).
+
+    El ajuste es por factura:
+        amount_total_signed_ajustado = amount_total_signed
+                                       − sum(price_subtotal_signed de líneas excluidas en esa factura)
+
+    Esto permite que los KPIs principales (que se calculan sobre
+    account.move, no sobre líneas) también respeten la exclusión sin
+    necesidad de recalcular todo desde las líneas.
+
+    Las facturas que tras el ajuste queden en monto 0 NO se eliminan; el
+    filtro de fechas/empresa/move_type ya hace la limpieza ulterior. Si
+    una factura tenía SOLO líneas excluidas, su `amount_total_signed`
+    queda en 0 y no contribuye a las ventas.
+
+    Si `invoice_lines` es None o no trae `move_id`, devuelve `invoices`
+    intacto (defensa para callers que no cargaron las líneas).
+    """
+    if invoices is None or invoices.empty:
+        return invoices if invoices is not None else pd.DataFrame()
+    if invoice_lines is None or invoice_lines.empty:
+        return invoices.copy()
+    if "move_id" not in invoice_lines.columns:
+        return invoices.copy()
+
+    patterns = list(EXCLUDED_SALES_PATTERNS)
+    if extra_patterns:
+        patterns.extend(p for p in extra_patterns if p)
+    if not patterns:
+        return invoices.copy()
+
+    combined = "|".join(f"(?:{p})" for p in patterns)
+    lines = invoice_lines.copy()
+    mask_excl = pd.Series(False, index=lines.index)
+    for col in ("product_name", "product_default_code", "name"):
+        if col in lines.columns:
+            col_match = (
+                lines[col]
+                .astype("string")
+                .fillna("")
+                .str.contains(combined, case=False, regex=True, na=False)
+            )
+            mask_excl = mask_excl | col_match
+
+    lines_excl = lines[mask_excl]
+    if lines_excl.empty:
+        return invoices.copy()
+
+    # Sumar monto excluido por move_id (factura)
+    excl_by_move = (
+        lines_excl.groupby("move_id")["price_subtotal_signed"]
+        .sum()
+        .to_dict()
+    )
+
+    out = invoices.copy()
+    if "id" in out.columns and "amount_total_signed" in out.columns:
+        ajustes = pd.to_numeric(out["id"], errors="coerce").map(excl_by_move).fillna(0.0)
+        out["amount_total_signed"] = (
+            pd.to_numeric(out["amount_total_signed"], errors="coerce") - ajustes
+        )
+        n_ajustadas = int((ajustes != 0).sum())
+        monto_ajustado = float(ajustes.sum())
+        if n_ajustadas:
+            logger.info(
+                "adjust_invoices_for_excluded_products: %d facturas ajustadas, "
+                "$%.0f descontados de productos excluidos",
+                n_ajustadas, monto_ajustado,
+            )
+    return out
+
+
+def filter_excluded_products(
+    invoice_lines: pd.DataFrame,
+    extra_patterns: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Devuelve `invoice_lines` sin las líneas de productos excluidos
+    (recaudos a terceros como SOAT, papeles, etc.).
+
+    El match se hace case-insensitive contra `product_name`,
+    `product_default_code` y `name`. Cualquier coincidencia con CUALQUIERA
+    de los patrones la saca del DataFrame.
+
+    Args:
+        invoice_lines: líneas de factura tal como las devuelve el extractor.
+        extra_patterns: patrones adicionales (además de EXCLUDED_SALES_PATTERNS).
+    """
+    if invoice_lines is None or invoice_lines.empty:
+        return invoice_lines if invoice_lines is not None else pd.DataFrame()
+
+    patterns = list(EXCLUDED_SALES_PATTERNS)
+    if extra_patterns:
+        patterns.extend(p for p in extra_patterns if p)
+    if not patterns:
+        return invoice_lines
+
+    combined = "|".join(f"(?:{p})" for p in patterns)
+    df = invoice_lines.copy()
+    mask_excl = pd.Series(False, index=df.index)
+    for col in ("product_name", "product_default_code", "name"):
+        if col in df.columns:
+            col_match = (
+                df[col]
+                .astype("string")
+                .fillna("")
+                .str.contains(combined, case=False, regex=True, na=False)
+            )
+            mask_excl = mask_excl | col_match
+
+    n_excl = int(mask_excl.sum())
+    if n_excl:
+        logger.info(
+            "filter_excluded_products: excluidas %d líneas (patrones: %s)",
+            n_excl,
+            ", ".join(patterns),
+        )
+    return df[~mask_excl].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -559,7 +704,19 @@ def compute_sales_by_product(
             "cantidad", "ventas_netas", "n_facturas", "participacion_pct"
         ])
 
-    df = invoice_lines.copy()
+    # Excluye SOAT, PAPELES MOTOS y otros recaudos a terceros que no son
+    # ingresos operacionales reales. Patrones configurables en
+    # EXCLUDED_SALES_PATTERNS al inicio de este módulo.
+    df = filter_excluded_products(invoice_lines)
+    if df.empty:
+        cols = (
+            ["product_id", "product_nombre"]
+            if group_by == "product"
+            else ["product_categ_id", "categoria_nombre"]
+        )
+        return pd.DataFrame(columns=cols + [
+            "cantidad", "ventas_netas", "n_facturas", "participacion_pct"
+        ])
 
     # Filtro por move_type / state (deben venir heredados del move)
     if "move_type" in df.columns:

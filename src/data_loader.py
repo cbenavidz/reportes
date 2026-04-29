@@ -337,10 +337,22 @@ def filter_analysis_by_vendedor(
     return out
 
 
+# Versión del schema de invoice_lines. Incrementar cuando se modifique la
+# estructura del DataFrame que devuelve `extract_invoice_lines` (nuevas
+# columnas, fixes de enriquecimiento, etc.). El número entra en la firma
+# de la función cacheada → Streamlit invalida el cache automáticamente
+# cuando cambie. Histórico:
+#   v1: versión inicial.
+#   v2: fix categoría producto (NaN en product_id) + price_subtotal_signed
+#       calculado en post-procesamiento (Odoo 19).
+INVOICE_LINES_CACHE_VERSION = 2
+
+
 @st.cache_data(ttl=900, show_spinner="Descargando líneas de factura (productos)...")
 def load_invoice_lines(
     months_back: int = 12,
     company_ids: tuple[int, ...] | None = None,
+    _cache_v: int = INVOICE_LINES_CACHE_VERSION,
 ) -> "pd.DataFrame":
     """
     Descarga líneas de factura (account.move.line con producto) para el
@@ -350,7 +362,9 @@ def load_invoice_lines(
     Odoo coincide con invoice_date del move padre). NO usa date_order
     (ese campo vive en sale.order y no aplica aquí).
 
-    Cache 15 min como el resto del pipeline.
+    Cache 15 min como el resto del pipeline. El parámetro `_cache_v`
+    sirve de cache-buster: cuando se incremente `INVOICE_LINES_CACHE_VERSION`
+    el cache se invalida automáticamente sin necesidad de reboot manual.
     """
     from datetime import date as _date, timedelta
     client = get_odoo_client()

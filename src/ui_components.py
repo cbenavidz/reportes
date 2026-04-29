@@ -135,6 +135,23 @@ def render_sidebar_filters() -> dict:
             "Últimos 6 meses": 180,
             "Últimos 3 meses": 90,
         }
+
+        st.markdown("---")
+        # Botón para forzar recarga desde Odoo. Limpia el caché de
+        # `@st.cache_data` (que dura 15 min por defecto). Útil si acabas
+        # de registrar facturas/pagos y quieres ver los datos al instante.
+        if st.button(
+            "🔄 Recargar datos de Odoo",
+            use_container_width=True,
+            help=(
+                "Borra el caché de la app y vuelve a descargar todo desde Odoo. "
+                "Tarda lo mismo que la primera carga (~30-60s). Úsalo después "
+                "de registrar facturas/pagos nuevos en Odoo."
+            ),
+        ):
+            st.cache_data.clear()
+            st.rerun()
+
         st.markdown("---")
 
     return {

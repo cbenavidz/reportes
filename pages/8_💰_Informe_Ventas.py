@@ -26,6 +26,8 @@ import streamlit as st
 from src.auth import logout_button, require_auth
 from src.data_loader import compute_full_analysis, load_invoice_lines
 from src.sales_analyzer import (
+    EXCLUDED_SALES_PATTERNS,
+    adjust_invoices_for_excluded_products,
     compute_sales_by_partner,
     compute_sales_by_product,
     compute_sales_by_vendedor,
@@ -50,7 +52,10 @@ st.caption(
     "Ventas facturadas (account.move) por período, vendedor, cliente y producto. "
     "**Fecha utilizada: fecha de FACTURA** (`invoice_date`), no fecha de orden. "
     "Las notas crédito (out_refund) restan automáticamente. Se mezclan ventas "
-    "de contado y crédito."
+    "de contado y crédito. **Productos excluidos** (recaudos a terceros, "
+    "no son ingresos operacionales reales): "
+    + ", ".join(p.replace("\\b", "").replace("\\s+", " ") for p in EXCLUDED_SALES_PATTERNS)
+    + "."
 )
 
 filters = render_sidebar_filters()
@@ -76,6 +81,29 @@ partners_all = data.get("raw_partners")
 if invoices_all is None or invoices_all.empty:
     st.info("No hay facturas disponibles en el rango cargado.")
     st.stop()
+
+# Cargar líneas de factura UNA sola vez para:
+#   1) ajustar `amount_total_signed` de cada factura descontando SOAT/papeles
+#      (afecta KPIs principales, mensual, vendedor y cliente).
+#   2) calcular las tablas por producto y categoría.
+# Si la carga falla (Odoo lento, etc.), seguimos sin filtro y mostramos
+# advertencia — el informe sigue siendo usable, solo no excluye SOAT.
+try:
+    invoice_lines_all = load_invoice_lines(
+        months_back=filters["months_back"],
+        company_ids=filters["company_ids"],
+    )
+except Exception as exc:  # noqa: BLE001
+    st.warning(
+        f"No se pudieron cargar las líneas de factura: {exc}. "
+        "El informe NO descontará SOAT/papeles esta vez."
+    )
+    invoice_lines_all = pd.DataFrame()
+
+if not invoice_lines_all.empty:
+    invoices_all = adjust_invoices_for_excluded_products(
+        invoices_all, invoice_lines_all
+    )
 
 # ---------------------------------------------------------------------------
 # Filtros propios del informe — período de ventas
@@ -458,14 +486,19 @@ with tab_prod:
     cargar = st.checkbox("Cargar análisis por producto", value=False,
                          key="cargar_prod")
     if cargar:
-        try:
-            lines = load_invoice_lines(
-                months_back=filters["months_back"],
-                company_ids=filters["company_ids"],
-            )
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"No se pudieron descargar líneas de factura: {exc}")
-            lines = pd.DataFrame()
+        # Reutilizamos las líneas ya cargadas arriba (evita un segundo
+        # round-trip a Odoo). Si por alguna razón están vacías, intentamos
+        # de nuevo.
+        lines = invoice_lines_all
+        if lines is None or lines.empty:
+            try:
+                lines = load_invoice_lines(
+                    months_back=filters["months_back"],
+                    company_ids=filters["company_ids"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"No se pudieron descargar líneas de factura: {exc}")
+                lines = pd.DataFrame()
 
         if lines is None or lines.empty:
             st.info("No hay líneas de factura en el período.")
@@ -512,14 +545,17 @@ with tab_cat:
     cargar_cat = st.checkbox("Cargar análisis por categoría", value=False,
                              key="cargar_cat")
     if cargar_cat:
-        try:
-            lines = load_invoice_lines(
-                months_back=filters["months_back"],
-                company_ids=filters["company_ids"],
-            )
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"No se pudieron descargar líneas de factura: {exc}")
-            lines = pd.DataFrame()
+        # Reutilizamos las líneas ya cargadas arriba.
+        lines = invoice_lines_all
+        if lines is None or lines.empty:
+            try:
+                lines = load_invoice_lines(
+                    months_back=filters["months_back"],
+                    company_ids=filters["company_ids"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"No se pudieron descargar líneas de factura: {exc}")
+                lines = pd.DataFrame()
 
         if lines is None or lines.empty:
             st.info("No hay líneas de factura en el período.")
