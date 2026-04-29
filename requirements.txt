@@ -1,8 +1,9 @@
-# Versiones probadas y compatibles con Python 3.9
-streamlit>=1.30,<1.38
-pandas>=2.0,<2.2
-numpy>=1.24,<2.0
-plotly>=5.17,<6.0
+# Dependencias mínimas, sin pinning agresivo, para que Streamlit Cloud
+# (Python 3.11–3.13) resuelva versiones compatibles automáticamente.
+streamlit>=1.36
+pandas>=2.0
+numpy>=1.24
+plotly>=5.17
 python-dotenv>=1.0
 openpyxl>=3.1
 xlsxwriter>=3.1
