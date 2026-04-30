@@ -28,12 +28,15 @@ from src.data_loader import compute_full_analysis, load_invoice_lines
 from src.sales_analyzer import (
     EXCLUDED_SALES_DEFAULT_CODES,
     compute_sales_by_partner,
+    compute_sales_by_partner_from_lines,
     compute_sales_by_product,
     compute_sales_by_vendedor,
+    compute_sales_by_vendedor_from_lines,
     compute_sales_growth,
     compute_sales_growth_from_lines,
     compute_sales_kpis,
     compute_sales_monthly,
+    compute_sales_monthly_from_lines,
     filter_sales_invoices,
     recompute_invoice_amounts_from_lines,
 )
@@ -382,12 +385,22 @@ months_show = st.slider(
     help="Tendencia histórica de ventas mensuales (basada en invoice_date).",
 )
 
-monthly = compute_sales_monthly(
-    invoices=invoices_all,
-    months=months_show,
-    cutoff_date=fecha_hasta,
-    company_ids=filters["company_ids"],
-)
+# Mensual desde líneas (consistente con KPI principal). Fallback a la
+# versión basada en facturas si no hay líneas cargadas.
+if not invoice_lines_all.empty:
+    monthly = compute_sales_monthly_from_lines(
+        invoice_lines=invoice_lines_all,
+        months=months_show,
+        cutoff_date=fecha_hasta,
+        company_ids=filters["company_ids"],
+    )
+else:
+    monthly = compute_sales_monthly(
+        invoices=invoices_all,
+        months=months_show,
+        cutoff_date=fecha_hasta,
+        company_ids=filters["company_ids"],
+    )
 
 if not monthly.empty:
     fig = go.Figure()
@@ -478,13 +491,23 @@ with tab_vend:
             )
             vendedor_names = dict(zip(tmp["user_id"].astype(int), tmp["user_name"]))
 
-    by_vend = compute_sales_by_vendedor(
-        invoices=invoices_all,
-        date_from=fecha_desde,
-        date_to=fecha_hasta,
-        company_ids=filters["company_ids"],
-        vendedor_names=vendedor_names or None,
-    )
+    if not invoice_lines_all.empty:
+        by_vend = compute_sales_by_vendedor_from_lines(
+            invoice_lines=invoice_lines_all,
+            invoices_for_user=invoices_all,
+            date_from=fecha_desde,
+            date_to=fecha_hasta,
+            company_ids=filters["company_ids"],
+            vendedor_names=vendedor_names or None,
+        )
+    else:
+        by_vend = compute_sales_by_vendedor(
+            invoices=invoices_all,
+            date_from=fecha_desde,
+            date_to=fecha_hasta,
+            company_ids=filters["company_ids"],
+            vendedor_names=vendedor_names or None,
+        )
 
     if by_vend.empty:
         st.info("No hay ventas en el período.")
@@ -528,13 +551,22 @@ with tab_vend:
 # --- Cliente (Pareto) ---
 with tab_clientes:
     top_n = st.slider("Top N clientes", 5, 100, 20, key="top_clientes")
-    by_part = compute_sales_by_partner(
-        invoices=invoices_all,
-        date_from=fecha_desde,
-        date_to=fecha_hasta,
-        company_ids=filters["company_ids"],
-        top_n=top_n,
-    )
+    if not invoice_lines_all.empty:
+        by_part = compute_sales_by_partner_from_lines(
+            invoice_lines=invoice_lines_all,
+            date_from=fecha_desde,
+            date_to=fecha_hasta,
+            company_ids=filters["company_ids"],
+            top_n=top_n,
+        )
+    else:
+        by_part = compute_sales_by_partner(
+            invoices=invoices_all,
+            date_from=fecha_desde,
+            date_to=fecha_hasta,
+            company_ids=filters["company_ids"],
+            top_n=top_n,
+        )
 
     if by_part.empty:
         st.info("No hay ventas en el período.")
@@ -746,13 +778,21 @@ if st.button("Generar Excel del informe", type="primary"):
         if not by_vend.empty:
             by_vend.to_excel(writer, sheet_name="Por vendedor", index=False)
 
-        # Recarga sin top_n para el export
-        by_part_full = compute_sales_by_partner(
-            invoices=invoices_all,
-            date_from=fecha_desde,
-            date_to=fecha_hasta,
-            company_ids=filters["company_ids"],
-        )
+        # Recarga sin top_n para el export — desde líneas para coincidencia.
+        if not invoice_lines_all.empty:
+            by_part_full = compute_sales_by_partner_from_lines(
+                invoice_lines=invoice_lines_all,
+                date_from=fecha_desde,
+                date_to=fecha_hasta,
+                company_ids=filters["company_ids"],
+            )
+        else:
+            by_part_full = compute_sales_by_partner(
+                invoices=invoices_all,
+                date_from=fecha_desde,
+                date_to=fecha_hasta,
+                company_ids=filters["company_ids"],
+            )
         if not by_part_full.empty:
             by_part_full.to_excel(writer, sheet_name="Por cliente", index=False)
 

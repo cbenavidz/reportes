@@ -459,6 +459,246 @@ def compute_sales_kpis_from_lines(
     )
 
 
+def _filter_lines_for_sales(
+    invoice_lines: pd.DataFrame,
+    date_from: date | pd.Timestamp | None = None,
+    date_to: date | pd.Timestamp | None = None,
+    company_ids: Iterable[int] | None = None,
+    extra_excluded_codes: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Helper común: filtra invoice_lines por estado, empresa, fecha y excluye
+    productos no operacionales. Usado por todas las funciones from_lines.
+    """
+    if invoice_lines is None or invoice_lines.empty:
+        return pd.DataFrame()
+
+    df = filter_excluded_products(invoice_lines, extra_codes=extra_excluded_codes)
+    if "move_type" in df.columns:
+        df = df[df["move_type"].isin(SALES_MOVE_TYPES)]
+    if "state" in df.columns:
+        df = df[df["state"].isin(SALES_VALID_STATES)]
+    if company_ids is not None and "company_id" in df.columns:
+        cset = set(int(c) for c in company_ids)
+        df = df[df["company_id"].isin(cset)]
+    if "invoice_date" in df.columns:
+        df = df.copy()
+        df["_d"] = pd.to_datetime(df["invoice_date"], errors="coerce")
+        df = df.dropna(subset=["_d"])
+        if date_from is not None:
+            df = df[df["_d"] >= pd.Timestamp(date_from)]
+        if date_to is not None:
+            df = df[df["_d"] <= pd.Timestamp(date_to)]
+    return df
+
+
+def compute_sales_monthly_from_lines(
+    invoice_lines: pd.DataFrame,
+    months: int = 12,
+    cutoff_date: date | None = None,
+    company_ids: Iterable[int] | None = None,
+) -> pd.DataFrame:
+    """
+    Tendencia mensual calculada desde líneas (consistente con KPIs).
+    Mismo formato de salida que `compute_sales_monthly`.
+    """
+    if cutoff_date is None:
+        cutoff_date = date.today()
+    cutoff_ts = pd.Timestamp(cutoff_date)
+    end_period = cutoff_ts.to_period("M").to_timestamp(how="end")
+    buffer_months = months + 12
+    start_period = (end_period.to_period("M") - (buffer_months - 1)).to_timestamp(how="start")
+
+    df = _filter_lines_for_sales(
+        invoice_lines, date_from=start_period, date_to=end_period, company_ids=company_ids,
+    )
+
+    full_index = pd.period_range(start=start_period, end=end_period, freq="M")
+    base = pd.DataFrame(index=full_index)
+    base.index.name = "mes"
+
+    if df.empty:
+        out = base.assign(
+            ventas_netas=0.0, ventas_brutas=0.0, notas_credito=0.0,
+            n_facturas=0, ticket_promedio=0.0,
+        ).reset_index()
+    else:
+        df["mes"] = df["_d"].dt.to_period("M")
+        is_fac = df["move_type"] == "out_invoice"
+        is_nc = df["move_type"] == "out_refund"
+
+        agg = pd.DataFrame({
+            "ventas_netas": df.groupby("mes")["price_subtotal_signed"].sum(),
+            "ventas_brutas": df.loc[is_fac].groupby("mes")["price_subtotal_signed"].sum(),
+            "nc_signed": df.loc[is_nc].groupby("mes")["price_subtotal_signed"].sum(),
+            "n_facturas": df.loc[is_fac].groupby("mes")["move_id"].nunique(),
+        })
+        agg = base.join(agg, how="left").fillna(0.0)
+        agg["notas_credito"] = agg["nc_signed"].abs()
+        agg["n_facturas"] = agg["n_facturas"].astype(int)
+        agg["ticket_promedio"] = np.where(
+            agg["n_facturas"] > 0,
+            agg["ventas_brutas"] / agg["n_facturas"].replace(0, np.nan),
+            0.0,
+        )
+        agg = agg.drop(columns=["nc_signed"])
+        out = agg.reset_index()
+
+    out["mes_label"] = out["mes"].astype(str)
+    out["var_mom"] = out["ventas_netas"].pct_change() * 100
+    out["var_yoy"] = out["ventas_netas"].pct_change(periods=12) * 100
+    out = out.tail(months).reset_index(drop=True)
+    return out
+
+
+def compute_sales_by_partner_from_lines(
+    invoice_lines: pd.DataFrame,
+    date_from: date | pd.Timestamp | None = None,
+    date_to: date | pd.Timestamp | None = None,
+    company_ids: Iterable[int] | None = None,
+    partner_names: dict[int, str] | None = None,
+    top_n: int | None = None,
+) -> pd.DataFrame:
+    """
+    Ventas por cliente con Pareto, calculado desde líneas.
+    """
+    df = _filter_lines_for_sales(invoice_lines, date_from, date_to, company_ids)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "partner_id", "partner_nombre", "ventas_netas", "ventas_brutas",
+            "notas_credito", "n_facturas", "ticket_promedio",
+            "participacion_pct", "participacion_acum_pct", "es_pareto_80",
+        ])
+
+    df = df.copy()
+    df["partner_id"] = pd.to_numeric(df["partner_id"], errors="coerce").fillna(-1).astype(int)
+    is_fac = df["move_type"] == "out_invoice"
+    is_nc = df["move_type"] == "out_refund"
+
+    grp = df.groupby("partner_id")
+    res = pd.DataFrame({
+        "ventas_netas": grp["price_subtotal_signed"].sum(),
+        "ventas_brutas": df.loc[is_fac].groupby("partner_id")["price_subtotal_signed"].sum(),
+        "nc_signed": df.loc[is_nc].groupby("partner_id")["price_subtotal_signed"].sum(),
+        "n_facturas": df.loc[is_fac].groupby("partner_id")["move_id"].nunique(),
+    }).fillna(0.0)
+    res["notas_credito"] = res["nc_signed"].abs()
+    res["n_facturas"] = res["n_facturas"].astype(int)
+    res["ticket_promedio"] = np.where(
+        res["n_facturas"] > 0,
+        res["ventas_brutas"] / res["n_facturas"].replace(0, np.nan),
+        0.0,
+    )
+
+    res = res.reset_index().sort_values("ventas_netas", ascending=False).reset_index(drop=True)
+
+    if partner_names is None and "partner_name" in df.columns:
+        partner_names = (
+            df.dropna(subset=["partner_name"])
+              .drop_duplicates("partner_id")
+              .set_index("partner_id")["partner_name"]
+              .to_dict()
+        )
+    if partner_names:
+        res["partner_nombre"] = res["partner_id"].map(partner_names).fillna("Sin nombre")
+    else:
+        res["partner_nombre"] = res["partner_id"].astype(str)
+
+    total = float(res["ventas_netas"].sum())
+    res["participacion_pct"] = (res["ventas_netas"] / total * 100) if total else 0.0
+    res["participacion_acum_pct"] = res["participacion_pct"].cumsum()
+    res["es_pareto_80"] = res["participacion_acum_pct"] <= 80.0
+
+    res = res.drop(columns=["nc_signed"])
+    if top_n is not None:
+        res = res.head(top_n)
+
+    return res[[
+        "partner_id", "partner_nombre", "ventas_netas", "ventas_brutas",
+        "notas_credito", "n_facturas", "ticket_promedio",
+        "participacion_pct", "participacion_acum_pct", "es_pareto_80",
+    ]]
+
+
+def compute_sales_by_vendedor_from_lines(
+    invoice_lines: pd.DataFrame,
+    invoices_for_user: pd.DataFrame,
+    date_from: date | pd.Timestamp | None = None,
+    date_to: date | pd.Timestamp | None = None,
+    company_ids: Iterable[int] | None = None,
+    vendedor_names: dict[int, str] | None = None,
+) -> pd.DataFrame:
+    """
+    Ventas por vendedor desde líneas. Como las líneas no traen
+    `invoice_user_id`, hacemos merge con `invoices_for_user` (que sí lo
+    tiene) por `move_id`.
+    """
+    df = _filter_lines_for_sales(invoice_lines, date_from, date_to, company_ids)
+    if df.empty:
+        return pd.DataFrame(columns=[
+            "vendedor_id", "vendedor_nombre", "ventas_netas", "ventas_brutas",
+            "notas_credito", "n_facturas", "ticket_promedio", "n_clientes",
+            "participacion_pct",
+        ])
+
+    # Cruzar con cabecera para obtener vendedor (invoice_user_id / user_id)
+    if invoices_for_user is None or invoices_for_user.empty:
+        df["vendedor_id"] = -1
+    else:
+        inv = invoices_for_user.copy()
+        # Resolvemos qué columna de vendedor usar (igual que en la versión legacy)
+        vid_col = None
+        for c in ("invoice_user_id", "user_id"):
+            if c in inv.columns:
+                vid_col = c
+                break
+        if vid_col is None:
+            df["vendedor_id"] = -1
+        else:
+            inv["_vid"] = pd.to_numeric(inv[vid_col], errors="coerce").fillna(-1).astype(int)
+            move_to_vid = inv.drop_duplicates("id").set_index("id")["_vid"].to_dict()
+            df = df.copy()
+            df["vendedor_id"] = (
+                pd.to_numeric(df["move_id"], errors="coerce").map(move_to_vid).fillna(-1).astype(int)
+            )
+
+    is_fac = df["move_type"] == "out_invoice"
+    is_nc = df["move_type"] == "out_refund"
+
+    grp = df.groupby("vendedor_id")
+    res = pd.DataFrame({
+        "ventas_netas": grp["price_subtotal_signed"].sum(),
+        "ventas_brutas": df.loc[is_fac].groupby("vendedor_id")["price_subtotal_signed"].sum(),
+        "nc_signed": df.loc[is_nc].groupby("vendedor_id")["price_subtotal_signed"].sum(),
+        "n_facturas": df.loc[is_fac].groupby("vendedor_id")["move_id"].nunique(),
+        "n_clientes": grp["partner_id"].nunique(),
+    }).fillna(0.0)
+    res["notas_credito"] = res["nc_signed"].abs()
+    res["n_facturas"] = res["n_facturas"].astype(int)
+    res["n_clientes"] = res["n_clientes"].astype(int)
+    res["ticket_promedio"] = np.where(
+        res["n_facturas"] > 0,
+        res["ventas_brutas"] / res["n_facturas"].replace(0, np.nan),
+        0.0,
+    )
+    total = float(res["ventas_netas"].sum())
+    res["participacion_pct"] = (res["ventas_netas"] / total * 100) if total else 0.0
+
+    res = res.reset_index()
+    if vendedor_names:
+        res["vendedor_nombre"] = res["vendedor_id"].map(vendedor_names).fillna("Sin vendedor")
+    else:
+        res["vendedor_nombre"] = res["vendedor_id"].astype(str)
+    res.loc[res["vendedor_id"] == -1, "vendedor_nombre"] = "Sin vendedor"
+
+    res = res.drop(columns=["nc_signed"])
+    return res.sort_values("ventas_netas", ascending=False).reset_index(drop=True)[[
+        "vendedor_id", "vendedor_nombre", "ventas_netas", "ventas_brutas",
+        "notas_credito", "n_facturas", "ticket_promedio", "n_clientes",
+        "participacion_pct",
+    ]]
+
+
 def compute_sales_growth_from_lines(
     invoice_lines: pd.DataFrame,
     date_from: date | pd.Timestamp,
