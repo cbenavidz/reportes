@@ -26,7 +26,7 @@ import streamlit as st
 from src.auth import logout_button, require_auth
 from src.data_loader import compute_full_analysis, load_invoice_lines
 from src.sales_analyzer import (
-    EXCLUDED_SALES_PATTERNS,
+    EXCLUDED_SALES_DEFAULT_CODES,
     adjust_invoices_for_excluded_products,
     compute_sales_by_partner,
     compute_sales_by_product,
@@ -56,9 +56,9 @@ st.caption(
     "Ventas facturadas (account.move) por período, vendedor, cliente y producto. "
     "**Fecha utilizada: fecha de FACTURA** (`invoice_date`), no fecha de orden. "
     "Las notas crédito (out_refund) restan automáticamente. Se mezclan ventas "
-    "de contado y crédito. **Productos excluidos** (recaudos a terceros, "
-    "no son ingresos operacionales reales): "
-    + ", ".join(p.replace("\\b", "").replace("\\s+", " ") for p in EXCLUDED_SALES_PATTERNS)
+    "de contado y crédito. **Productos excluidos por referencia interna** "
+    "(recaudos a terceros, no son ingresos operacionales reales): "
+    + ", ".join(f"`{c}`" for c in EXCLUDED_SALES_DEFAULT_CODES)
     + "."
 )
 

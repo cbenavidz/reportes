@@ -56,22 +56,34 @@ SALES_MOVE_TYPES = ("out_invoice", "out_refund")
 SALES_VALID_STATES = ("posted",)
 
 
-# Patrones de productos que NO son ingresos operacionales reales (recaudos
-# a terceros, papeles, trámites, etc.) y por lo tanto NO deben aparecer en
-# el informe de ventas como ventas de la empresa.
+# Productos que NO son ingresos operacionales reales (recaudos a terceros,
+# papeles, trámites, etc.) y NO deben aparecer en el informe de ventas.
 #
-# El match es case-insensitive y se aplica vía regex contra:
-#   - product_name         (nombre del producto)
-#   - product_default_code (referencia interna)
-#   - name                 (descripción de la línea, por si la editaron)
+# Se identifican por REFERENCIA INTERNA (`product.product.default_code`),
+# que es lo más confiable: no se ve afectada por cambios en el nombre del
+# producto ni por descripciones editadas en la factura.
 #
-# Caso del negocio: "SOAT1 PAPELES MOTOS 125<CC<180" — la empresa cobra el
-# SOAT al cliente y se lo entrega a la aseguradora; no es un ingreso real
-# de la operación. Lo mismo aplica a tarjeta de propiedad, tránsitos, etc.
-EXCLUDED_SALES_PATTERNS: tuple[str, ...] = (
-    r"\bSOAT\b",
-    r"PAPELES\s+MOTOS",
+# Match exacto, case-insensitive. Para agregar más, basta con sumar el
+# código a esta lista — no hay que tocar más código.
+#
+# Casos del negocio:
+#   - SOAT1 → SOAT (se cobra al cliente y se entrega a la aseguradora).
+#   - ANTCL → Andean Trust / cuota similar (recaudo a tercero).
+EXCLUDED_SALES_DEFAULT_CODES: tuple[str, ...] = (
+    "SOAT1",
+    "ANTCL",
 )
+
+# OPCIONAL: patrones extra contra `name` o `product_name` (por si una línea
+# trae el cobro pero NO tiene default_code asignado). Vacío por defecto;
+# usar solo si hay líneas sin product_id que igual hay que excluir.
+EXCLUDED_SALES_NAME_PATTERNS: tuple[str, ...] = ()
+
+
+# Alias retrocompatible — mantiene el nombre viejo para que el código que
+# importaba `EXCLUDED_SALES_PATTERNS` siga funcionando. Apunta a los codes
+# (que es la forma confiable).
+EXCLUDED_SALES_PATTERNS: tuple[str, ...] = EXCLUDED_SALES_DEFAULT_CODES
 
 
 def _ensure_datetime(s: pd.Series) -> pd.Series:
@@ -82,30 +94,74 @@ def _safe_div(num: float, den: float) -> float:
     return float(num) / float(den) if den else 0.0
 
 
+def _build_exclusion_mask(
+    lines: pd.DataFrame,
+    extra_codes: Iterable[str] | None = None,
+    extra_name_patterns: Iterable[str] | None = None,
+) -> pd.Series:
+    """
+    Construye la máscara booleana de líneas excluidas, combinando:
+      1) match EXACTO case-insensitive de `product_default_code` contra
+         EXCLUDED_SALES_DEFAULT_CODES (+ extra_codes).
+      2) match REGEX contra `product_name` / `name` con
+         EXCLUDED_SALES_NAME_PATTERNS (+ extra_name_patterns).
+
+    Si una línea cumple cualquiera de las dos condiciones, queda excluida.
+    """
+    mask = pd.Series(False, index=lines.index)
+
+    # 1) Match por default_code (referencia interna) — el camino confiable.
+    codes = {c.upper() for c in EXCLUDED_SALES_DEFAULT_CODES if c}
+    if extra_codes:
+        codes.update(c.upper() for c in extra_codes if c)
+    if codes and "product_default_code" in lines.columns:
+        norm = (
+            lines["product_default_code"]
+            .astype("string")
+            .fillna("")
+            .str.strip()
+            .str.upper()
+        )
+        mask = mask | norm.isin(codes)
+
+    # 2) Match por nombre/descripción (regex) — solo para casos sin code.
+    name_patterns = list(EXCLUDED_SALES_NAME_PATTERNS)
+    if extra_name_patterns:
+        name_patterns.extend(p for p in extra_name_patterns if p)
+    if name_patterns:
+        combined = "|".join(f"(?:{p})" for p in name_patterns)
+        for col in ("product_name", "name"):
+            if col in lines.columns:
+                mask = mask | (
+                    lines[col]
+                    .astype("string")
+                    .fillna("")
+                    .str.contains(combined, case=False, regex=True, na=False)
+                )
+
+    return mask
+
+
 def adjust_invoices_for_excluded_products(
     invoices: pd.DataFrame,
     invoice_lines: pd.DataFrame,
-    extra_patterns: Iterable[str] | None = None,
+    extra_codes: Iterable[str] | None = None,
+    extra_name_patterns: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     """
     Devuelve una copia de `invoices` con `amount_total_signed` ajustado
-    para descontar las líneas de productos excluidos (SOAT, papeles, etc.).
+    para descontar las líneas de productos excluidos (SOAT, ANTCL, etc.).
 
     El ajuste es por factura:
         amount_total_signed_ajustado = amount_total_signed
                                        − sum(price_subtotal_signed de líneas excluidas en esa factura)
 
-    Esto permite que los KPIs principales (que se calculan sobre
-    account.move, no sobre líneas) también respeten la exclusión sin
-    necesidad de recalcular todo desde las líneas.
-
-    Las facturas que tras el ajuste queden en monto 0 NO se eliminan; el
-    filtro de fechas/empresa/move_type ya hace la limpieza ulterior. Si
-    una factura tenía SOLO líneas excluidas, su `amount_total_signed`
-    queda en 0 y no contribuye a las ventas.
+    Identifica las líneas excluidas por REFERENCIA INTERNA exacta
+    (`product_default_code`), que es lo más confiable porque no depende
+    del nombre ni de descripciones editadas en la factura.
 
     Si `invoice_lines` es None o no trae `move_id`, devuelve `invoices`
-    intacto (defensa para callers que no cargaron las líneas).
+    intacto.
     """
     if invoices is None or invoices.empty:
         return invoices if invoices is not None else pd.DataFrame()
@@ -114,30 +170,13 @@ def adjust_invoices_for_excluded_products(
     if "move_id" not in invoice_lines.columns:
         return invoices.copy()
 
-    patterns = list(EXCLUDED_SALES_PATTERNS)
-    if extra_patterns:
-        patterns.extend(p for p in extra_patterns if p)
-    if not patterns:
-        return invoices.copy()
-
-    combined = "|".join(f"(?:{p})" for p in patterns)
-    lines = invoice_lines.copy()
-    mask_excl = pd.Series(False, index=lines.index)
-    for col in ("product_name", "product_default_code", "name"):
-        if col in lines.columns:
-            col_match = (
-                lines[col]
-                .astype("string")
-                .fillna("")
-                .str.contains(combined, case=False, regex=True, na=False)
-            )
-            mask_excl = mask_excl | col_match
-
-    lines_excl = lines[mask_excl]
+    mask_excl = _build_exclusion_mask(
+        invoice_lines, extra_codes=extra_codes, extra_name_patterns=extra_name_patterns
+    )
+    lines_excl = invoice_lines[mask_excl]
     if lines_excl.empty:
         return invoices.copy()
 
-    # Sumar monto excluido por move_id (factura)
     excl_by_move = (
         lines_excl.groupby("move_id")["price_subtotal_signed"]
         .sum()
@@ -155,58 +194,45 @@ def adjust_invoices_for_excluded_products(
         if n_ajustadas:
             logger.info(
                 "adjust_invoices_for_excluded_products: %d facturas ajustadas, "
-                "$%.0f descontados de productos excluidos",
+                "$%.0f descontados de productos excluidos (codes=%s)",
                 n_ajustadas, monto_ajustado,
+                ",".join(EXCLUDED_SALES_DEFAULT_CODES),
             )
     return out
 
 
 def filter_excluded_products(
     invoice_lines: pd.DataFrame,
-    extra_patterns: Iterable[str] | None = None,
+    extra_codes: Iterable[str] | None = None,
+    extra_name_patterns: Iterable[str] | None = None,
 ) -> pd.DataFrame:
     """
-    Devuelve `invoice_lines` sin las líneas de productos excluidos
-    (recaudos a terceros como SOAT, papeles, etc.).
+    Devuelve `invoice_lines` sin las líneas de productos excluidos.
 
-    El match se hace case-insensitive contra `product_name`,
-    `product_default_code` y `name`. Cualquier coincidencia con CUALQUIERA
-    de los patrones la saca del DataFrame.
+    Identifica las líneas excluidas por REFERENCIA INTERNA exacta
+    (`product_default_code`). Match case-insensitive.
 
     Args:
-        invoice_lines: líneas de factura tal como las devuelve el extractor.
-        extra_patterns: patrones adicionales (además de EXCLUDED_SALES_PATTERNS).
+        invoice_lines: líneas de factura del extractor.
+        extra_codes: códigos adicionales a excluir además de
+            EXCLUDED_SALES_DEFAULT_CODES.
+        extra_name_patterns: patrones extra contra el nombre (regex), por
+            si hay líneas sin default_code que igual hay que sacar.
     """
     if invoice_lines is None or invoice_lines.empty:
         return invoice_lines if invoice_lines is not None else pd.DataFrame()
 
-    patterns = list(EXCLUDED_SALES_PATTERNS)
-    if extra_patterns:
-        patterns.extend(p for p in extra_patterns if p)
-    if not patterns:
-        return invoice_lines
-
-    combined = "|".join(f"(?:{p})" for p in patterns)
-    df = invoice_lines.copy()
-    mask_excl = pd.Series(False, index=df.index)
-    for col in ("product_name", "product_default_code", "name"):
-        if col in df.columns:
-            col_match = (
-                df[col]
-                .astype("string")
-                .fillna("")
-                .str.contains(combined, case=False, regex=True, na=False)
-            )
-            mask_excl = mask_excl | col_match
-
+    mask_excl = _build_exclusion_mask(
+        invoice_lines, extra_codes=extra_codes, extra_name_patterns=extra_name_patterns
+    )
     n_excl = int(mask_excl.sum())
     if n_excl:
         logger.info(
-            "filter_excluded_products: excluidas %d líneas (patrones: %s)",
+            "filter_excluded_products: excluidas %d líneas (codes=%s)",
             n_excl,
-            ", ".join(patterns),
+            ",".join(EXCLUDED_SALES_DEFAULT_CODES),
         )
-    return df[~mask_excl].copy()
+    return invoice_lines[~mask_excl].copy()
 
 
 # ---------------------------------------------------------------------------
