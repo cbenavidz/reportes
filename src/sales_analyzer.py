@@ -184,11 +184,19 @@ def adjust_invoices_for_excluded_products(
     )
 
     out = invoices.copy()
-    if "id" in out.columns and "amount_total_signed" in out.columns:
+    if "id" in out.columns:
         ajustes = pd.to_numeric(out["id"], errors="coerce").map(excl_by_move).fillna(0.0)
-        out["amount_total_signed"] = (
-            pd.to_numeric(out["amount_total_signed"], errors="coerce") - ajustes
-        )
+        # Ajustamos AMBOS campos para mantener consistencia:
+        #   - amount_untaxed_signed: usado por KPIs (subtotal sin IVA).
+        #   - amount_total_signed: legacy, por si algún caller lo usa todavía.
+        # `price_subtotal_signed` de las líneas YA es sin IVA, así que va al
+        # campo untaxed directamente. El total con IVA se ajusta con el mismo
+        # monto (asumimos productos exentos como SOAT/ANTCL); si tuvieran IVA
+        # habría una pequeña diferencia, pero esos productos típicamente NO
+        # llevan IVA en Colombia.
+        for col in ("amount_untaxed_signed", "amount_total_signed"):
+            if col in out.columns:
+                out[col] = pd.to_numeric(out[col], errors="coerce") - ajustes
         n_ajustadas = int((ajustes != 0).sum())
         monto_ajustado = float(ajustes.sum())
         if n_ajustadas:
@@ -325,7 +333,18 @@ def compute_sales_kpis(
 ) -> SalesKPIs:
     """
     KPIs base del informe de ventas. Usa `invoice_date` para el filtro
-    temporal. NC restan automáticamente vía `amount_total_signed`.
+    temporal. NC restan automáticamente.
+
+    IMPORTANTE — usamos `amount_untaxed_signed` (subtotal SIN IVA), no
+    `amount_total_signed`. Razones:
+      - Es lo que Odoo muestra en su reporte oficial de ventas.
+      - El IVA es un impuesto recaudado a nombre del Estado, no es ingreso
+        operacional de la empresa.
+      - Coincide con el `price_subtotal_signed` que se usa en las tablas
+        por producto/categoría → consistencia entre KPIs y desglose.
+
+    Si una factura no tiene `amount_untaxed_signed` (DataFrame viejo o
+    campo faltante), cae al `amount_total_signed` como fallback.
     """
     df = filter_sales_invoices(invoices, date_from, date_to, company_ids)
     if df.empty:
@@ -333,12 +352,19 @@ def compute_sales_kpis(
                          pd.Timestamp(date_from) if date_from else None,
                          pd.Timestamp(date_to) if date_to else None)
 
+    # Columna de monto: subtotal sin IVA si existe, sino total con IVA.
+    monto_col = (
+        "amount_untaxed_signed"
+        if "amount_untaxed_signed" in df.columns
+        else "amount_total_signed"
+    )
+
     fac = df[df["move_type"] == "out_invoice"]
     nc = df[df["move_type"] == "out_refund"]
 
-    ventas_brutas = float(fac["amount_total_signed"].sum())
-    nc_total = float(nc["amount_total_signed"].sum())   # ya negativo
-    ventas_netas = ventas_brutas + nc_total              # netea
+    ventas_brutas = float(pd.to_numeric(fac[monto_col], errors="coerce").sum())
+    nc_total = float(pd.to_numeric(nc[monto_col], errors="coerce").sum())  # ya negativo
+    ventas_netas = ventas_brutas + nc_total
     n_fac = int(len(fac))
     n_nc = int(len(nc))
     ticket = _safe_div(ventas_brutas, n_fac)
@@ -414,10 +440,16 @@ def compute_sales_monthly(
         is_fac = df["move_type"] == "out_invoice"
         is_nc = df["move_type"] == "out_refund"
 
+        # Subtotal sin IVA (igual que en KPIs y tabla por categoría).
+        monto_col = (
+            "amount_untaxed_signed"
+            if "amount_untaxed_signed" in df.columns
+            else "amount_total_signed"
+        )
         agg = pd.DataFrame({
-            "ventas_netas": df.groupby("mes")["amount_total_signed"].sum(),
-            "ventas_brutas": df.loc[is_fac].groupby("mes")["amount_total_signed"].sum(),
-            "nc_signed": df.loc[is_nc].groupby("mes")["amount_total_signed"].sum(),
+            "ventas_netas": df.groupby("mes")[monto_col].sum(),
+            "ventas_brutas": df.loc[is_fac].groupby("mes")[monto_col].sum(),
+            "nc_signed": df.loc[is_nc].groupby("mes")[monto_col].sum(),
             "n_facturas": df.loc[is_fac].groupby("mes").size(),
         })
         agg = base.join(agg, how="left").fillna(0.0)
@@ -558,12 +590,19 @@ def compute_sales_by_vendedor(
     is_fac = df["move_type"] == "out_invoice"
     is_nc = df["move_type"] == "out_refund"
 
+    # Subtotal sin IVA (consistente con KPIs y Odoo).
+    monto_col = (
+        "amount_untaxed_signed"
+        if "amount_untaxed_signed" in df.columns
+        else "amount_total_signed"
+    )
+
     # Agregaciones
     grp = df.groupby("vendedor_id")
     res = pd.DataFrame({
-        "ventas_netas": grp["amount_total_signed"].sum(),
-        "ventas_brutas": df.loc[is_fac].groupby("vendedor_id")["amount_total_signed"].sum(),
-        "nc_signed": df.loc[is_nc].groupby("vendedor_id")["amount_total_signed"].sum(),
+        "ventas_netas": grp[monto_col].sum(),
+        "ventas_brutas": df.loc[is_fac].groupby("vendedor_id")[monto_col].sum(),
+        "nc_signed": df.loc[is_nc].groupby("vendedor_id")[monto_col].sum(),
         "n_facturas": df.loc[is_fac].groupby("vendedor_id").size(),
         "n_clientes": grp["partner_id"].nunique(),
     }).fillna(0.0)
@@ -634,11 +673,18 @@ def compute_sales_by_partner(
     is_fac = df["move_type"] == "out_invoice"
     is_nc = df["move_type"] == "out_refund"
 
+    # Subtotal sin IVA (consistente con KPIs y Odoo).
+    monto_col = (
+        "amount_untaxed_signed"
+        if "amount_untaxed_signed" in df.columns
+        else "amount_total_signed"
+    )
+
     grp = df.groupby("partner_id")
     res = pd.DataFrame({
-        "ventas_netas": grp["amount_total_signed"].sum(),
-        "ventas_brutas": df.loc[is_fac].groupby("partner_id")["amount_total_signed"].sum(),
-        "nc_signed": df.loc[is_nc].groupby("partner_id")["amount_total_signed"].sum(),
+        "ventas_netas": grp[monto_col].sum(),
+        "ventas_brutas": df.loc[is_fac].groupby("partner_id")[monto_col].sum(),
+        "nc_signed": df.loc[is_nc].groupby("partner_id")[monto_col].sum(),
         "n_facturas": df.loc[is_fac].groupby("partner_id").size(),
     }).fillna(0.0)
     res["notas_credito"] = res["nc_signed"].abs()

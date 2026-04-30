@@ -54,6 +54,7 @@ logout_button()
 st.title("💰 Informe de Ventas")
 st.caption(
     "Ventas facturadas (account.move) por período, vendedor, cliente y producto. "
+    "**Montos: subtotal SIN IVA** (igual que el reporte oficial de Odoo). "
     "**Fecha utilizada: fecha de FACTURA** (`invoice_date`), no fecha de orden. "
     "Las notas crédito (out_refund) restan automáticamente. Se mezclan ventas "
     "de contado y crédito. **Productos excluidos por referencia interna** "
