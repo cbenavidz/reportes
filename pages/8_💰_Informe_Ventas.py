@@ -142,6 +142,27 @@ if not invoice_lines_all.empty:
         invoices_all, invoice_lines_all
     )
 
+# Panel de diagnóstico — ayuda a verificar que los filtros se aplican.
+with st.expander("🔍 Diagnóstico de datos (clic para abrir)", expanded=False):
+    st.write(f"**Empresas seleccionadas en sidebar**: `{filters['company_ids']}`")
+    if invoices_all is not None and not invoices_all.empty:
+        st.write(f"**Facturas crudas cargadas**: {len(invoices_all):,}")
+        if "company_id" in invoices_all.columns:
+            por_empresa = (
+                invoices_all.groupby("company_id")
+                .agg(n_facturas=("id", "count"),
+                     monto_total=("amount_total_signed",
+                                  lambda s: float(pd.to_numeric(s, errors="coerce").abs().sum())))
+            )
+            st.write("**Por empresa (en facturas crudas, todo el histórico cargado):**")
+            st.dataframe(por_empresa, use_container_width=True)
+    if invoice_lines_all is not None and not invoice_lines_all.empty:
+        st.write(f"**Líneas de factura cargadas**: {len(invoice_lines_all):,}")
+        if "company_name" in invoice_lines_all.columns:
+            por_emp_l = invoice_lines_all.groupby("company_name").size().rename("n_lineas")
+            st.write("**Líneas por empresa:**")
+            st.dataframe(por_emp_l, use_container_width=True)
+
 # ---------------------------------------------------------------------------
 # Filtros propios del informe — período de ventas
 # ---------------------------------------------------------------------------
@@ -270,19 +291,32 @@ col4.metric(
 )
 
 col5, col6, col7, col8 = st.columns(4)
-col5.metric("🟢 Ventas brutas", _fmt_money(kpis.ventas_brutas))
-col6.metric("🔴 Notas crédito", _fmt_money(kpis.notas_credito),
-            help=f"{kpis.n_notas_credito} NC en el período")
-nc_pct = (kpis.notas_credito / kpis.ventas_brutas * 100) if kpis.ventas_brutas else 0.0
-col7.metric("📉 NC / Ventas", f"{nc_pct:.1f}%",
-            help="% de notas crédito sobre ventas brutas")
-col8.metric(
-    "📅 Δ vs anterior",
-    _fmt_money(growth["delta_ventas_abs"]),
+col5.metric(
+    "🟢 Ventas brutas",
+    _fmt_money(kpis.ventas_brutas),
+    help=f"{kpis.n_facturas:,} facturas (out_invoice).",
+)
+col6.metric(
+    "🔴 Notas crédito ($)",
+    _fmt_money(kpis.notas_credito),
     help=(
-        "Diferencia absoluta en ventas netas vs período anterior "
-        "(mismo largo, justo antes del actual)."
+        f"Monto total de notas crédito (out_refund) emitidas en el período. "
+        f"Se restan automáticamente de las ventas netas."
     ),
+)
+col7.metric(
+    "📄 # Notas crédito",
+    f"{kpis.n_notas_credito:,}",
+    help=(
+        "Cantidad de documentos NC en el período. "
+        f"Anterior: {kpis_prev.n_notas_credito:,} NC."
+    ),
+)
+nc_pct = (kpis.notas_credito / kpis.ventas_brutas * 100) if kpis.ventas_brutas else 0.0
+col8.metric(
+    "📉 NC / Ventas",
+    f"{nc_pct:.1f}%",
+    help="% de notas crédito sobre ventas brutas. Indicador de calidad.",
 )
 
 # ---------------------------------------------------------------------------
