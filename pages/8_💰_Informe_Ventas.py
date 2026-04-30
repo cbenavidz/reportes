@@ -120,12 +120,6 @@ if vendedor_user_ids and partners_all is not None and not partners_all.empty:
         st.warning("Los vendedores seleccionados no tienen clientes asignados.")
         st.stop()
 
-# Cargar líneas de factura UNA sola vez para:
-#   1) ajustar `amount_total_signed` de cada factura descontando SOAT/papeles
-#      (afecta KPIs principales, mensual, vendedor y cliente).
-#   2) calcular las tablas por producto y categoría.
-# Si la carga falla (Odoo lento, etc.), seguimos sin filtro y mostramos
-# advertencia — el informe sigue siendo usable, solo no excluye SOAT.
 try:
     invoice_lines_all = load_invoice_lines(
         months_back=filters["months_back"],
@@ -138,35 +132,74 @@ except Exception as exc:  # noqa: BLE001
     )
     invoice_lines_all = pd.DataFrame()
 
+# Snapshot del total ANTES del recompute (para diagnóstico)
+_dbg_total_antes = (
+    float(pd.to_numeric(invoices_all["amount_untaxed_signed"], errors="coerce").sum())
+    if "amount_untaxed_signed" in invoices_all.columns else 0.0
+)
+_dbg_n_antes = len(invoices_all)
+
 if not invoice_lines_all.empty:
-    # Reemplazamos amount_untaxed_signed con la suma de líneas product
-    # (excluyendo SOAT/ANTCL). Esto garantiza que los KPIs coincidan al
-    # peso con la tabla por producto/categoría y con un cálculo manual
-    # sobre account.move.line. Es exactamente lo que muestra el reporte
-    # oficial de Odoo.
     invoices_all = recompute_invoice_amounts_from_lines(
         invoices_all, invoice_lines_all
     )
 
-# Panel de diagnóstico — ayuda a verificar que los filtros se aplican.
-with st.expander("🔍 Diagnóstico de datos (clic para abrir)", expanded=False):
-    st.write(f"**Empresas seleccionadas en sidebar**: `{filters['company_ids']}`")
-    if invoices_all is not None and not invoices_all.empty:
-        st.write(f"**Facturas crudas cargadas**: {len(invoices_all):,}")
-        if "company_id" in invoices_all.columns:
-            por_empresa = (
-                invoices_all.groupby("company_id")
-                .agg(n_facturas=("id", "count"),
-                     monto_total=("amount_total_signed",
-                                  lambda s: float(pd.to_numeric(s, errors="coerce").abs().sum())))
-            )
-            st.write("**Por empresa (en facturas crudas, todo el histórico cargado):**")
-            st.dataframe(por_empresa, use_container_width=True)
+_dbg_total_despues = (
+    float(pd.to_numeric(invoices_all["amount_untaxed_signed"], errors="coerce").sum())
+    if "amount_untaxed_signed" in invoices_all.columns else 0.0
+)
+_dbg_n_cero = (
+    int((pd.to_numeric(invoices_all["amount_untaxed_signed"], errors="coerce") == 0).sum())
+    if "amount_untaxed_signed" in invoices_all.columns else 0
+)
+
+# Panel de diagnóstico — abierto por defecto mientras debuggeamos.
+with st.expander("🔍 Diagnóstico de datos", expanded=True):
+    st.write(f"**Empresas seleccionadas**: `{filters['company_ids']}`")
+    st.write(f"**Facturas cargadas**: {_dbg_n_antes:,}")
+
+    st.markdown("##### 💡 Comparativa antes/después del recompute")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total ANTES (amount_untaxed)", f"${_dbg_total_antes:,.0f}")
+    c2.metric("Total DESPUÉS (sum líneas)", f"${_dbg_total_despues:,.0f}")
+    c3.metric("Facturas en $0 tras recompute", f"{_dbg_n_cero:,}")
+
     if invoice_lines_all is not None and not invoice_lines_all.empty:
-        st.write(f"**Líneas de factura cargadas**: {len(invoice_lines_all):,}")
+        # Verificación cruda: sum directo de líneas en abril 2026
+        try:
+            from datetime import date as _date
+            il = invoice_lines_all.copy()
+            if "invoice_date" in il.columns:
+                il["d"] = pd.to_datetime(il["invoice_date"], errors="coerce")
+                il_abr = il[
+                    (il["d"] >= pd.Timestamp(2026, 4, 1))
+                    & (il["d"] <= pd.Timestamp(2026, 4, 30))
+                ]
+                if not il_abr.empty:
+                    from src.sales_analyzer import filter_excluded_products
+                    il_abr_filt = filter_excluded_products(il_abr)
+                    bruto_lineas = float(
+                        pd.to_numeric(il_abr["price_subtotal_signed"], errors="coerce").sum()
+                    )
+                    neto_lineas = float(
+                        pd.to_numeric(il_abr_filt["price_subtotal_signed"], errors="coerce").sum()
+                    )
+                    st.markdown("##### 📐 Suma directa de líneas en abril 2026")
+                    a1, a2 = st.columns(2)
+                    a1.metric("Bruto líneas (sin filtro)", f"${bruto_lineas:,.0f}")
+                    a2.metric("Neto líneas (sin SOAT/ANTCL)", f"${neto_lineas:,.0f}")
+                    st.caption(
+                        f"Líneas abril: {len(il_abr):,} · Tras filtro: {len(il_abr_filt):,}"
+                    )
+        except Exception as e:  # noqa: BLE001
+            st.error(f"Error en diagnóstico de líneas: {e}")
+
         if "company_name" in invoice_lines_all.columns:
-            por_emp_l = invoice_lines_all.groupby("company_name").size().rename("n_lineas")
-            st.write("**Líneas por empresa:**")
+            por_emp_l = (
+                invoice_lines_all.groupby("company_name")["price_subtotal_signed"]
+                .agg(["sum", "count"])
+            )
+            st.write("**Líneas por empresa (todo el histórico):**")
             st.dataframe(por_emp_l, use_container_width=True)
 
 # ---------------------------------------------------------------------------
