@@ -382,6 +382,118 @@ class SalesKPIs:
         }
 
 
+def compute_sales_kpis_from_lines(
+    invoice_lines: pd.DataFrame,
+    date_from: date | pd.Timestamp | None = None,
+    date_to: date | pd.Timestamp | None = None,
+    company_ids: Iterable[int] | None = None,
+    extra_excluded_codes: Iterable[str] | None = None,
+) -> SalesKPIs:
+    """
+    KPIs calculados DIRECTAMENTE desde `account.move.line` (no desde
+    `account.move`). Esta es la fuente de verdad — coincide al peso con
+    el reporte oficial de Odoo y con la tabla por categoría/producto.
+
+    Ventajas vs. `compute_sales_kpis`:
+      - No depende del nominal `amount_untaxed_signed` de Odoo (que puede
+        diferir de la suma real de líneas por descuentos globales).
+      - Maneja correctamente facturas cuyas líneas no son
+        `display_type='product'` (no las pierde).
+      - Excluye SOAT/ANTCL automáticamente.
+    """
+    if invoice_lines is None or invoice_lines.empty:
+        return SalesKPIs(0.0, 0.0, 0.0, 0, 0, 0.0, 0,
+                         pd.Timestamp(date_from) if date_from else None,
+                         pd.Timestamp(date_to) if date_to else None)
+
+    df = filter_excluded_products(invoice_lines, extra_codes=extra_excluded_codes)
+
+    # Filtro por estado y move_type (deben venir heredados del move).
+    if "move_type" in df.columns:
+        df = df[df["move_type"].isin(SALES_MOVE_TYPES)]
+    if "state" in df.columns:
+        df = df[df["state"].isin(SALES_VALID_STATES)]
+
+    # Filtro por empresa
+    if company_ids is not None and "company_id" in df.columns:
+        cset = set(int(c) for c in company_ids)
+        df = df[df["company_id"].isin(cset)]
+
+    # Filtro por fecha (usamos `invoice_date` de la línea, que es line.date
+    # y coincide con invoice_date del move padre en facturas posted).
+    if "invoice_date" in df.columns:
+        df = df.copy()
+        df["_d"] = pd.to_datetime(df["invoice_date"], errors="coerce")
+        df = df.dropna(subset=["_d"])
+        if date_from is not None:
+            df = df[df["_d"] >= pd.Timestamp(date_from)]
+        if date_to is not None:
+            df = df[df["_d"] <= pd.Timestamp(date_to)]
+
+    if df.empty:
+        return SalesKPIs(0.0, 0.0, 0.0, 0, 0, 0.0, 0,
+                         pd.Timestamp(date_from) if date_from else None,
+                         pd.Timestamp(date_to) if date_to else None)
+
+    fac = df[df["move_type"] == "out_invoice"]
+    nc = df[df["move_type"] == "out_refund"]
+
+    ventas_brutas = float(pd.to_numeric(fac["price_subtotal_signed"], errors="coerce").sum())
+    nc_total = float(pd.to_numeric(nc["price_subtotal_signed"], errors="coerce").sum())  # ya negativo
+    ventas_netas = ventas_brutas + nc_total
+
+    n_fac = int(fac["move_id"].nunique()) if "move_id" in fac.columns and not fac.empty else 0
+    n_nc = int(nc["move_id"].nunique()) if "move_id" in nc.columns and not nc.empty else 0
+    n_clientes = int(df["partner_id"].nunique()) if "partner_id" in df.columns else 0
+
+    return SalesKPIs(
+        ventas_netas=ventas_netas,
+        ventas_brutas=ventas_brutas,
+        notas_credito=abs(nc_total),
+        n_facturas=n_fac,
+        n_notas_credito=n_nc,
+        ticket_promedio=_safe_div(ventas_brutas, n_fac),
+        n_clientes_unicos=n_clientes,
+        fecha_desde=pd.Timestamp(date_from) if date_from else None,
+        fecha_hasta=pd.Timestamp(date_to) if date_to else None,
+    )
+
+
+def compute_sales_growth_from_lines(
+    invoice_lines: pd.DataFrame,
+    date_from: date | pd.Timestamp,
+    date_to: date | pd.Timestamp,
+    company_ids: Iterable[int] | None = None,
+) -> dict:
+    """
+    Comparativo período actual vs anterior, calculado desde líneas.
+    Mismo formato que `compute_sales_growth` pero con coincidencia exacta
+    al reporte de Odoo.
+    """
+    actual_from = pd.Timestamp(date_from)
+    actual_to = pd.Timestamp(date_to)
+    days = (actual_to - actual_from).days + 1
+    prev_to = actual_from - pd.Timedelta(days=1)
+    prev_from = prev_to - pd.Timedelta(days=days - 1)
+
+    actual = compute_sales_kpis_from_lines(invoice_lines, actual_from, actual_to, company_ids)
+    anterior = compute_sales_kpis_from_lines(invoice_lines, prev_from, prev_to, company_ids)
+
+    def _var_pct(a, b):
+        return ((a - b) / b * 100) if b else None
+
+    return {
+        "actual": actual,
+        "anterior": anterior,
+        "actual_periodo": (actual_from, actual_to),
+        "anterior_periodo": (prev_from, prev_to),
+        "var_ventas_pct": _var_pct(actual.ventas_netas, anterior.ventas_netas),
+        "var_facturas_pct": _var_pct(actual.n_facturas, anterior.n_facturas),
+        "var_ticket_pct": _var_pct(actual.ticket_promedio, anterior.ticket_promedio),
+        "delta_ventas_abs": actual.ventas_netas - anterior.ventas_netas,
+    }
+
+
 def compute_sales_kpis(
     invoices: pd.DataFrame,
     date_from: date | pd.Timestamp | None = None,

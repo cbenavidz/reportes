@@ -31,6 +31,7 @@ from src.sales_analyzer import (
     compute_sales_by_product,
     compute_sales_by_vendedor,
     compute_sales_growth,
+    compute_sales_growth_from_lines,
     compute_sales_kpis,
     compute_sales_monthly,
     filter_sales_invoices,
@@ -153,8 +154,8 @@ _dbg_n_cero = (
     if "amount_untaxed_signed" in invoices_all.columns else 0
 )
 
-# Panel de diagnóstico — abierto por defecto mientras debuggeamos.
-with st.expander("🔍 Diagnóstico de datos", expanded=True):
+# Panel de diagnóstico — colapsado por defecto, ya identificado el bug.
+with st.expander("🔍 Diagnóstico de datos", expanded=False):
     st.write(f"**Empresas seleccionadas**: `{filters['company_ids']}`")
     st.write(f"**Facturas cargadas**: {_dbg_n_antes:,}")
 
@@ -277,12 +278,24 @@ st.caption(
 # ---------------------------------------------------------------------------
 st.markdown("### 📊 KPIs")
 
-growth = compute_sales_growth(
-    invoices=invoices_all,
-    date_from=fecha_desde,
-    date_to=fecha_hasta,
-    company_ids=filters["company_ids"],
-)
+# KPIs calculados DIRECTAMENTE desde las líneas (account.move.line) para
+# coincidencia exacta con el reporte oficial de Odoo y con la tabla por
+# categoría/producto. No depende del nominal de Odoo.
+if not invoice_lines_all.empty:
+    growth = compute_sales_growth_from_lines(
+        invoice_lines=invoice_lines_all,
+        date_from=fecha_desde,
+        date_to=fecha_hasta,
+        company_ids=filters["company_ids"],
+    )
+else:
+    # Fallback al cálculo desde facturas si no se pudieron cargar las líneas
+    growth = compute_sales_growth(
+        invoices=invoices_all,
+        date_from=fecha_desde,
+        date_to=fecha_hasta,
+        company_ids=filters["company_ids"],
+    )
 kpis = growth["actual"]
 kpis_prev = growth["anterior"]
 
