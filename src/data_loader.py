@@ -347,7 +347,8 @@ def filter_analysis_by_vendedor(
 #       calculado en post-procesamiento (Odoo 19).
 #   v3: refactor exclusión productos por default_code exacto (SOAT1, ANTCL).
 #   v4: KPIs cambian a amount_untaxed_signed (sin IVA, igual que Odoo).
-INVOICE_LINES_CACHE_VERSION = 4
+#   v5: KPIs reconstruyen amount desde líneas (coincidencia exacta).
+INVOICE_LINES_CACHE_VERSION = 5
 
 
 @st.cache_data(ttl=900, show_spinner="Descargando líneas de factura (productos)...")

@@ -27,7 +27,6 @@ from src.auth import logout_button, require_auth
 from src.data_loader import compute_full_analysis, load_invoice_lines
 from src.sales_analyzer import (
     EXCLUDED_SALES_DEFAULT_CODES,
-    adjust_invoices_for_excluded_products,
     compute_sales_by_partner,
     compute_sales_by_product,
     compute_sales_by_vendedor,
@@ -35,6 +34,7 @@ from src.sales_analyzer import (
     compute_sales_kpis,
     compute_sales_monthly,
     filter_sales_invoices,
+    recompute_invoice_amounts_from_lines,
 )
 from src.ui_components import (
     render_company_context,
@@ -139,7 +139,12 @@ except Exception as exc:  # noqa: BLE001
     invoice_lines_all = pd.DataFrame()
 
 if not invoice_lines_all.empty:
-    invoices_all = adjust_invoices_for_excluded_products(
+    # Reemplazamos amount_untaxed_signed con la suma de líneas product
+    # (excluyendo SOAT/ANTCL). Esto garantiza que los KPIs coincidan al
+    # peso con la tabla por producto/categoría y con un cálculo manual
+    # sobre account.move.line. Es exactamente lo que muestra el reporte
+    # oficial de Odoo.
+    invoices_all = recompute_invoice_amounts_from_lines(
         invoices_all, invoice_lines_all
     )
 

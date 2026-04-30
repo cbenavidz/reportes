@@ -142,6 +142,63 @@ def _build_exclusion_mask(
     return mask
 
 
+def recompute_invoice_amounts_from_lines(
+    invoices: pd.DataFrame,
+    invoice_lines: pd.DataFrame,
+    extra_codes: Iterable[str] | None = None,
+    extra_name_patterns: Iterable[str] | None = None,
+) -> pd.DataFrame:
+    """
+    REEMPLAZA `amount_untaxed_signed` (y `amount_total_signed`) de cada
+    factura por la suma de `price_subtotal_signed` de sus líneas de
+    producto, excluyendo SOAT/ANTCL.
+
+    Esto garantiza que el total que se ve en los KPIs sea EXACTAMENTE el
+    mismo que el de la tabla por producto/categoría, y coincide al peso
+    con un cálculo manual sobre `account.move.line`.
+
+    A diferencia de `adjust_invoices_for_excluded_products` (que solo
+    RESTABA el monto SOAT del total nominal de Odoo), esta función
+    RECONSTRUYE el monto desde cero a partir de las líneas. La diferencia
+    típica es <1% pero existe por:
+      - descuentos globales aplicados a la cabecera, no a las líneas;
+      - líneas que no son `display_type=product` (notas, secciones);
+      - pequeños redondeos de Odoo entre subtotales y totales.
+
+    Si una factura no tiene líneas product (raro pero posible), su monto
+    queda en 0 — lo cual es correcto: si no se facturaron productos, no
+    hay venta operacional.
+    """
+    if invoices is None or invoices.empty:
+        return invoices if invoices is not None else pd.DataFrame()
+    if invoice_lines is None or invoice_lines.empty or "move_id" not in invoice_lines.columns:
+        return invoices.copy()
+
+    mask_excl = _build_exclusion_mask(
+        invoice_lines, extra_codes=extra_codes, extra_name_patterns=extra_name_patterns
+    )
+    lines_keep = invoice_lines[~mask_excl]
+    sum_by_move = (
+        lines_keep.groupby("move_id")["price_subtotal_signed"].sum().to_dict()
+    )
+
+    out = invoices.copy()
+    if "id" in out.columns:
+        nuevos = pd.to_numeric(out["id"], errors="coerce").map(sum_by_move).fillna(0.0)
+        for col in ("amount_untaxed_signed", "amount_total_signed"):
+            if col in out.columns:
+                out[col] = nuevos.values
+        n_actualizadas = int((nuevos != 0).sum())
+        total_recalc = float(nuevos.sum())
+        logger.info(
+            "recompute_invoice_amounts_from_lines: %d facturas recalculadas, "
+            "total $%.0f desde líneas (excluyendo codes=%s)",
+            n_actualizadas, total_recalc,
+            ",".join(EXCLUDED_SALES_DEFAULT_CODES),
+        )
+    return out
+
+
 def adjust_invoices_for_excluded_products(
     invoices: pd.DataFrame,
     invoice_lines: pd.DataFrame,
