@@ -36,7 +36,11 @@ from src.sales_analyzer import (
     compute_sales_monthly,
     filter_sales_invoices,
 )
-from src.ui_components import render_company_context, render_sidebar_filters
+from src.ui_components import (
+    render_company_context,
+    render_sidebar_filters,
+    render_vendedor_filter,
+)
 
 st.set_page_config(
     page_title="Informe de Ventas | Cartera",
@@ -81,6 +85,39 @@ partners_all = data.get("raw_partners")
 if invoices_all is None or invoices_all.empty:
     st.info("No hay facturas disponibles en el rango cargado.")
     st.stop()
+
+# ---------------------------------------------------------------------------
+# Filtro de vendedor (inline, arriba del contenido)
+# ---------------------------------------------------------------------------
+vendedor_user_ids = render_vendedor_filter(
+    partners_all,
+    key="vendedor_filter_ventas",
+)
+if vendedor_user_ids and partners_all is not None and not partners_all.empty:
+    # Filtrar facturas por partners asignados a los vendedores seleccionados
+    keep_partner_ids = set(
+        partners_all.loc[
+            partners_all["user_id"].isin(list(vendedor_user_ids)), "id"
+        ].dropna().astype(int).tolist()
+    )
+    if keep_partner_ids:
+        invoices_all = invoices_all[
+            invoices_all["partner_id"].isin(keep_partner_ids)
+        ].copy()
+        if not invoice_lines_all.empty and "partner_id" in invoice_lines_all.columns:
+            invoice_lines_all = invoice_lines_all[
+                invoice_lines_all["partner_id"].isin(keep_partner_ids)
+            ].copy()
+        names = (
+            partners_all.loc[
+                partners_all["user_id"].isin(list(vendedor_user_ids)), "user_name"
+            ].dropna().unique().tolist()
+        )
+        if names:
+            st.info(f"👤 Filtrando por vendedor(es): **{', '.join(names)}**")
+    else:
+        st.warning("Los vendedores seleccionados no tienen clientes asignados.")
+        st.stop()
 
 # Cargar líneas de factura UNA sola vez para:
 #   1) ajustar `amount_total_signed` de cada factura descontando SOAT/papeles
@@ -321,10 +358,10 @@ if not monthly.empty:
             "var_yoy_str": "% vs año ant.",
         }),
         column_config={
-            "Brutas": st.column_config.NumberColumn(format="$ %.0f"),
-            "NC": st.column_config.NumberColumn(format="$ %.0f"),
-            "Netas": st.column_config.NumberColumn(format="$ %.0f"),
-            "Ticket prom.": st.column_config.NumberColumn(format="$ %.0f"),
+            "Brutas": st.column_config.NumberColumn(format="$ %,.0f"),
+            "NC": st.column_config.NumberColumn(format="$ %,.0f"),
+            "Netas": st.column_config.NumberColumn(format="$ %,.0f"),
+            "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
         },
         use_container_width=True, hide_index=True,
     )
@@ -393,10 +430,10 @@ with tab_vend:
                 "participacion_pct": "% del total",
             }),
             column_config={
-                "Ventas netas": st.column_config.NumberColumn(format="$ %.0f"),
-                "Ventas brutas": st.column_config.NumberColumn(format="$ %.0f"),
-                "NC": st.column_config.NumberColumn(format="$ %.0f"),
-                "Ticket prom.": st.column_config.NumberColumn(format="$ %.0f"),
+                "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
+                "Ventas brutas": st.column_config.NumberColumn(format="$ %,.0f"),
+                "NC": st.column_config.NumberColumn(format="$ %,.0f"),
+                "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
                 "% del total": st.column_config.NumberColumn(format="%.1f %%"),
             },
             use_container_width=True, hide_index=True,
@@ -467,10 +504,10 @@ with tab_clientes:
                 "es_pareto_80": "Pareto 80",
             }),
             column_config={
-                "Ventas netas": st.column_config.NumberColumn(format="$ %.0f"),
-                "Ventas brutas": st.column_config.NumberColumn(format="$ %.0f"),
-                "NC": st.column_config.NumberColumn(format="$ %.0f"),
-                "Ticket prom.": st.column_config.NumberColumn(format="$ %.0f"),
+                "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
+                "Ventas brutas": st.column_config.NumberColumn(format="$ %,.0f"),
+                "NC": st.column_config.NumberColumn(format="$ %,.0f"),
+                "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
                 "% del total": st.column_config.NumberColumn(format="%.1f %%"),
                 "% acum.": st.column_config.NumberColumn(format="%.1f %%"),
             },
@@ -534,7 +571,7 @@ with tab_prod:
                         "participacion_pct": "% del total",
                     }),
                     column_config={
-                        "Ventas netas": st.column_config.NumberColumn(format="$ %.0f"),
+                        "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
                         "% del total": st.column_config.NumberColumn(format="%.1f %%"),
                     },
                     use_container_width=True, hide_index=True,
@@ -586,7 +623,7 @@ with tab_cat:
                         "participacion_pct": "% del total",
                     }),
                     column_config={
-                        "Ventas netas": st.column_config.NumberColumn(format="$ %.0f"),
+                        "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
                         "% del total": st.column_config.NumberColumn(format="%.1f %%"),
                     },
                     use_container_width=True, hide_index=True,

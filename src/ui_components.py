@@ -169,51 +169,59 @@ def render_sidebar_filters() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def render_sidebar_vendedor_filter(
+def render_vendedor_filter(
     partners: "pd.DataFrame | None",
     key: str = "vendedor_filter",
+    label: str = "👤 Filtrar por vendedor(es)",
 ) -> tuple[int, ...] | None:
     """
-    Multiselect de vendedor en el sidebar.
+    Multiselect de vendedor renderizado INLINE (en el cuerpo de la página,
+    no en el sidebar). Se ubica donde sea llamado, idealmente justo arriba
+    del contenido principal para que el usuario lo vea sin abrir el sidebar.
 
-    Se basa en `res.partner.user_id` (vendedor asignado al cliente). Devuelve
-    una tupla de user_ids seleccionados, o None si no hay selección.
+    Se basa en `res.partner.user_id` (vendedor asignado al cliente).
+    Devuelve una tupla de user_ids seleccionados, o None si no hay selección.
 
-    La selección se persiste en st.session_state[key] así puede ser leída
-    desde otras páginas.
+    La selección se persiste en `st.session_state[key]` así viaja entre
+    páginas — la clave por defecto (`vendedor_filter`) es la misma que
+    usaba la versión vieja del sidebar para compatibilidad.
     """
-    with st.sidebar:
-        st.markdown("---")
-        st.markdown("### 👤 Vendedor")
+    if partners is None or partners.empty or "user_id" not in partners.columns:
+        st.caption("Sin datos de vendedor disponibles.")
+        return None
 
-        if partners is None or partners.empty or "user_id" not in partners.columns:
-            st.caption("Sin datos de vendedor disponibles.")
-            return None
+    df = partners[["user_id", "user_name"]].dropna(subset=["user_id"]).copy()
+    if df.empty:
+        st.caption("Ningún cliente tiene vendedor asignado.")
+        return None
+    df["user_id"] = df["user_id"].astype(int)
+    df = df.drop_duplicates(subset="user_id").sort_values("user_name")
 
-        df = partners[["user_id", "user_name"]].dropna(subset=["user_id"]).copy()
-        if df.empty:
-            st.caption("Ningún cliente tiene vendedor asignado.")
-            return None
-        df["user_id"] = df["user_id"].astype(int)
-        df = df.drop_duplicates(subset="user_id").sort_values("user_name")
+    options = df["user_name"].tolist()
+    id_by_name = dict(zip(df["user_name"], df["user_id"]))
 
-        options = df["user_name"].tolist()
-        id_by_name = dict(zip(df["user_name"], df["user_id"]))
-
-        selected = st.multiselect(
-            "Filtrar por vendedor(es)",
-            options=options,
-            default=st.session_state.get(key, []),
-            help=(
-                "Limita los clientes a los asignados a estos vendedores "
-                "(`res.partner.user_id`). Vacío = todos."
-            ),
-            key=key,
-        )
+    selected = st.multiselect(
+        label,
+        options=options,
+        default=st.session_state.get(key, []),
+        help=(
+            "Limita los clientes a los asignados a estos vendedores "
+            "(`res.partner.user_id`). Vacío = todos los vendedores."
+        ),
+        key=key,
+        placeholder="Todos los vendedores",
+    )
 
     if not selected:
         return None
     return tuple(int(id_by_name[n]) for n in selected if n in id_by_name)
+
+
+# Alias retrocompatible — apunta al filtro inline. Si en algún momento
+# quieres volver al sidebar, basta con redefinirlo aquí. Las páginas
+# siguen llamando `render_sidebar_vendedor_filter` y funcionan igual,
+# pero el filtro ahora aparece en el cuerpo donde se llame.
+render_sidebar_vendedor_filter = render_vendedor_filter
 
 
 # ---------------------------------------------------------------------------
