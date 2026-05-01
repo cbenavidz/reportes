@@ -1,20 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-Página: Ventas en Ruta — Vendedores externos.
+Página: Ventas en Ruta — vendedores externos.
 
-Análisis enfocado a los vendedores que visitan clientes en territorio
-(por defecto: Luis Felipe Hurtado, Yarley Vanessa). Métricas que un
-gerente comercial necesita para coachear al equipo de calle:
+Versión simplificada que NO depende de `crm.team`. Selección manual de
+vendedores. Funciona con los datos disponibles en Odoo:
+  - `account.move.line` (ventas, subtotal sin IVA, excluye SOAT/ANTCL).
+  - `res.partner.user_id`, `city`, `partner_latitude`, `partner_longitude`.
 
-  - KPIs de ventas (igual que el informe general pero filtrado).
-  - Cobertura: % de clientes asignados atendidos en el período.
-  - Frecuencia de visita por cliente.
-  - Análisis por ciudad / departamento.
-  - Mapa de georeferencia con puntos de clientes.
-  - Zonificación automática (clusters geográficos).
-  - Oportunidades: clientes inactivos y en caída de ventas.
-
-Anclado a `invoice_date`. SOAT/ANTCL excluidos.
+Métricas: KPIs de ventas, evolución mensual de clientes atendidos,
+análisis por ciudad, mapa GPS, frecuencia de visita, top clientes,
+clientes inactivos.
 """
 from __future__ import annotations
 
@@ -24,25 +19,22 @@ from datetime import date, timedelta
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from src.auth import logout_button, require_auth
 from src.data_loader import compute_full_analysis, load_invoice_lines
 from src.route_sales import (
     build_geo_dataframe,
-    compute_coverage_kpis,
+    compute_monthly_clients_kpi,
     compute_sales_by_city,
     compute_visit_frequency,
-    detect_opportunities,
-    get_assigned_partners,
-    get_partners_by_team,
-    get_team_sellers,
-    zonify_partners,
+    detect_inactive_clients,
+    get_partners_for_sellers,
 )
 from src.sales_analyzer import (
     EXCLUDED_SALES_DEFAULT_CODES,
     compute_sales_growth_from_lines,
-    compute_sales_kpis_from_lines,
 )
 from src.ui_components import render_company_context, render_sidebar_filters
 
@@ -57,12 +49,10 @@ logout_button()
 
 st.title("🚚 Ventas en Ruta")
 st.caption(
-    "Reporte enfocado a vendedores externos (los que visitan clientes en "
-    "territorio). Métricas de cobertura, frecuencia de visita, análisis "
-    "geográfico y oportunidades de venta. **Visita = factura emitida** "
-    "(no manejamos `crm.lead.activity`). **Subtotal sin IVA**, excluyendo "
+    "Análisis para vendedores externos. **Subtotal sin IVA**, excluyendo "
     "recaudos a terceros: " + ", ".join(f"`{c}`" for c in EXCLUDED_SALES_DEFAULT_CODES)
-    + "."
+    + ". Métricas: cobertura mensual, ventas por ciudad, mapa GPS, "
+    "frecuencia de visita y clientes inactivos."
 )
 
 filters = render_sidebar_filters()
@@ -85,7 +75,7 @@ render_company_context(data.get("companies"), filters["company_ids"])
 partners_all = data.get("raw_partners")
 invoices_all = data.get("raw_invoices")
 if partners_all is None or partners_all.empty:
-    st.error("No se pudieron cargar los clientes. Revisa la conexión con Odoo.")
+    st.error("No se pudieron cargar los clientes.")
     st.stop()
 
 try:
@@ -98,150 +88,84 @@ except Exception as exc:  # noqa: BLE001
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Selección de equipo de ventas
+# Selección de vendedores externos
 # ---------------------------------------------------------------------------
-DEFAULT_TEAM = "Lubricantes"
+st.markdown("### 👤 Vendedores")
 
-st.markdown("### 🏷️ Equipo / Vendedores")
+# Construir lista de vendedores desde facturas (más fiel) o partners (fallback)
+seller_df = pd.DataFrame()
+if (
+    invoices_all is not None and not invoices_all.empty
+    and "invoice_user_id" in invoices_all.columns
+    and "invoice_user_id_name" in invoices_all.columns
+):
+    seller_df = (
+        invoices_all[["invoice_user_id", "invoice_user_id_name"]]
+        .dropna(subset=["invoice_user_id"])
+        .drop_duplicates("invoice_user_id")
+        .rename(columns={
+            "invoice_user_id": "user_id",
+            "invoice_user_id_name": "user_name",
+        })
+    )
+if seller_df.empty and "user_id" in partners_all.columns:
+    seller_df = (
+        partners_all[["user_id", "user_name"]]
+        .dropna(subset=["user_id"])
+        .drop_duplicates("user_id")
+    )
+if seller_df.empty:
+    st.error("No se pudo detectar ningún vendedor en facturas ni en clientes.")
+    st.stop()
+seller_df["user_id"] = seller_df["user_id"].astype(int)
+seller_df = seller_df.sort_values("user_name").reset_index(drop=True)
 
-# Lista de equipos disponibles. Probamos primero desde partners; si está
-# vacío, usamos los teams de las facturas.
-team_options: list[str] = []
-if "team_name" in partners_all.columns:
-    team_options = sorted(
-        partners_all["team_name"]
-        .dropna().astype(str).str.strip().replace("", pd.NA).dropna()
-        .unique().tolist()
-    )
-if not team_options and invoices_all is not None and "team_name" in invoices_all.columns:
-    team_options = sorted(
-        invoices_all["team_name"]
-        .dropna().astype(str).str.strip().replace("", pd.NA).dropna()
-        .unique().tolist()
-    )
+seller_options = seller_df["user_name"].astype(str).tolist()
+DEFAULTS = ["Yarley Vanessa", "Yarley", "Luis Felipe Hurtado", "Luis Felipe"]
+default_names = [
+    n for n in seller_options
+    if any(d.lower() in n.lower() for d in DEFAULTS)
+]
 
-if team_options:
-    # Default: Lubricantes (si existe)
-    default_team_idx = 0
-    for i, t in enumerate(team_options):
-        if DEFAULT_TEAM.lower() in t.lower():
-            default_team_idx = i
-            break
-    selected_team = st.selectbox(
-        "Equipo a analizar",
-        options=team_options, index=default_team_idx,
-        help=(
-            "Filtra por `crm.team`. Si los clientes en Odoo no tienen team "
-            "asignado en su ficha, derivamos el equipo desde las facturas."
-        ),
-    )
-    assigned_partners = get_partners_by_team(
-        partners_all, selected_team, invoices=invoices_all,
-    )
-    team_sellers = get_team_sellers(
-        partners_all, selected_team, invoices=invoices_all,
-    )
-    selected_user_ids = list(team_sellers.keys())
-    selected_names = list(team_sellers.values())
-    seller_names_str = ", ".join(selected_names) if selected_names else "—"
-    st.caption(
-        f"📋 **{len(assigned_partners):,}** clientes del equipo "
-        f"**{selected_team}** · vendedores: **{seller_names_str}**"
-    )
-else:
-    # Fallback: ningún `crm.team` configurado. Selección manual de vendedores
-    # por nombre. Por defecto preseleccionamos los del equipo Lubricantes.
-    st.info(
-        "ℹ️ Tus vendedores no están asignados a un `crm.team` en Odoo. "
-        "Selecciona manualmente los vendedores externos. "
-        "*(Para mayor robustez, te recomendamos crear el equipo "
-        "'Lubricantes' en Odoo y asignarles los vendedores.)*"
-    )
-    # Construimos lista desde invoice_user_id en facturas (más fiel) o
-    # desde partner.user_id como fallback.
-    seller_options_df = pd.DataFrame()
-    if (
-        invoices_all is not None and not invoices_all.empty
-        and "invoice_user_id" in invoices_all.columns
-        and "invoice_user_id_name" in invoices_all.columns
-    ):
-        seller_options_df = (
-            invoices_all[["invoice_user_id", "invoice_user_id_name"]]
-            .dropna(subset=["invoice_user_id"])
-            .drop_duplicates("invoice_user_id")
-            .rename(columns={
-                "invoice_user_id": "user_id",
-                "invoice_user_id_name": "user_name",
-            })
-        )
-    if seller_options_df.empty and "user_id" in partners_all.columns:
-        seller_options_df = (
-            partners_all[["user_id", "user_name"]]
-            .dropna(subset=["user_id"])
-            .drop_duplicates("user_id")
-        )
-    if seller_options_df.empty:
-        st.error(
-            "No se pudo detectar ningún vendedor en facturas ni en "
-            "clientes. Revisa la configuración de Odoo."
-        )
-        st.stop()
-    seller_options_df["user_id"] = seller_options_df["user_id"].astype(int)
-    seller_options_df = seller_options_df.sort_values("user_name")
+selected_names = st.multiselect(
+    "Selecciona vendedores externos",
+    options=seller_options,
+    default=default_names if default_names else seller_options[:2],
+    help=(
+        "Por defecto: Yarley Vanessa y Luis Felipe Hurtado (vendedores "
+        "externos del equipo Lubricantes). Puedes cambiar si tu equipo "
+        "crece o si quieres analizar a otro vendedor."
+    ),
+)
+if not selected_names:
+    st.warning("Selecciona al menos un vendedor.")
+    st.stop()
+selected_user_ids = (
+    seller_df.loc[seller_df["user_name"].isin(selected_names), "user_id"]
+    .astype(int).tolist()
+)
 
-    seller_options = seller_options_df["user_name"].tolist()
-    # Default: Yarley Vanessa y Luis Felipe Hurtado (si existen)
-    DEFAULTS = ["Yarley Vanessa", "Luis Felipe Hurtado", "Luis Felipe", "Yarley"]
-    default_names = [
-        n for n in seller_options
-        if any(d.lower() in str(n).lower() for d in DEFAULTS)
-    ]
-    selected_names = st.multiselect(
-        "👤 Vendedores externos",
-        options=seller_options,
-        default=default_names if default_names else seller_options[:2],
-        help=(
-            "Selecciona los vendedores externos. Por defecto: "
-            "Yarley Vanessa y Luis Felipe Hurtado."
-        ),
+# Clientes asignados (por user_id en partner o por invoice_user_id en factura)
+assigned_partners = get_partners_for_sellers(
+    partners_all, invoices_all, selected_user_ids,
+)
+if assigned_partners.empty:
+    st.warning(
+        "Los vendedores seleccionados no tienen clientes asignados ni "
+        "han emitido facturas. Revisa la selección."
     )
-    if not selected_names:
-        st.warning("Selecciona al menos un vendedor.")
-        st.stop()
-    selected_user_ids = (
-        seller_options_df.loc[
-            seller_options_df["user_name"].isin(selected_names), "user_id"
-        ].astype(int).tolist()
-    )
-    # Clientes asignados: por user_id en partner o por invoice_user_id en facturas.
-    asig_set: set[int] = set()
-    # 1) Partners cuyos user_id están en los seleccionados
-    if "user_id" in partners_all.columns:
-        ids_p = pd.to_numeric(partners_all["user_id"], errors="coerce")
-        asig_set.update(
-            partners_all.loc[ids_p.isin(selected_user_ids), "id"]
-            .dropna().astype(int).tolist()
-        )
-    # 2) Partners que aparecen en facturas con invoice_user_id seleccionado
-    if invoices_all is not None and not invoices_all.empty and "invoice_user_id" in invoices_all.columns:
-        ids_i = pd.to_numeric(invoices_all["invoice_user_id"], errors="coerce")
-        asig_set.update(
-            pd.to_numeric(
-                invoices_all.loc[ids_i.isin(selected_user_ids), "partner_id"],
-                errors="coerce",
-            ).dropna().astype(int).tolist()
-        )
-    if not asig_set:
-        st.warning("Los vendedores seleccionados no tienen clientes ni facturas.")
-        st.stop()
-    assigned_partners = partners_all[
-        pd.to_numeric(partners_all["id"], errors="coerce").isin(asig_set)
-    ].reset_index(drop=True)
-    selected_team = "Lubricantes"  # Etiqueta para títulos posteriores
-    st.caption(
-        f"📋 **{len(assigned_partners):,}** clientes del equipo "
-        f"**{selected_team}** · vendedores: **{', '.join(selected_names)}**"
-    )
+    st.stop()
+asig_ids = set(assigned_partners["id"].astype(int).tolist())
+
+st.caption(
+    f"📋 **{len(assigned_partners):,}** clientes vinculados a "
+    f"**{', '.join(selected_names)}** (asignación o facturación)."
+)
+
+# Filtrar invoice_lines a esos clientes
+lines_team = invoice_lines_all[
+    invoice_lines_all["partner_id"].isin(asig_ids)
+].copy() if not invoice_lines_all.empty else invoice_lines_all
 
 # ---------------------------------------------------------------------------
 # Período del informe
@@ -303,17 +227,10 @@ st.caption(
 )
 
 # ---------------------------------------------------------------------------
-# Filtrar invoice_lines a clientes del equipo
+# KPIs principales
 # ---------------------------------------------------------------------------
-asig_ids = set(assigned_partners["id"].astype(int).tolist())
-lines_team = invoice_lines_all[
-    invoice_lines_all["partner_id"].isin(asig_ids)
-].copy() if not invoice_lines_all.empty else invoice_lines_all
+st.markdown("### 📊 KPIs")
 
-# ---------------------------------------------------------------------------
-# KPIs de ventas + comparativo
-# ---------------------------------------------------------------------------
-st.markdown("### 📊 KPIs de ventas")
 growth = compute_sales_growth_from_lines(
     invoice_lines=lines_team,
     date_from=fecha_desde, date_to=fecha_hasta,
@@ -333,100 +250,76 @@ c1.metric("💰 Ventas netas", _fmt_money(kpis.ventas_netas),
           _fmt_pct(growth["var_ventas_pct"]),
           help=f"Anterior: {_fmt_money(kpis_prev.ventas_netas)}")
 c2.metric("🧾 # Facturas", f"{kpis.n_facturas:,}",
-          _fmt_pct(growth["var_facturas_pct"]),
-          help=f"Anterior: {kpis_prev.n_facturas:,}")
-c3.metric("🎫 Ticket promedio", _fmt_money(kpis.ticket_promedio),
-          _fmt_pct(growth["var_ticket_pct"]))
-c4.metric("👥 Clientes atendidos", f"{kpis.n_clientes_unicos:,}",
+          _fmt_pct(growth["var_facturas_pct"]))
+c3.metric("👥 Clientes atendidos", f"{kpis.n_clientes_unicos:,}",
           help="Clientes únicos con factura en el período.")
+c4.metric("🎫 Ticket promedio", _fmt_money(kpis.ticket_promedio),
+          _fmt_pct(growth["var_ticket_pct"]))
+
+cobertura = (
+    kpis.n_clientes_unicos / len(assigned_partners) * 100
+    if assigned_partners.shape[0] > 0 else 0
+)
+st.caption(
+    f"📊 Cobertura: **{cobertura:.1f}%** "
+    f"({kpis.n_clientes_unicos:,} de {len(assigned_partners):,} clientes "
+    "vinculados al equipo recibieron al menos 1 factura en el período)."
+)
 
 # ---------------------------------------------------------------------------
-# Cobertura del territorio
+# Evolución mensual de clientes atendidos
 # ---------------------------------------------------------------------------
-st.markdown("### 🎯 Cobertura del territorio")
-cov = compute_coverage_kpis(
+st.markdown("### 📈 Numérica mensual: clientes atendidos y ventas")
+months_show = st.slider(
+    "Meses a mostrar", 3, 24, 12, key="ruta_meses",
+    help="Histórico de clientes atendidos mes a mes.",
+)
+monthly = compute_monthly_clients_kpi(
     invoice_lines=lines_team,
-    assigned_partners=assigned_partners,
-    date_from=fecha_desde, date_to=fecha_hasta,
+    months=months_show,
+    cutoff_date=fecha_hasta,
     company_ids=filters["company_ids"],
 )
-
-cov_c1, cov_c2, cov_c3, cov_c4 = st.columns(4)
-cov_c1.metric(
-    "Clientes asignados", f"{cov['n_clientes_asignados']:,}",
-    help="Total de clientes en la base del equipo (`res.partner.user_id`)."
-)
-cov_c2.metric(
-    "Cobertura del período",
-    f"{cov['cobertura_pct']:.1f}%",
-    help=f"{cov['n_clientes_atendidos']:,} de {cov['n_clientes_asignados']:,} clientes recibieron al menos 1 factura.",
-)
-cov_c3.metric(
-    "🆕 Clientes nuevos", f"{cov['n_clientes_nuevos']:,}",
-    help="Clientes cuya PRIMERA factura está en el período (clientes ganados).",
-)
-cov_c4.metric(
-    "😴 Inactivos > 60 días", f"{cov['n_clientes_inactivos_60d']:,}",
-    help=(
-        f"Clientes asignados que NO compran hace más de 60 días.\n\n"
-        f"30d: {cov['n_clientes_inactivos_30d']:,} · "
-        f"90d: {cov['n_clientes_inactivos_90d']:,} · "
-        f"jamás: {cov['n_clientes_jamas_comprado']:,}"
-    ),
-    delta_color="inverse",
-)
-
-# ---------------------------------------------------------------------------
-# Frecuencia de visita
-# ---------------------------------------------------------------------------
-st.markdown("### 🔁 Frecuencia de visita")
-freq = compute_visit_frequency(
-    invoice_lines=lines_team,
-    assigned_partners=assigned_partners,
-    date_from=fecha_desde, date_to=fecha_hasta,
-    company_ids=filters["company_ids"],
-)
-
-if freq.empty:
-    st.info("No hay visitas registradas en el período.")
+if monthly.empty:
+    st.info("Sin datos en el rango.")
 else:
-    f_c1, f_c2, f_c3 = st.columns(3)
-    f_c1.metric(
-        "Visitas totales", f"{int(freq['num_visitas'].sum()):,}",
-        help="Suma de facturas emitidas a clientes del equipo en el período.",
+    fig_m = go.Figure()
+    fig_m.add_trace(go.Bar(
+        x=monthly["mes_label"], y=monthly["n_clientes_atendidos"],
+        name="Clientes atendidos", marker_color="#3b82f6", yaxis="y",
+        hovertemplate="<b>%{x}</b><br>%{y} clientes<extra></extra>",
+    ))
+    fig_m.add_trace(go.Scatter(
+        x=monthly["mes_label"], y=monthly["ventas_netas"],
+        name="Ventas netas $", mode="lines+markers",
+        line=dict(color="#10b981", width=3), marker=dict(size=8),
+        yaxis="y2",
+        hovertemplate="<b>%{x}</b><br>$%{y:,.0f}<extra></extra>",
+    ))
+    fig_m.update_layout(
+        height=420, margin=dict(l=0, r=0, t=10, b=0),
+        yaxis=dict(title="# Clientes", side="left"),
+        yaxis2=dict(title="Ventas $", overlaying="y", side="right",
+                    showgrid=False),
+        legend=dict(orientation="h", y=-0.2),
+        hovermode="x unified",
     )
-    f_c2.metric(
-        "Visitas por cliente prom.", f"{freq['num_visitas'].mean():.1f}",
-        help="Promedio de facturas por cliente atendido.",
-    )
-    media_dias = freq["dias_entre_visitas_prom"].dropna().mean()
-    f_c3.metric(
-        "Días entre visitas prom.",
-        f"{media_dias:.0f}" if pd.notna(media_dias) else "—",
-        help=(
-            "Promedio de días entre facturas consecutivas para clientes con "
-            "más de 1 visita en el período."
-        ),
-    )
+    st.plotly_chart(fig_m, use_container_width=True)
+
     st.dataframe(
-        freq.rename(columns={
-            "partner_name": "Cliente",
-            "num_visitas": "# Visitas",
-            "dias_entre_visitas_prom": "Días entre visitas",
-            "ultima_visita": "Última visita",
-            "dias_desde_ultima": "Días desde última",
-            "ventas_periodo": "Ventas período",
-        })[[
-            "Cliente", "# Visitas", "Días entre visitas",
-            "Última visita", "Días desde última", "Ventas período",
-        ]],
+        monthly[["mes_label", "n_clientes_atendidos", "n_facturas",
+                 "ventas_netas", "ticket_promedio"]].rename(columns={
+            "mes_label": "Mes",
+            "n_clientes_atendidos": "Clientes atendidos",
+            "n_facturas": "# Facturas",
+            "ventas_netas": "Ventas netas",
+            "ticket_promedio": "Ticket prom.",
+        }),
         column_config={
-            "Ventas período": st.column_config.NumberColumn(format="$ %,.0f"),
-            "Días entre visitas": st.column_config.NumberColumn(format="%.1f"),
-            "Días desde última": st.column_config.NumberColumn(format="%.0f"),
-            "Última visita": st.column_config.DateColumn(format="DD/MM/YYYY"),
+            "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
+            "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
         },
-        use_container_width=True, hide_index=True, height=320,
+        use_container_width=True, hide_index=True,
     )
 
 # ---------------------------------------------------------------------------
@@ -440,31 +333,29 @@ by_city = compute_sales_by_city(
     company_ids=filters["company_ids"],
 )
 if by_city.empty:
-    st.info("No hay datos por ciudad en el período.")
+    st.info("Sin datos por ciudad en el período.")
 else:
-    col_g, col_t = st.columns([2, 3])
-    with col_g:
+    cg, ct = st.columns([2, 3])
+    with cg:
         fig_c = px.bar(
-            by_city.head(15),
-            x="ventas_netas", y="city", orientation="h",
+            by_city.head(15), x="ventas_netas", y="city", orientation="h",
             color="ventas_netas", color_continuous_scale="Blues",
-            labels={"city": "Ciudad", "ventas_netas": "Ventas netas $"},
+            labels={"city": "Ciudad", "ventas_netas": "Ventas $"},
         )
         fig_c.update_layout(
             height=420, margin=dict(l=0, r=0, t=10, b=0),
             yaxis=dict(autorange="reversed"), coloraxis_showscale=False,
         )
         st.plotly_chart(fig_c, use_container_width=True)
-    with col_t:
-        rename_map = {
+    with ct:
+        rename = {
             "city": "Ciudad", "state_name": "Departamento",
             "n_clientes": "# Clientes", "n_facturas": "# Fact.",
             "ventas_netas": "Ventas netas", "ticket_promedio": "Ticket prom.",
             "participacion_pct": "% del total",
         }
-        col_show = [c for c in rename_map if c in by_city.columns]
         st.dataframe(
-            by_city[col_show].rename(columns=rename_map),
+            by_city[[c for c in rename if c in by_city.columns]].rename(columns=rename),
             column_config={
                 "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
                 "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
@@ -474,202 +365,152 @@ else:
         )
 
 # ---------------------------------------------------------------------------
-# Mapa de georeferencia + Zonificación
+# Mapa de georeferencia
 # ---------------------------------------------------------------------------
-st.markdown("### 🗺️ Mapa de clientes y zonificación")
+st.markdown("### 🗺️ Mapa de clientes")
 geo_df = build_geo_dataframe(
     assigned_partners=assigned_partners,
     invoice_lines=lines_team,
     date_from=fecha_desde, date_to=fecha_hasta,
     company_ids=filters["company_ids"],
 )
-
 if geo_df.empty:
     st.warning(
-        "Ningún cliente asignado tiene coordenadas GPS válidas en Odoo "
-        "(`partner_latitude` / `partner_longitude`). Para activar el mapa, "
-        "geolocaliza los clientes en Odoo (Contactos → acción Geolocalizar)."
+        "Ningún cliente del equipo tiene coordenadas GPS válidas "
+        "(`partner_latitude` / `partner_longitude` vacías o en cero). "
+        "En Odoo: Contactos → seleccionar clientes → Acción → "
+        "Geolocalizar partners."
     )
 else:
-    map_c1, map_c2 = st.columns([1, 3])
-    with map_c1:
-        n_zones = st.slider("Número de zonas", 2, 10, 5, key="ruta_n_zonas")
-        modo_color = st.radio(
-            "Colorear por", ["Zona", "Atendido / No atendido", "Ventas"],
-            index=0, key="ruta_modo_color",
-        )
-    geo_df = zonify_partners(geo_df, n_zones=n_zones)
-
-    with map_c2:
-        if modo_color == "Zona" and "zona" in geo_df.columns:
-            color_col = "zona"
-        elif modo_color == "Atendido / No atendido":
-            geo_df["estado"] = geo_df["es_atendido"].map(
-                {True: "✅ Atendido", False: "❌ Sin atender"}
-            )
-            color_col = "estado"
-        else:
-            color_col = "ventas_periodo"
-
-        # Tamaño del punto: ventas (con piso para los $0)
-        size_col = "ventas_periodo"
-        geo_df["_size"] = geo_df[size_col].clip(lower=0).fillna(0)
-        # Mínimo visual
-        max_v = float(geo_df["_size"].max() or 1)
-        geo_df["_size"] = geo_df["_size"].apply(lambda v: max(v, max_v * 0.05))
-
-        fig_map = px.scatter_mapbox(
-            geo_df, lat="lat", lon="lon",
-            color=color_col,
-            size="_size",
-            size_max=25,
-            hover_name="partner_name",
-            hover_data={
-                "city": True if "city" in geo_df.columns else False,
-                "ventas_periodo": ":,.0f",
-                "num_visitas": True,
-                "lat": False, "lon": False, "_size": False,
-            },
-            zoom=6,
-            height=550,
-            color_continuous_scale="Viridis" if color_col == "ventas_periodo" else None,
-        )
-        fig_map.update_layout(
-            mapbox_style="open-street-map",
-            margin=dict(l=0, r=0, t=0, b=0),
-        )
-        st.plotly_chart(fig_map, use_container_width=True)
-
-    # Resumen por zona
-    if "zona" in geo_df.columns:
-        st.markdown("##### 📍 Resumen por zona")
-        zona_stats = (
-            geo_df.groupby("zona")
-            .agg(
-                n_clientes=("partner_id", "count"),
-                n_atendidos=("es_atendido", "sum"),
-                ventas=("ventas_periodo", "sum"),
-                visitas=("num_visitas", "sum"),
-                lat_centro=("lat", "mean"),
-                lon_centro=("lon", "mean"),
-            )
-            .reset_index()
-        )
-        zona_stats["cobertura_pct"] = (
-            zona_stats["n_atendidos"] / zona_stats["n_clientes"] * 100
-        ).round(1)
-        zona_stats["ticket_prom"] = (
-            zona_stats["ventas"] / zona_stats["visitas"].replace(0, np.nan)
-        ).fillna(0)
-        st.dataframe(
-            zona_stats[[
-                "zona", "n_clientes", "n_atendidos", "cobertura_pct",
-                "ventas", "visitas", "ticket_prom",
-            ]].rename(columns={
-                "zona": "Zona", "n_clientes": "# Clientes",
-                "n_atendidos": "# Atendidos", "cobertura_pct": "Cobertura %",
-                "ventas": "Ventas período", "visitas": "Visitas",
-                "ticket_prom": "Ticket prom.",
-            }),
-            column_config={
-                "Ventas período": st.column_config.NumberColumn(format="$ %,.0f"),
-                "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
-                "Cobertura %": st.column_config.NumberColumn(format="%.1f%%"),
-            },
-            use_container_width=True, hide_index=True,
-        )
-
-# ---------------------------------------------------------------------------
-# Oportunidades de venta
-# ---------------------------------------------------------------------------
-st.markdown("### 🎯 Oportunidades de venta")
-op_c1, op_c2 = st.columns(2)
-with op_c1:
-    inact_days = st.slider(
-        "Umbral inactividad (días)", 30, 180, 60, step=15, key="ruta_inact_days",
+    map_modo = st.radio(
+        "Colorear por", ["Ventas", "Atendido / No atendido"],
+        index=0, horizontal=True, key="mapa_modo",
     )
-with op_c2:
-    drop_pct = st.slider(
-        "Caída de ventas (%) — alerta", 10, 80, 30, step=5, key="ruta_drop_pct",
+    if map_modo == "Atendido / No atendido":
+        geo_df["estado"] = geo_df["es_atendido"].map(
+            {True: "✅ Atendido", False: "❌ Sin atender"}
+        )
+        color_col = "estado"
+        color_map = None
+    else:
+        color_col = "ventas_periodo"
+        color_map = "Viridis"
+
+    geo_df["_size"] = geo_df["ventas_periodo"].clip(lower=0).fillna(0)
+    max_v = float(geo_df["_size"].max() or 1)
+    geo_df["_size"] = geo_df["_size"].apply(lambda v: max(v, max_v * 0.05))
+
+    fig_map = px.scatter_mapbox(
+        geo_df, lat="lat", lon="lon",
+        color=color_col, size="_size", size_max=22,
+        hover_name="partner_name",
+        hover_data={
+            "city": True if "city" in geo_df.columns else False,
+            "ventas_periodo": ":,.0f",
+            "num_visitas": True,
+            "lat": False, "lon": False, "_size": False,
+        },
+        zoom=6, height=550,
+        color_continuous_scale=color_map if color_col == "ventas_periodo" else None,
+    )
+    fig_map.update_layout(
+        mapbox_style="open-street-map", margin=dict(l=0, r=0, t=0, b=0),
+    )
+    st.plotly_chart(fig_map, use_container_width=True)
+    st.caption(
+        f"📍 {len(geo_df):,} clientes en el mapa "
+        f"(de {len(assigned_partners):,} totales del equipo). "
+        f"Tamaño del punto = ventas en el período."
     )
 
-opps = detect_opportunities(
+# ---------------------------------------------------------------------------
+# Frecuencia de visita
+# ---------------------------------------------------------------------------
+st.markdown("### 🔁 Frecuencia de visita")
+freq = compute_visit_frequency(
+    invoice_lines=lines_team,
+    assigned_partners=assigned_partners,
+    date_from=fecha_desde, date_to=fecha_hasta,
+    company_ids=filters["company_ids"],
+)
+if freq.empty:
+    st.info("Sin visitas en el período.")
+else:
+    f_c1, f_c2, f_c3 = st.columns(3)
+    f_c1.metric(
+        "Visitas totales", f"{int(freq['num_visitas'].sum()):,}",
+        help="Suma de facturas (visita = factura emitida).",
+    )
+    f_c2.metric(
+        "Visitas por cliente", f"{freq['num_visitas'].mean():.1f}",
+    )
+    media_dias = freq["dias_entre_visitas_prom"].dropna().mean()
+    f_c3.metric(
+        "Días entre visitas", f"{media_dias:.0f}" if pd.notna(media_dias) else "—",
+        help="Promedio sobre clientes con más de 1 visita en el período.",
+    )
+    st.dataframe(
+        freq.rename(columns={
+            "partner_name": "Cliente", "city": "Ciudad",
+            "num_visitas": "# Visitas",
+            "dias_entre_visitas_prom": "Días entre visitas",
+            "ultima_visita": "Última visita",
+            "dias_desde_ultima": "Días desde última",
+            "ventas_periodo": "Ventas período",
+        })[["Cliente", "Ciudad", "# Visitas", "Días entre visitas",
+            "Última visita", "Días desde última", "Ventas período"]],
+        column_config={
+            "Ventas período": st.column_config.NumberColumn(format="$ %,.0f"),
+            "Días entre visitas": st.column_config.NumberColumn(format="%.1f"),
+            "Días desde última": st.column_config.NumberColumn(format="%.0f"),
+            "Última visita": st.column_config.DateColumn(format="DD/MM/YYYY"),
+        },
+        use_container_width=True, hide_index=True, height=320,
+    )
+
+# ---------------------------------------------------------------------------
+# Clientes inactivos
+# ---------------------------------------------------------------------------
+st.markdown("### 😴 Clientes inactivos")
+threshold = st.slider(
+    "Umbral de inactividad (días)", 30, 180, 60, step=15, key="ruta_inact",
+)
+inact = detect_inactive_clients(
     invoice_lines=lines_team,
     assigned_partners=assigned_partners,
     cutoff=fecha_hasta,
     company_ids=filters["company_ids"],
-    inactivity_threshold_days=inact_days,
-    drop_threshold_pct=float(drop_pct),
+    threshold_days=threshold,
 )
-
-tab_inact, tab_caida = st.tabs(["😴 Clientes inactivos", "📉 Clientes en caída"])
-
-with tab_inact:
-    inactivos = opps["inactivos"]
-    if inactivos is None or inactivos.empty:
-        st.success(f"✅ No hay clientes inactivos por más de {inact_days} días.")
-    else:
-        st.caption(
-            f"{len(inactivos):,} clientes asignados al equipo NO compran hace "
-            f"más de **{inact_days} días**. Ordenados por valor histórico (los "
-            "más valiosos primero — son los que más urge reactivar)."
-        )
-        cols = [c for c in [
-            "partner_name", "city", "ultima_factura", "dias_desde_ultima",
-            "ventas_historicas",
-        ] if c in inactivos.columns]
-        rename = {
+if inact.empty:
+    st.success(f"✅ Ningún cliente inactivo por más de {threshold} días.")
+else:
+    st.caption(
+        f"{len(inact):,} clientes del equipo NO compran hace más de "
+        f"**{threshold} días**. Ordenados por valor histórico (los más "
+        "valiosos primero — son los que más urge reactivar)."
+    )
+    cols = [c for c in [
+        "partner_name", "city", "ultima_factura",
+        "dias_desde_ultima", "ventas_historicas",
+    ] if c in inact.columns]
+    st.dataframe(
+        inact[cols].rename(columns={
             "partner_name": "Cliente", "city": "Ciudad",
             "ultima_factura": "Última factura",
             "dias_desde_ultima": "Días sin comprar",
             "ventas_historicas": "Ventas históricas",
-        }
-        st.dataframe(
-            inactivos[cols].rename(columns=rename),
-            column_config={
-                "Ventas históricas": st.column_config.NumberColumn(format="$ %,.0f"),
-                "Días sin comprar": st.column_config.NumberColumn(format="%.0f"),
-                "Última factura": st.column_config.DateColumn(format="DD/MM/YYYY"),
-            },
-            use_container_width=True, hide_index=True, height=400,
-        )
-
-with tab_caida:
-    caida = opps["en_caida"]
-    if caida is None or caida.empty:
-        st.success(
-            f"✅ Ningún cliente tiene caída de ventas mayor a {drop_pct}% "
-            "vs el mes anterior."
-        )
-    else:
-        st.caption(
-            f"{len(caida):,} clientes con caída de ventas mayor a **{drop_pct}%** "
-            "vs mes anterior. Los primeros son los que más bajaron en pesos."
-        )
-        cols = [c for c in [
-            "partner_name", "city", "ventas_anterior",
-            "ventas_actual", "var_pct", "caida_abs",
-        ] if c in caida.columns]
-        rename = {
-            "partner_name": "Cliente", "city": "Ciudad",
-            "ventas_anterior": "Mes anterior",
-            "ventas_actual": "Mes actual",
-            "var_pct": "Variación %",
-            "caida_abs": "Caída ($)",
-        }
-        st.dataframe(
-            caida[cols].rename(columns=rename),
-            column_config={
-                "Mes anterior": st.column_config.NumberColumn(format="$ %,.0f"),
-                "Mes actual": st.column_config.NumberColumn(format="$ %,.0f"),
-                "Caída ($)": st.column_config.NumberColumn(format="$ %,.0f"),
-                "Variación %": st.column_config.NumberColumn(format="%+.1f%%"),
-            },
-            use_container_width=True, hide_index=True, height=400,
-        )
+        }),
+        column_config={
+            "Ventas históricas": st.column_config.NumberColumn(format="$ %,.0f"),
+            "Días sin comprar": st.column_config.NumberColumn(format="%.0f"),
+            "Última factura": st.column_config.DateColumn(format="DD/MM/YYYY"),
+        },
+        use_container_width=True, hide_index=True, height=400,
+    )
 
 # ---------------------------------------------------------------------------
-# Export Excel
+# Export
 # ---------------------------------------------------------------------------
 st.markdown("---")
 buf = io.BytesIO()
@@ -679,23 +520,23 @@ with pd.ExcelWriter(buf, engine="xlsxwriter") as writer:
         "Período desde": fecha_desde,
         "Período hasta": fecha_hasta,
         "Ventas netas": kpis.ventas_netas,
-        "Clientes asignados": cov["n_clientes_asignados"],
-        "Clientes atendidos": cov["n_clientes_atendidos"],
-        "Cobertura %": cov["cobertura_pct"],
-        "Clientes nuevos": cov["n_clientes_nuevos"],
-        "Inactivos > 60d": cov["n_clientes_inactivos_60d"],
+        "# Facturas": kpis.n_facturas,
+        "Clientes atendidos": kpis.n_clientes_unicos,
+        "Clientes vinculados": len(assigned_partners),
+        "Cobertura %": cobertura,
     }]).to_excel(writer, sheet_name="Resumen", index=False)
-    if not freq.empty:
-        freq.to_excel(writer, sheet_name="Frecuencia visita", index=False)
+    if not monthly.empty:
+        monthly.drop(columns=["mes"]).to_excel(
+            writer, sheet_name="Mensual", index=False)
     if not by_city.empty:
         by_city.to_excel(writer, sheet_name="Por ciudad", index=False)
+    if not freq.empty:
+        freq.to_excel(writer, sheet_name="Frecuencia", index=False)
+    if not inact.empty:
+        inact.to_excel(writer, sheet_name="Inactivos", index=False)
     if not geo_df.empty:
         geo_df.drop(columns=[c for c in ["_size"] if c in geo_df.columns])\
-              .to_excel(writer, sheet_name="Mapa clientes", index=False)
-    if not opps["inactivos"].empty:
-        opps["inactivos"].to_excel(writer, sheet_name="Inactivos", index=False)
-    if not opps["en_caida"].empty:
-        opps["en_caida"].to_excel(writer, sheet_name="En caida", index=False)
+            .to_excel(writer, sheet_name="Mapa", index=False)
 
 st.download_button(
     "⬇️ Descargar Excel — Ventas en Ruta",
