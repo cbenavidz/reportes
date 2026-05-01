@@ -32,15 +32,63 @@ logger = logging.getLogger(__name__)
 # Helpers
 # =============================================================================
 
+def get_partners_by_team(
+    partners: pd.DataFrame,
+    team_name: str = "Lubricantes",
+) -> pd.DataFrame:
+    """
+    Filtra partners por equipo de ventas (`crm.team`).
+
+    Match case-insensitive contains contra `team_name` columna del partner.
+    Si el campo `team_name` no existe en el DataFrame (campo no extraído),
+    devuelve un DataFrame vacío.
+    """
+    if partners is None or partners.empty or "team_name" not in partners.columns:
+        return pd.DataFrame()
+    target = team_name.strip().lower()
+    if not target:
+        return pd.DataFrame()
+    mask = (
+        partners["team_name"]
+        .astype("string")
+        .fillna("")
+        .str.strip()
+        .str.lower()
+        .str.contains(target, regex=False, na=False)
+    )
+    return partners[mask].reset_index(drop=True)
+
+
+def get_team_sellers(
+    partners: pd.DataFrame,
+    team_name: str = "Lubricantes",
+) -> dict[int, str]:
+    """
+    Devuelve {user_id: user_name} con los vendedores activos en un equipo.
+
+    Se infiere desde los partners: los `user_id` distintos asignados a
+    clientes del equipo. Si no hay clientes con team asignado, devuelve {}.
+    """
+    team_partners = get_partners_by_team(partners, team_name)
+    if team_partners.empty or "user_id" not in team_partners.columns:
+        return {}
+    df = team_partners[["user_id", "user_name"]].dropna(subset=["user_id"]).copy()
+    if df.empty:
+        return {}
+    df["user_id"] = df["user_id"].astype(int)
+    df = df.drop_duplicates("user_id")
+    return dict(zip(df["user_id"], df["user_name"].fillna("—").astype(str)))
+
+
 def get_external_sellers(
     partners: pd.DataFrame,
     seller_names: Iterable[str] = ("Luis Felipe Hurtado", "Yarley Vanessa"),
 ) -> dict[int, str]:
     """
-    Devuelve un dict {user_id: user_name} con los vendedores externos.
+    DEPRECATED — preferir `get_team_sellers("Lubricantes")` que es robusto
+    a cambios de personal. Se mantiene por compatibilidad.
 
-    Busca por nombre (case-insensitive, contains) en `partners["user_name"]`.
-    Si la lista de nombres es exhaustiva (sólo 2 personas), esto basta.
+    Devuelve un dict {user_id: user_name} buscando por nombre.
     """
     if partners is None or partners.empty or "user_id" not in partners.columns:
         return {}

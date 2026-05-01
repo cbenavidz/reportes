@@ -35,7 +35,8 @@ from src.route_sales import (
     compute_visit_frequency,
     detect_opportunities,
     get_assigned_partners,
-    get_external_sellers,
+    get_partners_by_team,
+    get_team_sellers,
     zonify_partners,
 )
 from src.sales_analyzer import (
@@ -96,60 +97,67 @@ except Exception as exc:  # noqa: BLE001
     st.stop()
 
 # ---------------------------------------------------------------------------
-# Selección de vendedores externos
+# Selección de equipo de ventas
 # ---------------------------------------------------------------------------
-DEFAULT_EXTERNAL_SELLERS = ("Luis Felipe Hurtado", "Yarley Vanessa")
+DEFAULT_TEAM = "Lubricantes"
 
-# Construir mapa user_id → user_name de TODOS los vendedores
-all_sellers = (
-    partners_all[["user_id", "user_name"]]
-    .dropna(subset=["user_id"])
-    .drop_duplicates("user_id")
-    .copy()
-)
-all_sellers["user_id"] = all_sellers["user_id"].astype(int)
-all_sellers = all_sellers.sort_values("user_name")
+st.markdown("### 🏷️ Equipo de ventas")
 
-default_external = get_external_sellers(partners_all, DEFAULT_EXTERNAL_SELLERS)
-default_ids = list(default_external.keys())
+# Lista de equipos disponibles (de los partners cargados)
+if "team_name" in partners_all.columns:
+    team_options = sorted(
+        partners_all["team_name"]
+        .dropna().astype(str).str.strip().replace("", pd.NA).dropna()
+        .unique().tolist()
+    )
+else:
+    team_options = []
 
-st.markdown("### 👥 Vendedores externos")
-seller_options = all_sellers["user_name"].tolist()
-default_names = [n for n in seller_options if all_sellers.loc[
-    all_sellers["user_name"] == n, "user_id"
-].iloc[0] in default_ids]
-
-selected_names = st.multiselect(
-    "Selecciona los vendedores externos a analizar",
-    options=seller_options,
-    default=default_names if default_names else seller_options[:2],
-    help=(
-        "Por defecto: Luis Felipe Hurtado y Yarley Vanessa. "
-        "Puedes cambiar la selección si tu equipo crece."
-    ),
-)
-
-if not selected_names:
-    st.warning("Selecciona al menos un vendedor.")
-    st.stop()
-
-selected_user_ids = (
-    all_sellers.loc[all_sellers["user_name"].isin(selected_names), "user_id"]
-    .astype(int).tolist()
-)
-
-# Clientes asignados a esos vendedores
-assigned_partners = get_assigned_partners(partners_all, selected_user_ids)
-if assigned_partners.empty:
-    st.warning(
-        "Los vendedores seleccionados no tienen clientes asignados "
-        "(`res.partner.user_id`). Revisa la asignación en Odoo."
+if not team_options:
+    st.error(
+        "Ningún cliente tiene equipo de ventas asignado en Odoo "
+        "(`res.partner.team_id`). Asigna los clientes a un equipo (ej. "
+        "'Lubricantes') desde Contactos en Odoo o usa el filtro "
+        "manual de vendedores más abajo."
     )
     st.stop()
 
+# Default: Lubricantes (si existe)
+default_team_idx = 0
+for i, t in enumerate(team_options):
+    if DEFAULT_TEAM.lower() in t.lower():
+        default_team_idx = i
+        break
+
+selected_team = st.selectbox(
+    "Equipo a analizar",
+    options=team_options,
+    index=default_team_idx,
+    help=(
+        "Filtra por `crm.team` (equipo de ventas asignado al cliente "
+        "en Odoo). Por defecto: Lubricantes — donde están Luis Felipe "
+        "Hurtado y Yarley Vanessa."
+    ),
+)
+
+# Clientes del equipo
+assigned_partners = get_partners_by_team(partners_all, selected_team)
+if assigned_partners.empty:
+    st.warning(
+        f"Ningún cliente está asignado al equipo '{selected_team}' "
+        f"(`res.partner.team_id`). Revisa la asignación en Odoo."
+    )
+    st.stop()
+
+# Vendedores del equipo (derivados de los partners asignados)
+team_sellers = get_team_sellers(partners_all, selected_team)
+seller_names_str = ", ".join(team_sellers.values()) if team_sellers else "—"
+selected_user_ids = list(team_sellers.keys())
+selected_names = list(team_sellers.values())
+
 st.caption(
     f"📋 **{len(assigned_partners):,}** clientes asignados al equipo "
-    f"({', '.join(selected_names)})."
+    f"**{selected_team}** · vendedores: **{seller_names_str}**"
 )
 
 # ---------------------------------------------------------------------------

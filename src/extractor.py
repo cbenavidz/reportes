@@ -64,6 +64,9 @@ PARTNER_FIELDS = [
     # Si no están disponibles en la base, _resolve_partner_fields los omite.
     "partner_latitude",
     "partner_longitude",
+    # Equipo de ventas asignado al cliente (`crm.team`). Permite filtrar
+    # clientes por equipo (ej. "Lubricantes") en el informe Ventas en Ruta.
+    "team_id",
     "customer_rank",
     "credit",
     "credit_limit",
@@ -270,6 +273,10 @@ def _normalize_partners(records: list[dict]) -> pd.DataFrame:
         df = df.drop(columns=["property_payment_term_id"])
     if "user_id" in df.columns:
         df[["user_id", "user_name"]] = df["user_id"].apply(
+            lambda v: pd.Series(_unpack_m2o(v))
+        )
+    if "team_id" in df.columns:
+        df[["team_id", "team_name"]] = df["team_id"].apply(
             lambda v: pd.Series(_unpack_m2o(v))
         )
 
