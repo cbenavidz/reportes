@@ -83,6 +83,7 @@ data = compute_full_analysis(
 render_company_context(data.get("companies"), filters["company_ids"])
 
 partners_all = data.get("raw_partners")
+invoices_all = data.get("raw_invoices")
 if partners_all is None or partners_all.empty:
     st.error("No se pudieron cargar los clientes. Revisa la conexión con Odoo.")
     st.stop()
@@ -103,22 +104,27 @@ DEFAULT_TEAM = "Lubricantes"
 
 st.markdown("### 🏷️ Equipo de ventas")
 
-# Lista de equipos disponibles (de los partners cargados)
+# Lista de equipos disponibles. Probamos primero desde partners; si está
+# vacío, usamos los teams de las facturas (donde sí están poblados).
+team_options: list[str] = []
 if "team_name" in partners_all.columns:
     team_options = sorted(
         partners_all["team_name"]
         .dropna().astype(str).str.strip().replace("", pd.NA).dropna()
         .unique().tolist()
     )
-else:
-    team_options = []
+if not team_options and invoices_all is not None and "team_name" in invoices_all.columns:
+    team_options = sorted(
+        invoices_all["team_name"]
+        .dropna().astype(str).str.strip().replace("", pd.NA).dropna()
+        .unique().tolist()
+    )
 
 if not team_options:
     st.error(
-        "Ningún cliente tiene equipo de ventas asignado en Odoo "
-        "(`res.partner.team_id`). Asigna los clientes a un equipo (ej. "
-        "'Lubricantes') desde Contactos en Odoo o usa el filtro "
-        "manual de vendedores más abajo."
+        "Ningún equipo de ventas detectado ni en `res.partner.team_id` ni "
+        "en `account.move.team_id`. Verifica que tus vendedores estén "
+        "asignados a un equipo (`crm.team`) en Odoo."
     )
     st.stop()
 
@@ -134,29 +140,33 @@ selected_team = st.selectbox(
     options=team_options,
     index=default_team_idx,
     help=(
-        "Filtra por `crm.team` (equipo de ventas asignado al cliente "
-        "en Odoo). Por defecto: Lubricantes — donde están Luis Felipe "
-        "Hurtado y Yarley Vanessa."
+        "Filtra por `crm.team`. Si los clientes en Odoo no tienen team "
+        "asignado en su ficha, derivamos el equipo desde las facturas "
+        "(team del vendedor que las emitió). Por defecto: Lubricantes."
     ),
 )
 
-# Clientes del equipo
-assigned_partners = get_partners_by_team(partners_all, selected_team)
+# Clientes del equipo (usa partners si tienen team, fallback a invoices)
+assigned_partners = get_partners_by_team(
+    partners_all, selected_team, invoices=invoices_all,
+)
 if assigned_partners.empty:
     st.warning(
-        f"Ningún cliente está asignado al equipo '{selected_team}' "
-        f"(`res.partner.team_id`). Revisa la asignación en Odoo."
+        f"Ningún cliente identificado para el equipo '{selected_team}'. "
+        f"Verifica que haya facturas emitidas por vendedores de ese equipo."
     )
     st.stop()
 
-# Vendedores del equipo (derivados de los partners asignados)
-team_sellers = get_team_sellers(partners_all, selected_team)
+# Vendedores del equipo
+team_sellers = get_team_sellers(
+    partners_all, selected_team, invoices=invoices_all,
+)
 seller_names_str = ", ".join(team_sellers.values()) if team_sellers else "—"
 selected_user_ids = list(team_sellers.keys())
 selected_names = list(team_sellers.values())
 
 st.caption(
-    f"📋 **{len(assigned_partners):,}** clientes asignados al equipo "
+    f"📋 **{len(assigned_partners):,}** clientes del equipo "
     f"**{selected_team}** · vendedores: **{seller_names_str}**"
 )
 

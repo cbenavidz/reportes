@@ -43,41 +43,103 @@ logger = logging.getLogger(__name__)
 def get_partners_by_team(
     partners: pd.DataFrame,
     team_name: str = "Lubricantes",
+    invoices: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Filtra partners por equipo de ventas (`crm.team`).
 
-    Match case-insensitive contains contra `team_name` columna del partner.
-    Si el campo `team_name` no existe en el DataFrame (campo no extraído),
-    devuelve un DataFrame vacío.
+    Estrategia (en orden):
+      1) Si `partners["team_name"]` existe Y tiene al menos un valor no
+         vacío, filtra por ahí. Es lo más limpio cuando los clientes
+         tienen `team_id` poblado en `res.partner` desde Odoo.
+      2) Fallback: filtrar las FACTURAS (`invoices["team_name"]`) por el
+         team y devolver los partners que aparecen en esas facturas. Esto
+         funciona aunque `res.partner.team_id` esté vacío en Odoo —
+         captura el equipo desde el vendedor que emitió la factura.
+
+    Match case-insensitive contains.
     """
-    if partners is None or partners.empty or "team_name" not in partners.columns:
+    if partners is None or partners.empty:
         return pd.DataFrame()
     target = team_name.strip().lower()
     if not target:
         return pd.DataFrame()
-    mask = (
-        partners["team_name"]
-        .astype("string")
-        .fillna("")
-        .str.strip()
-        .str.lower()
-        .str.contains(target, regex=False, na=False)
+
+    # Estrategia 1: team_name en partner directo
+    if "team_name" in partners.columns:
+        team_col = (
+            partners["team_name"]
+            .astype("string").fillna("").str.strip()
+        )
+        if (team_col != "").any():
+            mask = team_col.str.lower().str.contains(target, regex=False, na=False)
+            if mask.any():
+                return partners[mask].reset_index(drop=True)
+
+    # Estrategia 2: derivar partner_ids del equipo desde las facturas
+    if invoices is None or invoices.empty or "team_name" not in invoices.columns:
+        return pd.DataFrame()
+    inv_team = (
+        invoices["team_name"]
+        .astype("string").fillna("").str.strip().str.lower()
     )
-    return partners[mask].reset_index(drop=True)
+    inv_mask = inv_team.str.contains(target, regex=False, na=False)
+    if not inv_mask.any():
+        return pd.DataFrame()
+    partner_ids_team = (
+        pd.to_numeric(invoices.loc[inv_mask, "partner_id"], errors="coerce")
+        .dropna().astype(int).unique().tolist()
+    )
+    if not partner_ids_team:
+        return pd.DataFrame()
+    return partners[
+        pd.to_numeric(partners["id"], errors="coerce").isin(partner_ids_team)
+    ].reset_index(drop=True)
 
 
 def get_team_sellers(
     partners: pd.DataFrame,
     team_name: str = "Lubricantes",
+    invoices: pd.DataFrame | None = None,
 ) -> dict[int, str]:
     """
-    Devuelve {user_id: user_name} con los vendedores activos en un equipo.
+    Devuelve {user_id: user_name} con los vendedores del equipo.
 
-    Se infiere desde los partners: los `user_id` distintos asignados a
-    clientes del equipo. Si no hay clientes con team asignado, devuelve {}.
+    Estrategia:
+      1) Si las FACTURAS tienen team_name, derivar los user_id distintos
+         de las facturas con ese team (lo más fiel a la operación real).
+      2) Fallback: usar `partners[partners.team_name == X].user_id`.
     """
-    team_partners = get_partners_by_team(partners, team_name)
+    target = team_name.strip().lower()
+    if not target:
+        return {}
+
+    # Estrategia 1: desde facturas
+    if (
+        invoices is not None and not invoices.empty
+        and "team_name" in invoices.columns
+        and "invoice_user_id" in invoices.columns
+    ):
+        team_col = (
+            invoices["team_name"]
+            .astype("string").fillna("").str.strip().str.lower()
+        )
+        sub = invoices[team_col.str.contains(target, regex=False, na=False)]
+        if not sub.empty:
+            df = sub[["invoice_user_id", "invoice_user_id_name"]].copy() \
+                if "invoice_user_id_name" in sub.columns \
+                else sub[["invoice_user_id"]].assign(invoice_user_id_name=None)
+            df = df.dropna(subset=["invoice_user_id"])
+            if not df.empty:
+                df["invoice_user_id"] = df["invoice_user_id"].astype(int)
+                df = df.drop_duplicates("invoice_user_id")
+                return dict(zip(
+                    df["invoice_user_id"],
+                    df["invoice_user_id_name"].fillna("—").astype(str),
+                ))
+
+    # Estrategia 2: desde partners
+    team_partners = get_partners_by_team(partners, team_name, invoices=invoices)
     if team_partners.empty or "user_id" not in team_partners.columns:
         return {}
     df = team_partners[["user_id", "user_name"]].dropna(subset=["user_id"]).copy()
