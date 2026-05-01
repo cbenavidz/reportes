@@ -55,8 +55,15 @@ PARTNER_FIELDS = [
     "phone",
     "mobile",
     "street",
+    "street2",
+    "zip",
     "city",
+    "state_id",
     "country_id",
+    # Coordenadas GPS para mapas de georeferencia (módulo `base_geolocalize`).
+    # Si no están disponibles en la base, _resolve_partner_fields los omite.
+    "partner_latitude",
+    "partner_longitude",
     "customer_rank",
     "credit",
     "credit_limit",
@@ -252,6 +259,10 @@ def _normalize_partners(records: list[dict]) -> pd.DataFrame:
         df[["country_id", "country_name"]] = df["country_id"].apply(
             lambda v: pd.Series(_unpack_m2o(v))
         )
+    if "state_id" in df.columns:
+        df[["state_id", "state_name"]] = df["state_id"].apply(
+            lambda v: pd.Series(_unpack_m2o(v))
+        )
     if "property_payment_term_id" in df.columns:
         df[["payment_term_id", "payment_term_name"]] = df[
             "property_payment_term_id"
@@ -266,6 +277,10 @@ def _normalize_partners(records: list[dict]) -> pd.DataFrame:
         df["create_date"] = pd.to_datetime(df["create_date"], errors="coerce")
     df["credit"] = pd.to_numeric(df.get("credit"), errors="coerce").fillna(0.0)
     df["credit_limit"] = pd.to_numeric(df.get("credit_limit"), errors="coerce").fillna(0.0)
+    # Coordenadas GPS — pueden venir como False, None o número
+    for geo_col in ("partner_latitude", "partner_longitude"):
+        if geo_col in df.columns:
+            df[geo_col] = pd.to_numeric(df[geo_col], errors="coerce")
     if "days_sales_outstanding" in df.columns:
         df["days_sales_outstanding"] = pd.to_numeric(
             df["days_sales_outstanding"], errors="coerce"
