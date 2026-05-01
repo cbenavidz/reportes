@@ -102,10 +102,10 @@ except Exception as exc:  # noqa: BLE001
 # ---------------------------------------------------------------------------
 DEFAULT_TEAM = "Lubricantes"
 
-st.markdown("### 🏷️ Equipo de ventas")
+st.markdown("### 🏷️ Equipo / Vendedores")
 
 # Lista de equipos disponibles. Probamos primero desde partners; si está
-# vacío, usamos los teams de las facturas (donde sí están poblados).
+# vacío, usamos los teams de las facturas.
 team_options: list[str] = []
 if "team_name" in partners_all.columns:
     team_options = sorted(
@@ -120,55 +120,128 @@ if not team_options and invoices_all is not None and "team_name" in invoices_all
         .unique().tolist()
     )
 
-if not team_options:
-    st.error(
-        "Ningún equipo de ventas detectado ni en `res.partner.team_id` ni "
-        "en `account.move.team_id`. Verifica que tus vendedores estén "
-        "asignados a un equipo (`crm.team`) en Odoo."
+if team_options:
+    # Default: Lubricantes (si existe)
+    default_team_idx = 0
+    for i, t in enumerate(team_options):
+        if DEFAULT_TEAM.lower() in t.lower():
+            default_team_idx = i
+            break
+    selected_team = st.selectbox(
+        "Equipo a analizar",
+        options=team_options, index=default_team_idx,
+        help=(
+            "Filtra por `crm.team`. Si los clientes en Odoo no tienen team "
+            "asignado en su ficha, derivamos el equipo desde las facturas."
+        ),
     )
-    st.stop()
-
-# Default: Lubricantes (si existe)
-default_team_idx = 0
-for i, t in enumerate(team_options):
-    if DEFAULT_TEAM.lower() in t.lower():
-        default_team_idx = i
-        break
-
-selected_team = st.selectbox(
-    "Equipo a analizar",
-    options=team_options,
-    index=default_team_idx,
-    help=(
-        "Filtra por `crm.team`. Si los clientes en Odoo no tienen team "
-        "asignado en su ficha, derivamos el equipo desde las facturas "
-        "(team del vendedor que las emitió). Por defecto: Lubricantes."
-    ),
-)
-
-# Clientes del equipo (usa partners si tienen team, fallback a invoices)
-assigned_partners = get_partners_by_team(
-    partners_all, selected_team, invoices=invoices_all,
-)
-if assigned_partners.empty:
-    st.warning(
-        f"Ningún cliente identificado para el equipo '{selected_team}'. "
-        f"Verifica que haya facturas emitidas por vendedores de ese equipo."
+    assigned_partners = get_partners_by_team(
+        partners_all, selected_team, invoices=invoices_all,
     )
-    st.stop()
+    team_sellers = get_team_sellers(
+        partners_all, selected_team, invoices=invoices_all,
+    )
+    selected_user_ids = list(team_sellers.keys())
+    selected_names = list(team_sellers.values())
+    seller_names_str = ", ".join(selected_names) if selected_names else "—"
+    st.caption(
+        f"📋 **{len(assigned_partners):,}** clientes del equipo "
+        f"**{selected_team}** · vendedores: **{seller_names_str}**"
+    )
+else:
+    # Fallback: ningún `crm.team` configurado. Selección manual de vendedores
+    # por nombre. Por defecto preseleccionamos los del equipo Lubricantes.
+    st.info(
+        "ℹ️ Tus vendedores no están asignados a un `crm.team` en Odoo. "
+        "Selecciona manualmente los vendedores externos. "
+        "*(Para mayor robustez, te recomendamos crear el equipo "
+        "'Lubricantes' en Odoo y asignarles los vendedores.)*"
+    )
+    # Construimos lista desde invoice_user_id en facturas (más fiel) o
+    # desde partner.user_id como fallback.
+    seller_options_df = pd.DataFrame()
+    if (
+        invoices_all is not None and not invoices_all.empty
+        and "invoice_user_id" in invoices_all.columns
+        and "invoice_user_id_name" in invoices_all.columns
+    ):
+        seller_options_df = (
+            invoices_all[["invoice_user_id", "invoice_user_id_name"]]
+            .dropna(subset=["invoice_user_id"])
+            .drop_duplicates("invoice_user_id")
+            .rename(columns={
+                "invoice_user_id": "user_id",
+                "invoice_user_id_name": "user_name",
+            })
+        )
+    if seller_options_df.empty and "user_id" in partners_all.columns:
+        seller_options_df = (
+            partners_all[["user_id", "user_name"]]
+            .dropna(subset=["user_id"])
+            .drop_duplicates("user_id")
+        )
+    if seller_options_df.empty:
+        st.error(
+            "No se pudo detectar ningún vendedor en facturas ni en "
+            "clientes. Revisa la configuración de Odoo."
+        )
+        st.stop()
+    seller_options_df["user_id"] = seller_options_df["user_id"].astype(int)
+    seller_options_df = seller_options_df.sort_values("user_name")
 
-# Vendedores del equipo
-team_sellers = get_team_sellers(
-    partners_all, selected_team, invoices=invoices_all,
-)
-seller_names_str = ", ".join(team_sellers.values()) if team_sellers else "—"
-selected_user_ids = list(team_sellers.keys())
-selected_names = list(team_sellers.values())
-
-st.caption(
-    f"📋 **{len(assigned_partners):,}** clientes del equipo "
-    f"**{selected_team}** · vendedores: **{seller_names_str}**"
-)
+    seller_options = seller_options_df["user_name"].tolist()
+    # Default: Yarley Vanessa y Luis Felipe Hurtado (si existen)
+    DEFAULTS = ["Yarley Vanessa", "Luis Felipe Hurtado", "Luis Felipe", "Yarley"]
+    default_names = [
+        n for n in seller_options
+        if any(d.lower() in str(n).lower() for d in DEFAULTS)
+    ]
+    selected_names = st.multiselect(
+        "👤 Vendedores externos",
+        options=seller_options,
+        default=default_names if default_names else seller_options[:2],
+        help=(
+            "Selecciona los vendedores externos. Por defecto: "
+            "Yarley Vanessa y Luis Felipe Hurtado."
+        ),
+    )
+    if not selected_names:
+        st.warning("Selecciona al menos un vendedor.")
+        st.stop()
+    selected_user_ids = (
+        seller_options_df.loc[
+            seller_options_df["user_name"].isin(selected_names), "user_id"
+        ].astype(int).tolist()
+    )
+    # Clientes asignados: por user_id en partner o por invoice_user_id en facturas.
+    asig_set: set[int] = set()
+    # 1) Partners cuyos user_id están en los seleccionados
+    if "user_id" in partners_all.columns:
+        ids_p = pd.to_numeric(partners_all["user_id"], errors="coerce")
+        asig_set.update(
+            partners_all.loc[ids_p.isin(selected_user_ids), "id"]
+            .dropna().astype(int).tolist()
+        )
+    # 2) Partners que aparecen en facturas con invoice_user_id seleccionado
+    if invoices_all is not None and not invoices_all.empty and "invoice_user_id" in invoices_all.columns:
+        ids_i = pd.to_numeric(invoices_all["invoice_user_id"], errors="coerce")
+        asig_set.update(
+            pd.to_numeric(
+                invoices_all.loc[ids_i.isin(selected_user_ids), "partner_id"],
+                errors="coerce",
+            ).dropna().astype(int).tolist()
+        )
+    if not asig_set:
+        st.warning("Los vendedores seleccionados no tienen clientes ni facturas.")
+        st.stop()
+    assigned_partners = partners_all[
+        pd.to_numeric(partners_all["id"], errors="coerce").isin(asig_set)
+    ].reset_index(drop=True)
+    selected_team = "Lubricantes"  # Etiqueta para títulos posteriores
+    st.caption(
+        f"📋 **{len(assigned_partners):,}** clientes del equipo "
+        f"**{selected_team}** · vendedores: **{', '.join(selected_names)}**"
+    )
 
 # ---------------------------------------------------------------------------
 # Período del informe
