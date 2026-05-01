@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-Análisis de Ventas en Ruta — vendedores externos.
+Análisis de Ventas en Ruta — equipo de ventas externas.
 
-Métricas específicas de un equipo que visita clientes en territorio:
+Métricas específicas de un equipo que visita clientes en territorio
+(por defecto: equipo "Lubricantes" → Yarley Vanessa, Luis Felipe Hurtado):
   - Cobertura: % de clientes asignados que recibieron al menos 1 factura.
   - Frecuencia de visita: días promedio entre facturas a un mismo cliente.
   - Clientes nuevos en el período (primera factura emitida).
@@ -13,6 +14,13 @@ Métricas específicas de un equipo que visita clientes en territorio:
 
 Anclado a `invoice_date` (fecha de FACTURACIÓN), igual que el resto del
 informe de ventas. SOAT/ANTCL excluidos automáticamente.
+
+Funciones públicas:
+  - get_partners_by_team(partners, team_name)
+  - get_team_sellers(partners, team_name)
+  - get_assigned_partners(partners, user_ids)
+  - compute_coverage_kpis, compute_visit_frequency, compute_sales_by_city
+  - build_geo_dataframe, zonify_partners, detect_opportunities
 """
 from __future__ import annotations
 
