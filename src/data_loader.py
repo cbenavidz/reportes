@@ -349,7 +349,8 @@ def filter_analysis_by_vendedor(
 #   v4: KPIs cambian a amount_untaxed_signed (sin IVA, igual que Odoo).
 #   v5: KPIs reconstruyen amount desde líneas (coincidencia exacta).
 #   v6: TODOS los reportes (mensual, vendedor, cliente) calculan desde líneas.
-INVOICE_LINES_CACHE_VERSION = 6
+#   v7: agregado `product_volume` al esquema (campo `volume` de product.product).
+INVOICE_LINES_CACHE_VERSION = 7
 
 
 @st.cache_data(ttl=900, show_spinner="Descargando líneas de factura (productos)...")

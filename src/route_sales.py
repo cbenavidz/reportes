@@ -120,9 +120,13 @@ def compute_monthly_clients_kpi(
     else:
         df = df.copy()
         df["mes"] = df["_d"].dt.to_period("M")
-        # Volumen signed: quantity con signo según move_type (refunds restan)
+        # Volumen físico = quantity × product.volume × signo del move_type.
+        # `product_volume` viene del extractor (campo `volume` de product.product).
+        # Para Casa de los Mineros, esto da el volumen en galones.
         sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
-        df["_qty_signed"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0) * sign
+        qty = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
+        unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
+        df["_qty_signed"] = qty * unit_vol * sign
         is_fac = df["move_type"] == "out_invoice"
         agg = pd.DataFrame({
             "n_clientes_atendidos": df.groupby("mes")["partner_id"].nunique(),
@@ -170,10 +174,12 @@ def compute_sales_by_city(
 
     df["city"] = df["city"].fillna("Sin ciudad").replace("", "Sin ciudad")
     is_fac = df["move_type"] == "out_invoice"
-    # Volumen signed (refunds restan)
+    # Volumen físico = quantity × product.volume × signo
     sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
     df = df.copy()
-    df["_qty_signed"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0) * sign
+    qty = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
+    unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
+    df["_qty_signed"] = qty * unit_vol * sign
     grp_cols = ["city"] + (["state_name"] if "state_name" in df.columns else [])
 
     grp = df.groupby(grp_cols)
@@ -232,10 +238,12 @@ def compute_visit_frequency(
         .sort_values(["partner_id", "_d"])
     )
     ventas_pid = df.groupby("partner_id")["price_subtotal_signed"].sum().to_dict()
-    # Volumen signed por cliente
+    # Volumen físico = quantity × product.volume × signo
     sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
     df = df.copy()
-    df["_qty_signed"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0) * sign
+    qty = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
+    unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
+    df["_qty_signed"] = qty * unit_vol * sign
     volumen_pid = df.groupby("partner_id")["_qty_signed"].sum().to_dict()
     name_pid = (
         df.dropna(subset=["partner_name"])

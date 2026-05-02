@@ -620,18 +620,28 @@ def extract_invoice_lines(
             prod_records = client.search_read(
                 "product.product",
                 domain=[("id", "in", product_ids)],
-                fields=["id", "categ_id", "default_code", "name"],
+                fields=["id", "categ_id", "default_code", "name", "volume"],
             )
             cat_map: dict[int, tuple[int | None, str | None]] = {}
             code_map: dict[int, str | None] = {}
+            volume_map: dict[int, float] = {}
             for p in prod_records:
                 cid, cname = _unpack_m2o(p.get("categ_id"))
                 cat_map[int(p["id"])] = (cid, cname)
                 code_map[int(p["id"])] = p.get("default_code") or None
+                # `product.volume` es float (m³ típicamente, pero el negocio
+                # decide la unidad — para Casa de los Mineros son galones).
+                vol = p.get("volume")
+                try:
+                    volume_map[int(p["id"])] = float(vol) if vol else 0.0
+                except (TypeError, ValueError):
+                    volume_map[int(p["id"])] = 0.0
             logger.info(
-                "Enriquecimiento productos: %d productos, %d categorías únicas",
+                "Enriquecimiento productos: %d productos, %d categorías únicas, "
+                "%d con volume > 0",
                 len(cat_map),
                 len({c for c, _ in cat_map.values() if c}),
+                sum(1 for v in volume_map.values() if v > 0),
             )
 
             def _cat_id(i):
@@ -649,9 +659,15 @@ def extract_invoice_lines(
                     return None
                 return code_map.get(int(i))
 
+            def _vol(i):
+                if pd.isna(i):
+                    return 0.0
+                return volume_map.get(int(i), 0.0)
+
             df["product_categ_id"] = df["product_id"].map(_cat_id)
             df["product_categ_name"] = df["product_id"].map(_cat_name)
             df["product_default_code"] = df["product_id"].map(_code)
+            df["product_volume"] = df["product_id"].map(_vol)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "No se pudo enriquecer categoría de productos: %s", exc, exc_info=True
@@ -659,10 +675,12 @@ def extract_invoice_lines(
             df["product_categ_id"] = None
             df["product_categ_name"] = None
             df["product_default_code"] = None
+            df["product_volume"] = 0.0
     else:
         df["product_categ_id"] = None
         df["product_categ_name"] = None
         df["product_default_code"] = None
+        df["product_volume"] = 0.0
 
     # Anclar invoice_date desde el move padre (move_id ya viene como nombre,
     # pero `date` de la línea es la fecha contable que en práctica = invoice_date).
