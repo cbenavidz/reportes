@@ -160,7 +160,9 @@ asig_ids = set(assigned_partners["id"].astype(int).tolist())
 
 st.caption(
     f"📋 **{len(assigned_partners):,}** clientes vinculados a "
-    f"**{', '.join(selected_names)}** (asignación o facturación)."
+    f"**{', '.join(selected_names)}** (asignación o facturación). "
+    "Si abajo seleccionas una categoría, los KPIs y conteos de cliente "
+    "se restringen a quienes compran de esa categoría."
 )
 
 # ---------------------------------------------------------------------------
@@ -202,10 +204,27 @@ if selected_cats and not lines_team.empty and "product_categ_name" in lines_team
     lines_team = lines_team[
         lines_team["product_categ_name"].isin(selected_cats)
     ].copy()
+    # Cuántos clientes únicos compraron de la(s) categoría(s) en TODO el
+    # histórico — sirve para entender el alcance del filtro.
+    n_clientes_cat = int(lines_team["partner_id"].nunique()) if not lines_team.empty else 0
     st.caption(
         f"🎯 Filtrando por categoría(s): **{', '.join(selected_cats)}** · "
-        f"{len(lines_team):,} líneas restantes."
+        f"**{n_clientes_cat:,}** clientes han comprado de esta(s) categoría(s) "
+        f"alguna vez · {len(lines_team):,} líneas en el histórico cargado."
     )
+
+# Para los KPIs de cobertura: los clientes "del territorio" que pueden
+# considerarse vinculados a la(s) categoría(s) seleccionada(s) son los
+# que han comprado al menos una vez de esas categorías. Cuando no hay
+# filtro de categoría, son todos los `assigned_partners`.
+if selected_cats and not lines_team.empty:
+    cat_partner_ids = set(lines_team["partner_id"].dropna().astype(int).unique().tolist())
+    territorio_size = max(
+        int(assigned_partners["id"].astype(int).isin(cat_partner_ids).sum()),
+        1,
+    )
+else:
+    territorio_size = len(assigned_partners)
 
 # ---------------------------------------------------------------------------
 # Período del informe
@@ -297,14 +316,22 @@ c4.metric("🎫 Ticket promedio", _fmt_money(kpis.ticket_promedio),
           _fmt_pct(growth["var_ticket_pct"]))
 
 cobertura = (
-    kpis.n_clientes_unicos / len(assigned_partners) * 100
-    if assigned_partners.shape[0] > 0 else 0
+    kpis.n_clientes_unicos / territorio_size * 100
+    if territorio_size > 0 else 0
 )
-st.caption(
-    f"📊 Cobertura: **{cobertura:.1f}%** "
-    f"({kpis.n_clientes_unicos:,} de {len(assigned_partners):,} clientes "
-    "vinculados al equipo recibieron al menos 1 factura en el período)."
-)
+if selected_cats:
+    st.caption(
+        f"📊 Cobertura en categoría: **{cobertura:.1f}%** "
+        f"({kpis.n_clientes_unicos:,} de {territorio_size:,} clientes que "
+        f"compran de **{', '.join(selected_cats)}** recibieron factura "
+        "en el período)."
+    )
+else:
+    st.caption(
+        f"📊 Cobertura: **{cobertura:.1f}%** "
+        f"({kpis.n_clientes_unicos:,} de {territorio_size:,} clientes "
+        "vinculados al equipo recibieron al menos 1 factura en el período)."
+    )
 
 # ---------------------------------------------------------------------------
 # Evolución mensual de clientes atendidos
