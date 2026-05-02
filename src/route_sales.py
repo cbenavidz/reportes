@@ -128,11 +128,41 @@ def compute_monthly_clients_kpi(
         unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
         df["_qty_signed"] = qty * unit_vol * sign
         is_fac = df["move_type"] == "out_invoice"
+        # Clientes atendidos por mes: solo aquellos con VENTA NETA > 0 ese mes.
+        # Si el cliente facturó y luego devolvió todo (neto = 0), no cuenta.
+        # Esto coincide con el reporte oficial de Odoo de "clientes
+        # facturados".
+        ventas_partner_mes = (
+            df.groupby(["mes", "partner_id"])["price_subtotal_signed"]
+            .sum()
+            .reset_index()
+        )
+        # Solo partners con factura en ese mes Y venta neta positiva
+        partners_con_fac_mes = (
+            df.loc[is_fac].groupby("mes")["partner_id"]
+            .agg(lambda s: set(s.dropna().astype(int).tolist()))
+            .to_dict()
+        )
+
+        def _n_clientes_netos(mes):
+            partners_fac = partners_con_fac_mes.get(mes, set())
+            sub = ventas_partner_mes[ventas_partner_mes["mes"] == mes]
+            count = 0
+            for _, row in sub.iterrows():
+                if (
+                    int(row["partner_id"]) in partners_fac
+                    and float(row["price_subtotal_signed"]) > 0
+                ):
+                    count += 1
+            return count
+
+        n_clientes_serie = pd.Series(
+            {m: _n_clientes_netos(m) for m in df["mes"].unique()},
+            name="n_clientes_atendidos",
+        )
+
         agg = pd.DataFrame({
-            # Clientes atendidos = solo los que tuvieron FACTURA en el mes
-            # (out_invoice). Los que solo tuvieron NC no cuentan, para
-            # coincidir con el reporte oficial de Odoo.
-            "n_clientes_atendidos": df.loc[is_fac].groupby("mes")["partner_id"].nunique(),
+            "n_clientes_atendidos": n_clientes_serie,
             "ventas_netas": df.groupby("mes")["price_subtotal_signed"].sum(),
             "volumen": df.groupby("mes")["_qty_signed"].sum(),
             "n_facturas": df.loc[is_fac].groupby("mes")["move_id"].nunique(),
@@ -185,11 +215,37 @@ def compute_sales_by_city(
     df["_qty_signed"] = qty * unit_vol * sign
     grp_cols = ["city"] + (["state_name"] if "state_name" in df.columns else [])
 
+    # Clientes únicos por ciudad: solo los con VENTA NETA > 0 en esa ciudad.
+    # Filtra clientes que facturaron y luego devolvieron todo.
+    # Paso 1: ventas netas por (ciudad, partner)
+    ventas_pcg = (
+        df.groupby(grp_cols + ["partner_id"])["price_subtotal_signed"]
+        .sum()
+        .reset_index()
+    )
+    # Paso 2: marca cuáles partners tuvieron factura en esa ciudad
+    fac_partners_ciudad = (
+        df.loc[is_fac][grp_cols + ["partner_id"]].drop_duplicates()
+    )
+    fac_partners_ciudad["_tiene_factura"] = True
+    # Merge: ventas + flag de "tuvo factura"
+    ventas_pcg = ventas_pcg.merge(
+        fac_partners_ciudad, on=grp_cols + ["partner_id"], how="left",
+    )
+    ventas_pcg["_tiene_factura"] = ventas_pcg["_tiene_factura"].fillna(False)
+    # Paso 3: contar partners netos > 0 por ciudad
+    cond = (
+        (ventas_pcg["_tiene_factura"])
+        & (ventas_pcg["price_subtotal_signed"] > 0)
+    )
+    n_clientes_serie = (
+        ventas_pcg[cond].groupby(grp_cols)["partner_id"].nunique()
+        .rename("n_clientes")
+    )
+
     grp = df.groupby(grp_cols)
     res = pd.DataFrame({
-        # Clientes únicos por ciudad: solo los que tuvieron FACTURA
-        # (out_invoice), no NC, para coincidir con Odoo.
-        "n_clientes": df.loc[is_fac].groupby(grp_cols)["partner_id"].nunique(),
+        "n_clientes": n_clientes_serie,
         "n_facturas": df.loc[is_fac].groupby(grp_cols)["move_id"].nunique(),
         "ventas_netas": grp["price_subtotal_signed"].sum(),
         "volumen": grp["_qty_signed"].sum(),
