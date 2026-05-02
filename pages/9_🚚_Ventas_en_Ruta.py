@@ -160,9 +160,10 @@ asig_ids = set(assigned_partners["id"].astype(int).tolist())
 
 st.caption(
     f"📋 **{len(assigned_partners):,}** clientes vinculados a "
-    f"**{', '.join(selected_names)}** (asignación o facturación). "
-    "Si abajo seleccionas una categoría, los KPIs y conteos de cliente "
-    "se restringen a quienes compran de esa categoría."
+    f"**{', '.join(selected_names)}** (en su ficha de Odoo o porque les "
+    "han emitido factura). Los KPIs y conteos de cliente solo cuentan "
+    "facturas emitidas POR el vendedor seleccionado, no las que le "
+    "asignan al cliente. Si filtras por categoría, también se restringe."
 )
 
 # ---------------------------------------------------------------------------
@@ -196,10 +197,35 @@ else:
     selected_cats = []
     st.caption("ℹ️ Sin categorías de producto detectadas en las facturas.")
 
-# Filtrar invoice_lines: primero por clientes del equipo, luego por categoría
-lines_team = invoice_lines_all[
-    invoice_lines_all["partner_id"].isin(asig_ids)
-].copy() if not invoice_lines_all.empty else invoice_lines_all
+# Filtrar invoice_lines por las FACTURAS que el vendedor emitió.
+# Esto es lo correcto para medir "qué hizo Yarley realmente" (no las
+# asignaciones en res.partner.user_id, que pueden estar desactualizadas
+# o cubrir clientes que no le compraron a Yarley en el período).
+moves_vendedor: set[int] = set()
+if (
+    invoices_all is not None and not invoices_all.empty
+    and "invoice_user_id" in invoices_all.columns
+):
+    ids_v = pd.to_numeric(invoices_all["invoice_user_id"], errors="coerce")
+    moves_vendedor = set(
+        pd.to_numeric(
+            invoices_all.loc[ids_v.isin(selected_user_ids), "id"],
+            errors="coerce",
+        ).dropna().astype(int).tolist()
+    )
+
+if not invoice_lines_all.empty and moves_vendedor:
+    lines_team = invoice_lines_all[
+        pd.to_numeric(invoice_lines_all["move_id"], errors="coerce")
+        .isin(moves_vendedor)
+    ].copy()
+elif not invoice_lines_all.empty:
+    # Fallback (si no logramos detectar moves del vendedor): por partner asignado
+    lines_team = invoice_lines_all[
+        invoice_lines_all["partner_id"].isin(asig_ids)
+    ].copy()
+else:
+    lines_team = invoice_lines_all
 if selected_cats and not lines_team.empty and "product_categ_name" in lines_team.columns:
     lines_team = lines_team[
         lines_team["product_categ_name"].isin(selected_cats)
