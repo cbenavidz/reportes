@@ -320,10 +320,15 @@ def detect_inactive_clients(
     assigned_partners: pd.DataFrame,
     cutoff: date | pd.Timestamp,
     company_ids: Iterable[int] | None = None,
-    threshold_days: int = 60,
+    min_days: int = 15,
+    max_days: int | None = 60,
 ) -> pd.DataFrame:
     """
-    Clientes asignados sin compra hace > N días.
+    Clientes en ventana de inactividad: días sin comprar entre
+    `min_days` y `max_days`.
+
+    Si `max_days` es None, se interpreta como "sin techo" (todos los
+    inactivos por más de `min_days`).
     """
     cutoff_ts = pd.Timestamp(cutoff)
     if assigned_partners is None or assigned_partners.empty:
@@ -345,8 +350,12 @@ def detect_inactive_clients(
     ultima["ventas_historicas"] = (
         df_all.groupby("partner_id")["price_subtotal_signed"].sum()
     )
-    inactivos = ultima[ultima["dias_desde_ultima"] > threshold_days].copy()
-    inactivos = inactivos.reset_index()
+
+    mask = ultima["dias_desde_ultima"] >= min_days
+    if max_days is not None:
+        mask &= ultima["dias_desde_ultima"] <= max_days
+    inactivos = ultima[mask].copy().reset_index()
+
     name_map = (
         df_all.dropna(subset=["partner_name"])
         .drop_duplicates("partner_id")

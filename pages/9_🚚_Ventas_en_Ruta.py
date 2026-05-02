@@ -34,6 +34,7 @@ from src.route_sales import (
 )
 from src.sales_analyzer import (
     EXCLUDED_SALES_DEFAULT_CODES,
+    _filter_lines_for_sales,
     compute_sales_growth_from_lines,
 )
 from src.ui_components import render_company_context, render_sidebar_filters
@@ -365,6 +366,55 @@ else:
         )
 
 # ---------------------------------------------------------------------------
+# Umbral de inactividad (compartido entre mapa e tabla de inactivos)
+# ---------------------------------------------------------------------------
+st.markdown("### 😴 Ventana de inactividad")
+inact_range = st.slider(
+    "Días sin comprar (rango)",
+    min_value=15, max_value=365,
+    value=(15, 60), step=5, key="ruta_inact_range",
+    help=(
+        "Selecciona el rango de días sin comprar para considerar a un "
+        "cliente como inactivo. Por defecto 15-60 días: clientes que "
+        "todavía son recientes y son los más fáciles de reactivar."
+    ),
+)
+inact_min, inact_max = inact_range
+
+# Calcular últimos días de compra por cliente (global, sin filtro de período)
+# para identificar el estado real de inactividad de cada uno.
+_df_global = _filter_lines_for_sales(
+    lines_team, company_ids=filters["company_ids"],
+) if not lines_team.empty else pd.DataFrame()
+last_purchase: dict[int, pd.Timestamp] = {}
+if not _df_global.empty:
+    last_purchase = (
+        _df_global.groupby("partner_id")["_d"].max().to_dict()
+    )
+
+cutoff_ts = pd.Timestamp(fecha_hasta)
+
+def _client_status(pid: int) -> tuple[str, int | None]:
+    last = last_purchase.get(int(pid))
+    if last is None or pd.isna(last):
+        return ("⚫ Sin historia", None)
+    dias = (cutoff_ts - last).days
+    if dias < inact_min:
+        return ("✅ Activo", dias)
+    if dias <= inact_max:
+        return (f"🟡 Inactivo {inact_min}-{inact_max}d", dias)
+    return (f"🔴 Crítico (>{inact_max}d)", dias)
+
+# Detectar inactivos (uso compartido para mapa y tabla)
+inact = detect_inactive_clients(
+    invoice_lines=lines_team,
+    assigned_partners=assigned_partners,
+    cutoff=fecha_hasta,
+    company_ids=filters["company_ids"],
+    min_days=inact_min, max_days=inact_max,
+)
+
+# ---------------------------------------------------------------------------
 # Mapa de georeferencia
 # ---------------------------------------------------------------------------
 st.markdown("### 🗺️ Mapa de clientes")
@@ -382,19 +432,30 @@ if geo_df.empty:
         "Geolocalizar partners."
     )
 else:
+    # Asignar estado a cada cliente del mapa según ventana de inactividad
+    estados = geo_df["partner_id"].apply(_client_status)
+    geo_df["estado"] = [s[0] for s in estados]
+    geo_df["dias_desde_ultima"] = [s[1] for s in estados]
+
     map_modo = st.radio(
-        "Colorear por", ["Ventas", "Atendido / No atendido"],
-        index=0, horizontal=True, key="mapa_modo",
+        "Colorear por",
+        ["Ventas", "Estado de actividad"],
+        index=1, horizontal=True, key="mapa_modo",
     )
-    if map_modo == "Atendido / No atendido":
-        geo_df["estado"] = geo_df["es_atendido"].map(
-            {True: "✅ Atendido", False: "❌ Sin atender"}
-        )
+    if map_modo == "Estado de actividad":
         color_col = "estado"
-        color_map = None
+        # Orden y colores fijos para que no roten
+        color_map = {
+            "✅ Activo": "#10b981",          # verde
+            f"🟡 Inactivo {inact_min}-{inact_max}d": "#f59e0b",  # amarillo
+            f"🔴 Crítico (>{inact_max}d)": "#ef4444",            # rojo
+            "⚫ Sin historia": "#6b7280",     # gris
+        }
+        color_scale = None
     else:
         color_col = "ventas_periodo"
-        color_map = "Viridis"
+        color_map = None
+        color_scale = "Viridis"
 
     geo_df["_size"] = geo_df["ventas_periodo"].clip(lower=0).fillna(0)
     max_v = float(geo_df["_size"].max() or 1)
@@ -408,20 +469,26 @@ else:
             "city": True if "city" in geo_df.columns else False,
             "ventas_periodo": ":,.0f",
             "num_visitas": True,
+            "dias_desde_ultima": True,
             "lat": False, "lon": False, "_size": False,
+            "estado": False,
         },
         zoom=6, height=550,
-        color_continuous_scale=color_map if color_col == "ventas_periodo" else None,
+        color_continuous_scale=color_scale if color_col == "ventas_periodo" else None,
+        color_discrete_map=color_map if color_map else None,
     )
     fig_map.update_layout(
         mapbox_style="open-street-map", margin=dict(l=0, r=0, t=0, b=0),
     )
     st.plotly_chart(fig_map, use_container_width=True)
-    st.caption(
-        f"📍 {len(geo_df):,} clientes en el mapa "
-        f"(de {len(assigned_partners):,} totales del equipo). "
-        f"Tamaño del punto = ventas en el período."
-    )
+
+    # Conteo por estado
+    if "estado" in geo_df.columns:
+        conteo = geo_df["estado"].value_counts()
+        cap_parts = [f"📍 {len(geo_df):,} clientes en el mapa"]
+        for est, n in conteo.items():
+            cap_parts.append(f"{est}: **{n}**")
+        st.caption(" · ".join(cap_parts))
 
 # ---------------------------------------------------------------------------
 # Frecuencia de visita
@@ -469,26 +536,19 @@ else:
     )
 
 # ---------------------------------------------------------------------------
-# Clientes inactivos
+# Clientes inactivos (usa el mismo rango configurado arriba)
 # ---------------------------------------------------------------------------
-st.markdown("### 😴 Clientes inactivos")
-threshold = st.slider(
-    "Umbral de inactividad (días)", 30, 180, 60, step=15, key="ruta_inact",
-)
-inact = detect_inactive_clients(
-    invoice_lines=lines_team,
-    assigned_partners=assigned_partners,
-    cutoff=fecha_hasta,
-    company_ids=filters["company_ids"],
-    threshold_days=threshold,
-)
+st.markdown(f"### 😴 Clientes inactivos ({inact_min}-{inact_max} días)")
 if inact.empty:
-    st.success(f"✅ Ningún cliente inactivo por más de {threshold} días.")
+    st.success(
+        f"✅ Ningún cliente inactivo en el rango {inact_min}-{inact_max} días."
+    )
 else:
     st.caption(
-        f"{len(inact):,} clientes del equipo NO compran hace más de "
-        f"**{threshold} días**. Ordenados por valor histórico (los más "
-        "valiosos primero — son los que más urge reactivar)."
+        f"{len(inact):,} clientes del equipo NO compran entre **{inact_min} "
+        f"y {inact_max} días**. Ordenados por valor histórico (los más "
+        "valiosos primero — son los que más urge reactivar). "
+        "Cambia el rango arriba en *Ventana de inactividad*."
     )
     cols = [c for c in [
         "partner_name", "city", "ultima_factura",
