@@ -103,13 +103,18 @@ def main() -> None:
         print(sub["parent_state"].value_counts())
         print()
 
-    print("=== LISTA COMPLETA de clientes (compara con tu Excel de Odoo) ===")
-    print("(Los nombres ordenados alfabéticamente, igual que tu tabla de Odoo)")
+    print("=== LISTA COMPLETA ordenada por VENTA NETA (mayor a menor) ===")
     print()
-    for i, row in enumerate(agg.itertuples(index=False), start=1):
-        print(f"{i:3d}. {row.partner_name}")
+    agg_sorted = agg.sort_values("venta_neta", ascending=False).reset_index(drop=True)
+    for i, row in enumerate(agg_sorted.itertuples(index=False), start=1):
+        venta = f"${row.venta_neta:>15,.0f}"
+        n_inv = int(row.n_lineas_invoice)
+        n_nc = int(row.n_lineas_nc)
+        nc_str = f" + {n_nc} NC" if n_nc else ""
+        print(f"{i:3d}. {venta} | {n_inv:3d} lín. fact{nc_str}  | {row.partner_name}")
     print()
-    print(f"TOTAL: {len(agg)} clientes")
+    print(f"TOTAL: {len(agg)} clientes · "
+          f"${agg['venta_neta'].sum():,.0f} en ventas")
     print()
     print("=== CLIENTES con NETA <= 0 (deberían NO contar) ===")
     print(agg[agg["venta_neta"] <= 0].to_string(index=False))
