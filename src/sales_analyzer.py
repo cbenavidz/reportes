@@ -444,7 +444,11 @@ def compute_sales_kpis_from_lines(
 
     n_fac = int(fac["move_id"].nunique()) if "move_id" in fac.columns and not fac.empty else 0
     n_nc = int(nc["move_id"].nunique()) if "move_id" in nc.columns and not nc.empty else 0
-    n_clientes = int(df["partner_id"].nunique()) if "partner_id" in df.columns else 0
+    # Clientes únicos = solo los que tuvieron al menos UNA FACTURA
+    # (out_invoice). Los que solo tuvieron NC no se cuentan, para coincidir
+    # con el reporte oficial de Odoo. Sin esta restricción daba diferencia
+    # de unos pocos clientes (ej. 81 vs 76 en Odoo).
+    n_clientes = int(fac["partner_id"].nunique()) if "partner_id" in fac.columns and not fac.empty else 0
 
     return SalesKPIs(
         ventas_netas=ventas_netas,

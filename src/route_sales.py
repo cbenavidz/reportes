@@ -129,7 +129,10 @@ def compute_monthly_clients_kpi(
         df["_qty_signed"] = qty * unit_vol * sign
         is_fac = df["move_type"] == "out_invoice"
         agg = pd.DataFrame({
-            "n_clientes_atendidos": df.groupby("mes")["partner_id"].nunique(),
+            # Clientes atendidos = solo los que tuvieron FACTURA en el mes
+            # (out_invoice). Los que solo tuvieron NC no cuentan, para
+            # coincidir con el reporte oficial de Odoo.
+            "n_clientes_atendidos": df.loc[is_fac].groupby("mes")["partner_id"].nunique(),
             "ventas_netas": df.groupby("mes")["price_subtotal_signed"].sum(),
             "volumen": df.groupby("mes")["_qty_signed"].sum(),
             "n_facturas": df.loc[is_fac].groupby("mes")["move_id"].nunique(),
@@ -184,7 +187,9 @@ def compute_sales_by_city(
 
     grp = df.groupby(grp_cols)
     res = pd.DataFrame({
-        "n_clientes": grp["partner_id"].nunique(),
+        # Clientes únicos por ciudad: solo los que tuvieron FACTURA
+        # (out_invoice), no NC, para coincidir con Odoo.
+        "n_clientes": df.loc[is_fac].groupby(grp_cols)["partner_id"].nunique(),
         "n_facturas": df.loc[is_fac].groupby(grp_cols)["move_id"].nunique(),
         "ventas_netas": grp["price_subtotal_signed"].sum(),
         "volumen": grp["_qty_signed"].sum(),
