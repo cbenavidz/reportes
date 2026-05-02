@@ -114,16 +114,20 @@ def compute_monthly_clients_kpi(
 
     if df.empty:
         out = base.assign(
-            n_clientes_atendidos=0, ventas_netas=0.0,
+            n_clientes_atendidos=0, ventas_netas=0.0, volumen=0.0,
             n_facturas=0, ticket_promedio=0.0,
         ).reset_index()
     else:
         df = df.copy()
         df["mes"] = df["_d"].dt.to_period("M")
+        # Volumen signed: quantity con signo según move_type (refunds restan)
+        sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
+        df["_qty_signed"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0) * sign
         is_fac = df["move_type"] == "out_invoice"
         agg = pd.DataFrame({
             "n_clientes_atendidos": df.groupby("mes")["partner_id"].nunique(),
             "ventas_netas": df.groupby("mes")["price_subtotal_signed"].sum(),
+            "volumen": df.groupby("mes")["_qty_signed"].sum(),
             "n_facturas": df.loc[is_fac].groupby("mes")["move_id"].nunique(),
         })
         agg = base.join(agg, how="left").fillna(0.0)
@@ -166,6 +170,10 @@ def compute_sales_by_city(
 
     df["city"] = df["city"].fillna("Sin ciudad").replace("", "Sin ciudad")
     is_fac = df["move_type"] == "out_invoice"
+    # Volumen signed (refunds restan)
+    sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
+    df = df.copy()
+    df["_qty_signed"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0) * sign
     grp_cols = ["city"] + (["state_name"] if "state_name" in df.columns else [])
 
     grp = df.groupby(grp_cols)
@@ -173,6 +181,7 @@ def compute_sales_by_city(
         "n_clientes": grp["partner_id"].nunique(),
         "n_facturas": df.loc[is_fac].groupby(grp_cols)["move_id"].nunique(),
         "ventas_netas": grp["price_subtotal_signed"].sum(),
+        "volumen": grp["_qty_signed"].sum(),
     }).fillna(0.0).reset_index()
     res["n_facturas"] = res["n_facturas"].astype(int)
     res["ticket_promedio"] = np.where(
@@ -200,7 +209,7 @@ def compute_visit_frequency(
     cols = [
         "partner_id", "partner_name", "city", "num_visitas",
         "dias_entre_visitas_prom", "ultima_visita", "dias_desde_ultima",
-        "ventas_periodo",
+        "ventas_periodo", "volumen_periodo",
     ]
     if assigned_partners is None or assigned_partners.empty:
         return pd.DataFrame(columns=cols)
@@ -223,6 +232,11 @@ def compute_visit_frequency(
         .sort_values(["partner_id", "_d"])
     )
     ventas_pid = df.groupby("partner_id")["price_subtotal_signed"].sum().to_dict()
+    # Volumen signed por cliente
+    sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
+    df = df.copy()
+    df["_qty_signed"] = pd.to_numeric(df["quantity"], errors="coerce").fillna(0) * sign
+    volumen_pid = df.groupby("partner_id")["_qty_signed"].sum().to_dict()
     name_pid = (
         df.dropna(subset=["partner_name"])
         .drop_duplicates("partner_id")
@@ -254,6 +268,7 @@ def compute_visit_frequency(
             "ultima_visita": ultima,
             "dias_desde_ultima": (cutoff - ultima).days,
             "ventas_periodo": float(ventas_pid.get(pid, 0.0)),
+            "volumen_periodo": float(volumen_pid.get(pid, 0.0)),
         })
     return pd.DataFrame(out_rows).sort_values(
         "ventas_periodo", ascending=False

@@ -336,11 +336,21 @@ else:
         yaxis="y2",
         hovertemplate="<b>%{x}</b><br>$%{y:,.0f}<extra></extra>",
     ))
+    fig_m.add_trace(go.Scatter(
+        x=monthly["mes_label"], y=monthly["volumen"],
+        name="Volumen (unidades)", mode="lines+markers",
+        line=dict(color="#f59e0b", width=2, dash="dot"),
+        marker=dict(size=7, symbol="diamond"),
+        yaxis="y3",
+        hovertemplate="<b>%{x}</b><br>Volumen: %{y:,.1f}<extra></extra>",
+    ))
     fig_m.update_layout(
-        height=420, margin=dict(l=0, r=0, t=10, b=0),
+        height=440, margin=dict(l=0, r=80, t=10, b=0),
         yaxis=dict(title="# Clientes", side="left"),
         yaxis2=dict(title="Ventas $", overlaying="y", side="right",
                     showgrid=False),
+        yaxis3=dict(title="Volumen", overlaying="y", side="right",
+                    position=0.96, showgrid=False, anchor="free"),
         legend=dict(orientation="h", y=-0.2),
         hovermode="x unified",
     )
@@ -348,15 +358,17 @@ else:
 
     st.dataframe(
         monthly[["mes_label", "n_clientes_atendidos", "n_facturas",
-                 "ventas_netas", "ticket_promedio"]].rename(columns={
+                 "ventas_netas", "volumen", "ticket_promedio"]].rename(columns={
             "mes_label": "Mes",
             "n_clientes_atendidos": "Clientes atendidos",
             "n_facturas": "# Facturas",
             "ventas_netas": "Ventas netas",
+            "volumen": "Volumen (und)",
             "ticket_promedio": "Ticket prom.",
         }),
         column_config={
             "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
+            "Volumen (und)": st.column_config.NumberColumn(format="%,.1f"),
             "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
         },
         use_container_width=True, hide_index=True,
@@ -391,13 +403,15 @@ else:
         rename = {
             "city": "Ciudad", "state_name": "Departamento",
             "n_clientes": "# Clientes", "n_facturas": "# Fact.",
-            "ventas_netas": "Ventas netas", "ticket_promedio": "Ticket prom.",
+            "ventas_netas": "Ventas netas", "volumen": "Volumen (und)",
+            "ticket_promedio": "Ticket prom.",
             "participacion_pct": "% del total",
         }
         st.dataframe(
             by_city[[c for c in rename if c in by_city.columns]].rename(columns=rename),
             column_config={
                 "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
+                "Volumen (und)": st.column_config.NumberColumn(format="%,.1f"),
                 "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
                 "% del total": st.column_config.NumberColumn(format="%.1f%%"),
             },
@@ -563,10 +577,13 @@ else:
             "ultima_visita": "Última visita",
             "dias_desde_ultima": "Días desde última",
             "ventas_periodo": "Ventas período",
+            "volumen_periodo": "Volumen (und)",
         })[["Cliente", "Ciudad", "# Visitas", "Días entre visitas",
-            "Última visita", "Días desde última", "Ventas período"]],
+            "Última visita", "Días desde última",
+            "Ventas período", "Volumen (und)"]],
         column_config={
             "Ventas período": st.column_config.NumberColumn(format="$ %,.0f"),
+            "Volumen (und)": st.column_config.NumberColumn(format="%,.1f"),
             "Días entre visitas": st.column_config.NumberColumn(format="%.1f"),
             "Días desde última": st.column_config.NumberColumn(format="%.0f"),
             "Última visita": st.column_config.DateColumn(format="DD/MM/YYYY"),
