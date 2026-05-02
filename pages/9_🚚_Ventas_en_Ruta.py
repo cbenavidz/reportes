@@ -163,10 +163,49 @@ st.caption(
     f"**{', '.join(selected_names)}** (asignación o facturación)."
 )
 
-# Filtrar invoice_lines a esos clientes
+# ---------------------------------------------------------------------------
+# Filtro de categoría de producto (opcional)
+# ---------------------------------------------------------------------------
+st.markdown("### 📦 Categoría de producto (opcional)")
+cat_options: list[str] = []
+if (
+    invoice_lines_all is not None and not invoice_lines_all.empty
+    and "product_categ_name" in invoice_lines_all.columns
+):
+    cat_options = sorted(
+        invoice_lines_all["product_categ_name"]
+        .dropna().astype(str).str.strip().replace("", pd.NA).dropna()
+        .unique().tolist()
+    )
+
+if cat_options:
+    selected_cats = st.multiselect(
+        "Filtrar por categoría",
+        options=cat_options,
+        default=[],
+        help=(
+            "Si seleccionas una o más categorías, todos los reportes de "
+            "abajo se restringen a ventas de esas categorías. Vacío = "
+            "todas las categorías."
+        ),
+        placeholder="Todas las categorías",
+    )
+else:
+    selected_cats = []
+    st.caption("ℹ️ Sin categorías de producto detectadas en las facturas.")
+
+# Filtrar invoice_lines: primero por clientes del equipo, luego por categoría
 lines_team = invoice_lines_all[
     invoice_lines_all["partner_id"].isin(asig_ids)
 ].copy() if not invoice_lines_all.empty else invoice_lines_all
+if selected_cats and not lines_team.empty and "product_categ_name" in lines_team.columns:
+    lines_team = lines_team[
+        lines_team["product_categ_name"].isin(selected_cats)
+    ].copy()
+    st.caption(
+        f"🎯 Filtrando por categoría(s): **{', '.join(selected_cats)}** · "
+        f"{len(lines_team):,} líneas restantes."
+    )
 
 # ---------------------------------------------------------------------------
 # Período del informe
