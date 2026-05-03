@@ -9,3 +9,8 @@ openpyxl>=3.1
 xlsxwriter>=3.1
 PyYAML>=6.0
 bcrypt>=4.0
+
+# Conectores de redes sociales y analytics
+requests>=2.30  # Meta Graph API y TikTok (HTTP directo)
+google-analytics-data>=0.18  # GA4 Data API
+google-auth>=2.20  # Service Account credentials
