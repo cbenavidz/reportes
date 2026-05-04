@@ -274,6 +274,312 @@ def compute_period_kpis(
     return out
 
 
+def compute_recommendations(
+    posts_df: pd.DataFrame | None,
+    period_kpis: dict,
+    period_kpis_prev: dict | None = None,
+    platform_name: str = "Facebook",
+) -> list[dict]:
+    """
+    Genera recomendaciones inteligentes basadas en los datos.
+
+    Devuelve lista de dicts con keys:
+        - icon: emoji
+        - tipo: 'positivo' | 'alerta' | 'oportunidad' | 'info'
+        - titulo: str (corto, headline)
+        - texto: str (recomendación detallada)
+        - dato: str (la métrica que sustenta la reco, opcional)
+
+    Heurísticas implementadas:
+        1. Tendencia de engagement vs período anterior
+        2. Frecuencia de publicación
+        3. Tipo de contenido con mejor performance
+        4. Mejor día de la semana
+        5. Mejor franja horaria
+        6. Variabilidad de engagement (consistencia)
+        7. Top performer outliers
+    """
+    recs: list[dict] = []
+
+    # ---- 1. Tendencia vs período anterior ----
+    if period_kpis_prev:
+        eng_actual = period_kpis.get("engagement", 0)
+        eng_prev = period_kpis_prev.get("engagement", 0)
+        if eng_prev > 0:
+            delta_pct = (eng_actual - eng_prev) / eng_prev * 100
+            if delta_pct > 20:
+                recs.append({
+                    "icon": "🚀",
+                    "tipo": "positivo",
+                    "titulo": "Engagement subiendo fuerte",
+                    "texto": (
+                        f"Tu engagement creció {delta_pct:+.0f}% vs el período "
+                        f"anterior. Lo que estés haciendo está funcionando — "
+                        "identifica qué cambió y duplica."
+                    ),
+                    "dato": f"{int(eng_actual):,} vs {int(eng_prev):,}",
+                })
+            elif delta_pct < -15:
+                recs.append({
+                    "icon": "⚠️",
+                    "tipo": "alerta",
+                    "titulo": "Engagement cayendo",
+                    "texto": (
+                        f"Tu engagement bajó {abs(delta_pct):.0f}% vs el período "
+                        "anterior. Revisa qué cambió: cadencia, formatos, "
+                        "horarios o tipo de contenido."
+                    ),
+                    "dato": f"{int(eng_actual):,} vs {int(eng_prev):,}",
+                })
+
+    # ---- 2. Frecuencia de publicación ----
+    if posts_df is not None and not posts_df.empty:
+        n_posts = len(posts_df)
+        # Calcular días del período si tenemos fecha
+        if "fecha" in posts_df.columns:
+            try:
+                fechas = pd.to_datetime(posts_df["fecha"])
+                rango_dias = max((fechas.max() - fechas.min()).days, 1)
+                posts_per_week = n_posts / rango_dias * 7
+            except Exception:
+                posts_per_week = n_posts / 4.3  # asumir mes
+        else:
+            posts_per_week = n_posts / 4.3
+
+        if posts_per_week < 2:
+            recs.append({
+                "icon": "📅",
+                "tipo": "alerta",
+                "titulo": "Cadencia baja de publicación",
+                "texto": (
+                    f"Estás publicando {posts_per_week:.1f} posts/semana. "
+                    f"Para {platform_name} se recomienda mínimo 3-5/semana "
+                    "para mantener engagement. Considera un calendario "
+                    "editorial."
+                ),
+                "dato": f"{n_posts} posts en el período",
+            })
+        elif posts_per_week > 14:
+            recs.append({
+                "icon": "🔥",
+                "tipo": "alerta",
+                "titulo": "Posiblemente publicas demasiado",
+                "texto": (
+                    f"Estás publicando {posts_per_week:.1f} posts/semana. "
+                    "Demasiada frecuencia puede saturar a tu audiencia y "
+                    "diluir el alcance. Prueba reducir a 5-10/semana y "
+                    "enfócate en calidad."
+                ),
+                "dato": f"{n_posts} posts",
+            })
+
+        # ---- 3. Tipo de contenido con mejor performance ----
+        if "tipo" in posts_df.columns and "engagement" in posts_df.columns:
+            by_tipo = posts_df.groupby("tipo").agg(
+                n=("post_id", "count") if "post_id" in posts_df.columns else ("tipo", "count"),
+                engagement_promedio=("engagement", "mean"),
+                engagement_total=("engagement", "sum"),
+            ).reset_index()
+            by_tipo = by_tipo[by_tipo["n"] >= 2]  # mínimo 2 posts del tipo
+            if len(by_tipo) >= 2:
+                by_tipo = by_tipo.sort_values("engagement_promedio", ascending=False)
+                mejor = by_tipo.iloc[0]
+                peor = by_tipo.iloc[-1]
+                if mejor["engagement_promedio"] > peor["engagement_promedio"] * 1.5:
+                    multiplo = mejor["engagement_promedio"] / max(peor["engagement_promedio"], 1)
+                    recs.append({
+                        "icon": "🎯",
+                        "tipo": "oportunidad",
+                        "titulo": f"Los {mejor['tipo']} funcionan mejor",
+                        "texto": (
+                            f"Tus posts tipo **{mejor['tipo']}** tienen "
+                            f"{multiplo:.1f}× más engagement promedio que "
+                            f"los **{peor['tipo']}**. Considera publicar "
+                            f"más {mejor['tipo'].lower()}."
+                        ),
+                        "dato": (
+                            f"{mejor['tipo']}: {mejor['engagement_promedio']:.0f} "
+                            f"avg ({int(mejor['n'])} posts) · "
+                            f"{peor['tipo']}: {peor['engagement_promedio']:.0f} "
+                            f"avg ({int(peor['n'])} posts)"
+                        ),
+                    })
+
+        # ---- 4. Mejor día de la semana ----
+        if "fecha" in posts_df.columns and "engagement" in posts_df.columns:
+            try:
+                df_dia = posts_df.copy()
+                df_dia["fecha"] = pd.to_datetime(df_dia["fecha"])
+                df_dia["dia_semana"] = df_dia["fecha"].dt.day_name()
+                by_dia = df_dia.groupby("dia_semana")["engagement"].agg([
+                    ("n", "count"), ("avg", "mean"),
+                ]).reset_index()
+                by_dia = by_dia[by_dia["n"] >= 2]
+                if len(by_dia) >= 3:
+                    by_dia = by_dia.sort_values("avg", ascending=False)
+                    mejor_dia = by_dia.iloc[0]
+                    dias_es = {
+                        "Monday": "lunes", "Tuesday": "martes",
+                        "Wednesday": "miércoles", "Thursday": "jueves",
+                        "Friday": "viernes", "Saturday": "sábado",
+                        "Sunday": "domingo",
+                    }
+                    dia_es = dias_es.get(mejor_dia["dia_semana"], mejor_dia["dia_semana"])
+                    recs.append({
+                        "icon": "📆",
+                        "tipo": "info",
+                        "titulo": f"Tu mejor día: {dia_es}",
+                        "texto": (
+                            f"Los posts publicados en **{dia_es}** tienen "
+                            f"el mejor engagement promedio. Considera "
+                            "concentrar tus mejores contenidos ese día."
+                        ),
+                        "dato": (
+                            f"{mejor_dia['avg']:.0f} engagement promedio "
+                            f"({int(mejor_dia['n'])} posts)"
+                        ),
+                    })
+            except Exception:
+                pass
+
+        # ---- 5. Mejor franja horaria ----
+        if "hora" in posts_df.columns and "engagement" in posts_df.columns:
+            try:
+                df_hora = posts_df.dropna(subset=["hora"]).copy()
+                if len(df_hora) >= 5:
+                    df_hora["hora"] = df_hora["hora"].astype(int)
+                    df_hora["franja"] = pd.cut(
+                        df_hora["hora"],
+                        bins=[-1, 6, 11, 14, 18, 23],
+                        labels=[
+                            "Madrugada (0-6)", "Mañana (7-11)",
+                            "Mediodía (12-14)", "Tarde (15-18)",
+                            "Noche (19-23)",
+                        ],
+                    )
+                    by_franja = df_hora.groupby("franja", observed=True)[
+                        "engagement"
+                    ].agg([("n", "count"), ("avg", "mean")]).reset_index()
+                    by_franja = by_franja[by_franja["n"] >= 2]
+                    if len(by_franja) >= 2:
+                        by_franja = by_franja.sort_values("avg", ascending=False)
+                        mejor_franja = by_franja.iloc[0]
+                        recs.append({
+                            "icon": "🕐",
+                            "tipo": "info",
+                            "titulo": f"Mejor hora: {mejor_franja['franja']}",
+                            "texto": (
+                                f"Los posts publicados en **{mejor_franja['franja']}** "
+                                "obtienen mejor engagement. Considera programar "
+                                "tus posts más importantes en esa franja."
+                            ),
+                            "dato": (
+                                f"{mejor_franja['avg']:.0f} engagement promedio "
+                                f"({int(mejor_franja['n'])} posts)"
+                            ),
+                        })
+            except Exception:
+                pass
+
+        # ---- 6. Top performer outlier ----
+        if "engagement" in posts_df.columns and len(posts_df) >= 3:
+            engs = posts_df["engagement"].sort_values(ascending=False)
+            if engs.iloc[0] > engs.iloc[1:].mean() * 5 and engs.iloc[1:].mean() > 0:
+                ratio = engs.iloc[0] / engs.iloc[1:].mean()
+                recs.append({
+                    "icon": "⭐",
+                    "tipo": "oportunidad",
+                    "titulo": "Tienes un post viral",
+                    "texto": (
+                        f"Tu mejor post tuvo {ratio:.0f}× más engagement que "
+                        "el promedio del resto. Estudia qué lo hizo único "
+                        "(formato, mensaje, horario, hashtags) y replica."
+                    ),
+                    "dato": (
+                        f"{int(engs.iloc[0])} vs {int(engs.iloc[1:].mean())} "
+                        "promedio del resto"
+                    ),
+                })
+
+    # ---- 7. Engagement rate vs benchmarks ----
+    er = period_kpis.get("engagement_rate", 0)
+    if er > 0:
+        if platform_name == "Facebook":
+            if er < 1:
+                recs.append({
+                    "icon": "📉",
+                    "tipo": "alerta",
+                    "titulo": "Engagement rate bajo",
+                    "texto": (
+                        f"Tu engagement rate ({er:.2f}%) está debajo del "
+                        "benchmark de Facebook (1-2%). Mejora con: "
+                        "preguntas en captions, contenido nativo (no solo "
+                        "links externos), CTAs claros."
+                    ),
+                    "dato": f"{er:.2f}% (benchmark: 1-2%)",
+                })
+            elif er > 5:
+                recs.append({
+                    "icon": "🌟",
+                    "tipo": "positivo",
+                    "titulo": "Engagement rate excepcional",
+                    "texto": (
+                        f"Tu engagement rate ({er:.2f}%) está MUY por encima "
+                        "del benchmark de Facebook (1-2%). Tu audiencia está "
+                        "muy comprometida. Considera invertir en pauta para "
+                        "amplificar."
+                    ),
+                    "dato": f"{er:.2f}% (benchmark: 1-2%)",
+                })
+        elif platform_name == "Instagram":
+            if er < 1:
+                recs.append({
+                    "icon": "📉",
+                    "tipo": "alerta",
+                    "titulo": "Engagement rate bajo",
+                    "texto": (
+                        f"Tu engagement rate ({er:.2f}%) está debajo del "
+                        "benchmark de IG (1-3%). Mejora con: más reels, "
+                        "carruseles, hashtags relevantes, stickers en "
+                        "stories."
+                    ),
+                    "dato": f"{er:.2f}% (benchmark: 1-3%)",
+                })
+
+    return recs
+
+
+def compute_post_breakdown_by_type(
+    posts_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Agrupa posts por tipo y calcula métricas por categoría.
+
+    Returns DataFrame con columnas:
+        tipo, n_posts, total_likes, total_comentarios,
+        total_compartidos, total_engagement, engagement_promedio
+    """
+    if posts_df is None or posts_df.empty or "tipo" not in posts_df.columns:
+        return pd.DataFrame()
+
+    agg_dict = {"post_id": "count"} if "post_id" in posts_df.columns else {}
+    for col in ["likes", "comentarios", "compartidos", "engagement"]:
+        if col in posts_df.columns:
+            agg_dict[col] = "sum"
+
+    if not agg_dict:
+        return pd.DataFrame()
+
+    by_tipo = posts_df.groupby("tipo").agg(agg_dict).reset_index()
+    if "post_id" in by_tipo.columns:
+        by_tipo = by_tipo.rename(columns={"post_id": "n_posts"})
+    if "engagement" in by_tipo.columns and "n_posts" in by_tipo.columns:
+        by_tipo["engagement_promedio"] = (
+            by_tipo["engagement"] / by_tipo["n_posts"].replace(0, 1)
+        )
+    return by_tipo.sort_values("engagement", ascending=False).reset_index(drop=True)
+
+
 def compute_daily_aggregation(
     df: pd.DataFrame,
     metric: str = "engagement",

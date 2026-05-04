@@ -34,6 +34,8 @@ from src.social_connectors import (
 from src.social_media import (
     compute_daily_aggregation,
     compute_period_kpis,
+    compute_post_breakdown_by_type,
+    compute_recommendations,
     parse_csv_auto,
 )
 
@@ -333,7 +335,7 @@ def _render_top_posts(top_df: pd.DataFrame, title: str):
     if "fecha" in show_df.columns:
         show_df["fecha"] = pd.to_datetime(show_df["fecha"]).dt.strftime("%Y-%m-%d")
     cols_order = [c for c in [
-        "fecha", "mensaje", "caption", "tipo",
+        "fecha", "tipo", "mensaje", "caption",
         "likes", "comentarios", "compartidos", "engagement", "url",
     ] if c in show_df.columns]
     show_df = show_df[cols_order]
@@ -341,6 +343,7 @@ def _render_top_posts(top_df: pd.DataFrame, title: str):
         show_df,
         column_config={
             "url": st.column_config.LinkColumn("Ver post", display_text="🔗"),
+            "tipo": st.column_config.TextColumn("Tipo", width="small"),
             "mensaje": st.column_config.TextColumn("Mensaje", width="large"),
             "caption": st.column_config.TextColumn("Caption", width="large"),
             "likes": st.column_config.NumberColumn(format="%,d"),
@@ -350,6 +353,126 @@ def _render_top_posts(top_df: pd.DataFrame, title: str):
         },
         use_container_width=True, hide_index=True, height=400,
     )
+
+
+def _render_breakdown_by_type(top_df: pd.DataFrame, color: str, title: str):
+    """Renderiza desglose por tipo de post (Foto/Video/Reel/etc)."""
+    if top_df is None or top_df.empty or "tipo" not in top_df.columns:
+        return
+    breakdown = compute_post_breakdown_by_type(top_df)
+    if breakdown.empty:
+        return
+    st.markdown(f"##### 🗂️ Desglose por tipo de post — {title}")
+
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        # Pie chart por número de posts
+        if "n_posts" in breakdown.columns:
+            fig = px.pie(
+                breakdown, values="n_posts", names="tipo",
+                title="Distribución por tipo",
+                color_discrete_sequence=px.colors.sequential.Blues_r
+                if color == "#1877F2" else px.colors.sequential.Reds_r,
+            )
+            fig.update_layout(height=320, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with col2:
+        # Bar chart de engagement promedio por tipo
+        if "engagement_promedio" in breakdown.columns:
+            fig = px.bar(
+                breakdown.sort_values("engagement_promedio", ascending=True),
+                x="engagement_promedio", y="tipo",
+                orientation="h", text="engagement_promedio",
+                color_discrete_sequence=[color],
+                title="Engagement promedio por tipo",
+                labels={
+                    "engagement_promedio": "Engagement promedio",
+                    "tipo": "Tipo",
+                },
+            )
+            fig.update_traces(texttemplate="%{text:.0f}", textposition="outside")
+            fig.update_layout(height=320, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Tabla detallada
+    show_breakdown = breakdown.copy()
+    column_config = {
+        "tipo": st.column_config.TextColumn("Tipo"),
+    }
+    if "n_posts" in show_breakdown.columns:
+        column_config["n_posts"] = st.column_config.NumberColumn(
+            "# Posts", format="%,d"
+        )
+    for c in ["likes", "comentarios", "compartidos", "engagement"]:
+        if c in show_breakdown.columns:
+            column_config[c] = st.column_config.NumberColumn(
+                c.title(), format="%,d"
+            )
+    if "engagement_promedio" in show_breakdown.columns:
+        column_config["engagement_promedio"] = st.column_config.NumberColumn(
+            "Engagement avg", format="%.1f"
+        )
+    st.dataframe(
+        show_breakdown,
+        column_config=column_config,
+        use_container_width=True, hide_index=True,
+    )
+
+
+def _render_recommendations(
+    top_df: pd.DataFrame,
+    df_period: pd.DataFrame,
+    df_prev: pd.DataFrame | None,
+    title: str,
+):
+    """Renderiza panel de recomendaciones inteligentes."""
+    period_kpis = compute_period_kpis(df_period, fecha_desde, fecha_hasta)
+    period_kpis_prev = (
+        compute_period_kpis(df_prev, fecha_desde_prev, fecha_hasta_prev)
+        if df_prev is not None and not df_prev.empty else None
+    )
+    recs = compute_recommendations(
+        posts_df=top_df,
+        period_kpis=period_kpis,
+        period_kpis_prev=period_kpis_prev,
+        platform_name=title,
+    )
+    if not recs:
+        return
+    st.markdown(f"##### 💡 Recomendaciones inteligentes — {title}")
+    st.caption(
+        "Análisis automático del período. Estas son sugerencias basadas en "
+        "los patrones de tus datos."
+    )
+
+    color_map = {
+        "positivo": "#d1fae5", "alerta": "#fee2e2",
+        "oportunidad": "#fef3c7", "info": "#dbeafe",
+    }
+    border_map = {
+        "positivo": "#10b981", "alerta": "#ef4444",
+        "oportunidad": "#f59e0b", "info": "#3b82f6",
+    }
+
+    for r in recs:
+        bg = color_map.get(r["tipo"], "#f3f4f6")
+        border = border_map.get(r["tipo"], "#9ca3af")
+        st.markdown(
+            f"""
+<div style="background:{bg};border-left:4px solid {border};
+            padding:12px 16px;border-radius:8px;margin-bottom:8px;">
+<div style="font-size:14px;font-weight:600;color:#111827;">
+{r['icon']} {r['titulo']}
+</div>
+<div style="font-size:13px;color:#374151;margin-top:4px;">
+{r['texto']}
+</div>
+{f'<div style="font-size:12px;color:#6b7280;margin-top:6px;font-style:italic;">{r["dato"]}</div>' if r.get('dato') else ''}
+</div>
+""",
+            unsafe_allow_html=True,
+        )
 
 
 def _aggregate_by_period(df: pd.DataFrame, freq: str) -> pd.DataFrame:
@@ -557,28 +680,40 @@ def _platform_tab_meta(
     # 1. KPIs con comparativa
     _render_kpi_grid(df, df_prev, icon)
 
-    # 2. Tendencia agrupada (Día/Semana/Mes según selector)
+    # 2. Recomendaciones inteligentes (al inicio, lo más valioso)
+    if top is not None and not top.empty:
+        st.markdown("---")
+        _render_recommendations(top, df, df_prev, title)
+
+    st.markdown("---")
+
+    # 3. Tendencia agrupada (Día/Semana/Mes según selector)
     _render_tendency(df, color, title)
 
     st.markdown("---")
 
-    # 3. KPIs agrupados (gráficas + tabla por período)
+    # 4. KPIs agrupados (gráficas + tabla por período)
     _render_kpis_grouped(df, color, title)
 
     st.markdown("---")
 
-    # 4. Evolución mensual histórica (12 meses, requiere descarga separada)
+    # 5. Evolución mensual histórica (12 meses, requiere descarga separada)
     if monthly is not None and not monthly.empty:
         _render_monthly_evolution(monthly, color, title)
         st.markdown("---")
 
-    # 5. Top posts
+    # 6. Desglose por tipo de post (Foto/Video/Reel/etc.)
+    if top is not None and not top.empty:
+        _render_breakdown_by_type(top, color, title)
+        st.markdown("---")
+
+    # 7. Top posts
     _render_top_posts(top, title)
 
     if top is not None and not top.empty:
         st.markdown("---")
 
-    # 6. Detalle diario (raw)
+    # 8. Detalle diario (raw)
     with st.expander(f"📋 Detalle diario raw ({len(df):,} filas)", expanded=False):
         st.dataframe(df, use_container_width=True, hide_index=True, height=400)
 

@@ -155,6 +155,55 @@ def _fetch_metric_total_value(
     return None
 
 
+def _classify_facebook_post_type(post: dict) -> str:
+    """
+    Clasifica un post de FB en: Reel, Video, Foto, Álbum, Enlace, Texto.
+
+    Lógica:
+      1. Mira attachments[0].type (más confiable)
+      2. Fallback a status_type
+      3. Default: Texto
+    """
+    attachments = (post.get("attachments") or {}).get("data") or []
+    if attachments:
+        att = attachments[0]
+        att_type = (att.get("type") or "").lower()
+        media_type = (att.get("media_type") or "").lower()
+
+        # Mapeo de tipos de Meta a etiquetas legibles
+        if "reel" in att_type or "reel" in media_type:
+            return "Reel"
+        if att_type in ("video_inline", "video_autoplay", "video_share_youtube"):
+            return "Video"
+        if media_type == "video":
+            return "Video"
+        if att_type in ("photo",):
+            return "Foto"
+        if att_type in ("album",):
+            return "Álbum"
+        if att_type in ("share", "link", "external"):
+            return "Enlace"
+        if media_type == "photo":
+            # Si hay múltiples subattachments, es álbum
+            sub = att.get("subattachments", {}).get("data", [])
+            if len(sub) > 1:
+                return "Álbum"
+            return "Foto"
+
+    # Fallback a status_type
+    status_type = (post.get("status_type") or "").lower()
+    if status_type == "added_video":
+        return "Video"
+    if status_type in ("added_photos", "mobile_status_update"):
+        return "Foto"
+    if status_type == "shared_story":
+        return "Compartido"
+    if status_type == "created_note":
+        return "Nota"
+
+    return "Texto"
+
+
 def _unpack_reactions(value):
     """`page_actions_post_reactions_total` viene como dict — extraemos."""
     if isinstance(value, dict):
@@ -187,8 +236,10 @@ def _fetch_facebook_posts(
 
     # IMPORTANTE: usar /published_posts (no /posts) para mejor cobertura.
     # comments.summary(total_count): pages_read_engagement bastá.
+    # attachments: para clasificar tipo de post (foto/video/reel/álbum/etc.)
     fields = (
-        "id,created_time,message,permalink_url,"
+        "id,created_time,message,permalink_url,status_type,"
+        "attachments{media_type,type,subattachments{media_type}},"
         "likes.summary(total_count).limit(0),"
         "comments.summary(total_count).limit(0),"
         "shares,"
@@ -211,9 +262,18 @@ def _fetch_facebook_posts(
             "likes", "comentarios", "compartidos", "reacciones_total",
         ])
     for p in data.get("data", []):
-        created = p.get("created_time", "")[:10]
+        created_full = p.get("created_time", "")
+        created = created_full[:10]
         if not created:
             continue
+        # Hora del post (UTC): created_time tiene formato 2024-04-15T14:30:00+0000
+        hora = None
+        try:
+            if "T" in created_full:
+                hora_str = created_full[11:13]
+                hora = int(hora_str)
+        except (ValueError, IndexError):
+            hora = None
         # Intentar varias formas de obtener el count (Meta cambió shapes)
         likes_obj = p.get("likes") or {}
         comments_obj = p.get("comments") or {}
@@ -236,9 +296,13 @@ def _fetch_facebook_posts(
             or reactions_obj.get("count")
             or 0
         )
+        # Clasificar tipo de post desde attachments + status_type
+        tipo_post = _classify_facebook_post_type(p)
         rows.append({
             "fecha": created,
+            "hora": hora,
             "post_id": p.get("id"),
+            "tipo": tipo_post,
             "mensaje": (p.get("message") or "")[:200],
             "url": p.get("permalink_url", ""),
             "likes": likes_total,
@@ -488,6 +552,26 @@ def fetch_meta_instagram_monthly_evolution(
     return monthly.sort_values("mes").tail(months).reset_index(drop=True)
 
 
+def _classify_instagram_post_type(media: dict) -> str:
+    """
+    Clasifica un media de IG en: Reel, Foto, Video, Carrusel, Story.
+    """
+    product_type = (media.get("media_product_type") or "").upper()
+    media_type = (media.get("media_type") or "").upper()
+
+    if product_type == "REELS":
+        return "Reel"
+    if product_type == "STORY":
+        return "Story"
+    if media_type == "CAROUSEL_ALBUM":
+        return "Carrusel"
+    if media_type == "VIDEO":
+        return "Video"
+    if media_type == "IMAGE":
+        return "Foto"
+    return media_type or "Otro"
+
+
 def fetch_meta_instagram_top_posts(
     date_from: date,
     date_to: date,
@@ -499,25 +583,37 @@ def fetch_meta_instagram_top_posts(
     if not ig_id:
         raise RuntimeError("Falta instagram_user_id en secrets.")
     page_token = _get_page_access_token() or cfg.get("access_token")
-    fields = "id,timestamp,media_type,media_url,permalink,caption,like_count,comments_count"
+    fields = (
+        "id,timestamp,media_type,media_product_type,media_url,permalink,"
+        "caption,like_count,comments_count"
+    )
     params = {"fields": fields, "limit": 100}
     data = _try_get(f"/{ig_id}/media", params, token=page_token)
     if not data:
         return pd.DataFrame()
     rows = []
     for m in data.get("data", []):
-        ts = m.get("timestamp", "")[:10]
+        ts_full = m.get("timestamp", "")
+        ts = ts_full[:10]
         if not ts:
             continue
         media_date = datetime.strptime(ts, "%Y-%m-%d").date()
         if media_date < date_from or media_date > date_to:
             continue
+        # Extraer hora
+        hora = None
+        try:
+            if "T" in ts_full:
+                hora = int(ts_full[11:13])
+        except (ValueError, IndexError):
+            hora = None
         likes = int(m.get("like_count", 0) or 0)
         comments = int(m.get("comments_count", 0) or 0)
         rows.append({
             "fecha": ts,
+            "hora": hora,
             "post_id": m.get("id"),
-            "tipo": m.get("media_type", ""),
+            "tipo": _classify_instagram_post_type(m),
             "caption": (m.get("caption") or "")[:200],
             "url": m.get("permalink", ""),
             "likes": likes,
