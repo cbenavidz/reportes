@@ -508,19 +508,59 @@ def _aggregate_by_period(df: pd.DataFrame, freq: str) -> pd.DataFrame:
     return grouped
 
 
+_MES_ES = {
+    1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
+    7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
+}
+
+
+def _format_period_labels(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """Agrega columna 'periodo' con etiquetas legibles según freq."""
+    if df is None or df.empty or "fecha" not in df.columns:
+        return df
+    out = df.copy()
+    out["fecha"] = pd.to_datetime(out["fecha"])
+    if freq == "MS":  # Mes
+        out["periodo"] = out["fecha"].apply(
+            lambda d: f"{_MES_ES[d.month]} {d.year}"
+        )
+    elif freq == "QS":  # Trimestre
+        out["periodo"] = out["fecha"].apply(
+            lambda d: f"Q{((d.month - 1) // 3) + 1} {d.year}"
+        )
+    elif freq == "W-MON":  # Semana
+        out["periodo"] = out["fecha"].apply(
+            lambda d: f"Sem {d.isocalendar().week:02d} ({d.strftime('%d-%b')})"
+        )
+    else:  # Día
+        out["periodo"] = out["fecha"].dt.strftime("%Y-%m-%d")
+    return out
+
+
 def _render_tendency(df: pd.DataFrame, color: str, title: str):
     """Gráfica de engagement agrupada por la frecuencia seleccionada."""
     grouped = _aggregate_by_period(df, GROUP_FREQ)
     if grouped.empty or "engagement" not in grouped.columns:
         return
+    grouped = _format_period_labels(grouped, GROUP_FREQ)
     st.markdown(f"##### 📈 Engagement por {agrupacion.lower()} — {title}")
-    fig = px.area(
-        grouped, x="fecha", y="engagement",
-        color_discrete_sequence=[color],
-        labels={"fecha": "Fecha", "engagement": "Engagement"},
-        markers=True,
-    )
-    fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0))
+    # Para Día usamos area (continuous), para Mes/Trimestre/Semana usamos bar
+    if GROUP_FREQ == "D":
+        fig = px.area(
+            grouped, x="periodo", y="engagement",
+            color_discrete_sequence=[color],
+            labels={"periodo": "Fecha", "engagement": "Engagement"},
+            markers=True,
+        )
+    else:
+        fig = px.bar(
+            grouped, x="periodo", y="engagement",
+            color_discrete_sequence=[color],
+            labels={"periodo": agrupacion, "engagement": "Engagement"},
+            text="engagement",
+        )
+        fig.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
+    fig.update_layout(height=320, margin=dict(l=0, r=0, t=10, b=0))
     st.plotly_chart(fig, use_container_width=True)
 
 
@@ -532,7 +572,10 @@ def _render_kpis_grouped(df: pd.DataFrame, color: str, title: str):
     grouped = _aggregate_by_period(df, GROUP_FREQ)
     if grouped.empty:
         return
+    grouped = _format_period_labels(grouped, GROUP_FREQ)
     st.markdown(f"##### 📊 KPIs por {agrupacion.lower()} — {title}")
+
+    chart_kind = "bar" if GROUP_FREQ != "D" else "area"
 
     # 4 gráficas en grid
     metrics_to_chart = []
@@ -549,38 +592,44 @@ def _render_kpis_grouped(df: pd.DataFrame, color: str, title: str):
         cols_pair = st.columns(2)
         for i, (col, label) in enumerate(metrics_to_chart):
             with cols_pair[i % 2]:
-                fig = px.bar(
-                    grouped, x="fecha", y=col,
-                    color_discrete_sequence=[color],
-                    labels={"fecha": agrupacion, col: label},
-                    title=label,
-                )
+                if chart_kind == "bar":
+                    fig = px.bar(
+                        grouped, x="periodo", y=col,
+                        color_discrete_sequence=[color],
+                        labels={"periodo": agrupacion, col: label},
+                        title=label, text=col,
+                    )
+                    fig.update_traces(
+                        texttemplate="%{text:,.0f}", textposition="outside"
+                    )
+                else:
+                    fig = px.area(
+                        grouped, x="periodo", y=col,
+                        color_discrete_sequence=[color],
+                        labels={"periodo": agrupacion, col: label},
+                        title=label, markers=True,
+                    )
                 fig.update_layout(
-                    height=260, margin=dict(l=0, r=0, t=40, b=0),
+                    height=280, margin=dict(l=0, r=0, t=40, b=0),
                 )
                 st.plotly_chart(fig, use_container_width=True)
 
     # Seguidores como línea (snapshot)
     if "seguidores" in grouped.columns and grouped["seguidores"].sum() > 0:
         fig = px.line(
-            grouped, x="fecha", y="seguidores",
+            grouped, x="periodo", y="seguidores",
             color_discrete_sequence=[color],
-            labels={"fecha": agrupacion, "seguidores": "Seguidores"},
+            labels={"periodo": agrupacion, "seguidores": "Seguidores"},
             markers=True, title="Seguidores totales",
         )
-        fig.update_layout(height=260, margin=dict(l=0, r=0, t=40, b=0))
+        fig.update_layout(height=280, margin=dict(l=0, r=0, t=40, b=0))
         st.plotly_chart(fig, use_container_width=True)
 
     with st.expander(f"📋 Tabla por {agrupacion.lower()}", expanded=False):
         show_df = grouped.copy()
-        if agrupacion == "Mes":
-            show_df["fecha"] = pd.to_datetime(show_df["fecha"]).dt.strftime("%Y-%m")
-        elif agrupacion == "Trimestre":
-            show_df["fecha"] = pd.to_datetime(show_df["fecha"]).dt.to_period("Q").astype(str)
-        elif agrupacion == "Semana":
-            show_df["fecha"] = pd.to_datetime(show_df["fecha"]).dt.strftime("Sem %W (%Y-%m-%d)")
-        else:
-            show_df["fecha"] = pd.to_datetime(show_df["fecha"]).dt.strftime("%Y-%m-%d")
+        # Reordenar para que 'periodo' sea la primera columna
+        cols = ["periodo"] + [c for c in show_df.columns if c not in ("fecha", "periodo")]
+        show_df = show_df[cols]
         st.dataframe(show_df, use_container_width=True, hide_index=True)
 
 
@@ -606,44 +655,26 @@ def _platform_tab_meta(
     with st.expander(f"📥 Setup API + cómo obtener CSV", expanded=False):
         st.markdown(instrucciones)
 
-    # Botones de descarga
+    # Botón único para obtener todo
     if api_status == "configured":
-        c1, c2, c3 = st.columns(3)
-        if c1.button(
-            f"🔄 Datos del período ({fecha_desde} → {fecha_hasta})",
+        if st.button(
+            f"🔄 Obtener datos del período ({fecha_desde} → {fecha_hasta})",
             key=f"refresh_{platform_key}", use_container_width=True,
+            type="primary",
         ):
             try:
-                with st.spinner(f"Descargando datos del período + período anterior..."):
+                with st.spinner(
+                    "Descargando KPIs del período, período anterior, y top posts..."
+                ):
                     df = fetch_data_fn(fecha_desde, fecha_hasta)
                     df_prev = fetch_data_fn(fecha_desde_prev, fecha_hasta_prev)
+                    top = fetch_top_fn(fecha_desde, fecha_hasta, n=20)
                     st.session_state["social_data"][platform_key] = df
                     st.session_state["social_data"][f"{platform_key}_prev"] = df_prev
-                    st.success(f"✅ {len(df):,} días descargados.")
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Error: {exc}")
-
-        if c2.button(
-            f"📅 Histórico mensual (12 meses)",
-            key=f"refresh_{platform_key}_monthly", use_container_width=True,
-        ):
-            try:
-                with st.spinner("Descargando histórico mensual (puede tardar 1-2 min)..."):
-                    monthly = fetch_monthly_fn(months=12)
-                    st.session_state["social_data"][f"{platform_key}_monthly"] = monthly
-                    st.success(f"✅ {len(monthly):,} meses descargados.")
-            except Exception as exc:  # noqa: BLE001
-                st.error(f"Error: {exc}")
-
-        if c3.button(
-            f"🔥 Top posts del período",
-            key=f"refresh_{platform_key}_top", use_container_width=True,
-        ):
-            try:
-                with st.spinner("Descargando top posts..."):
-                    top = fetch_top_fn(fecha_desde, fecha_hasta, n=10)
                     st.session_state["social_data"][f"{platform_key}_top"] = top
-                    st.success(f"✅ {len(top):,} posts.")
+                    st.success(
+                        f"✅ Listo: {len(df):,} días · {len(top):,} posts del período."
+                    )
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Error: {exc}")
 
@@ -667,7 +698,6 @@ def _platform_tab_meta(
 
     df = st.session_state["social_data"].get(platform_key)
     df_prev = st.session_state["social_data"].get(f"{platform_key}_prev")
-    monthly = st.session_state["social_data"].get(f"{platform_key}_monthly")
     top = st.session_state["social_data"].get(f"{platform_key}_top")
 
     if df is None or df.empty:
@@ -697,12 +727,7 @@ def _platform_tab_meta(
 
     st.markdown("---")
 
-    # 5. Evolución mensual histórica (12 meses, requiere descarga separada)
-    if monthly is not None and not monthly.empty:
-        _render_monthly_evolution(monthly, color, title)
-        st.markdown("---")
-
-    # 6. Desglose por tipo de post (Foto/Video/Reel/etc.)
+    # 5. Desglose por tipo de post (Foto/Video/Reel/etc.)
     if top is not None and not top.empty:
         _render_breakdown_by_type(top, color, title)
         st.markdown("---")
