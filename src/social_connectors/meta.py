@@ -185,12 +185,14 @@ def _fetch_facebook_posts(
         date_to + timedelta(days=1), datetime.min.time()
     ).timestamp())
 
+    # IMPORTANTE: usar /published_posts (no /posts) para mejor cobertura.
+    # comments.summary(total_count): pages_read_engagement bastá.
     fields = (
         "id,created_time,message,permalink_url,"
-        "likes.summary(true).limit(0),"
-        "comments.summary(true).limit(0),"
+        "likes.summary(total_count).limit(0),"
+        "comments.summary(total_count).limit(0),"
         "shares,"
-        "reactions.summary(true).limit(0)"
+        "reactions.summary(total_count).limit(0)"
     )
     params = {
         "fields": fields,
@@ -199,7 +201,10 @@ def _fetch_facebook_posts(
         "limit": 100,
     }
     rows = []
-    data = _try_get(f"/{page_id}/posts", params, token=token)
+    # Intentar primero /published_posts (incluye historic), fallback a /posts
+    data = _try_get(f"/{page_id}/published_posts", params, token=token)
+    if not data:
+        data = _try_get(f"/{page_id}/posts", params, token=token)
     if not data:
         return pd.DataFrame(columns=[
             "fecha", "post_id", "mensaje", "url",
@@ -209,10 +214,28 @@ def _fetch_facebook_posts(
         created = p.get("created_time", "")[:10]
         if not created:
             continue
-        likes_total = (p.get("likes") or {}).get("summary", {}).get("total_count", 0)
-        comments_total = (p.get("comments") or {}).get("summary", {}).get("total_count", 0)
+        # Intentar varias formas de obtener el count (Meta cambió shapes)
+        likes_obj = p.get("likes") or {}
+        comments_obj = p.get("comments") or {}
+        reactions_obj = p.get("reactions") or {}
+        likes_total = (
+            likes_obj.get("summary", {}).get("total_count")
+            or likes_obj.get("count")
+            or len(likes_obj.get("data", []))
+            or 0
+        )
+        comments_total = (
+            comments_obj.get("summary", {}).get("total_count")
+            or comments_obj.get("count")
+            or len(comments_obj.get("data", []))
+            or 0
+        )
         shares_total = (p.get("shares") or {}).get("count", 0)
-        reactions_total = (p.get("reactions") or {}).get("summary", {}).get("total_count", 0)
+        reactions_total = (
+            reactions_obj.get("summary", {}).get("total_count")
+            or reactions_obj.get("count")
+            or 0
+        )
         rows.append({
             "fecha": created,
             "post_id": p.get("id"),
@@ -610,6 +633,16 @@ def fetch_meta_facebook_data(
             if c in df.columns:
                 df[c] = df[c].fillna(0).astype(int)
 
+    df = df.sort_values("fecha").reset_index(drop=True)
+
+    # Forzar columna 'seguidores' a estar siempre presente (snapshot actual).
+    # El merge con posts_df puede haber dejado NaN en esta columna.
+    if seguidores_actuales > 0:
+        if "seguidores" not in df.columns:
+            df["seguidores"] = seguidores_actuales
+        else:
+            df["seguidores"] = df["seguidores"].fillna(seguidores_actuales)
+
     # Engagement: usar el de Page Insights si existe, sino calcularlo
     if "engagement_total" in df.columns:
         df["engagement"] = df["engagement_total"].fillna(0)
@@ -618,12 +651,20 @@ def fetch_meta_facebook_data(
             df.get("likes", 0) + df.get("comentarios", 0) + df.get("compartidos", 0)
         )
 
+    # Si engagement es 0 pero hay likes/comentarios/compartidos, recalcular
+    if df["engagement"].sum() == 0:
+        df["engagement"] = (
+            df.get("likes", 0).fillna(0)
+            + df.get("comentarios", 0).fillna(0)
+            + df.get("compartidos", 0).fillna(0)
+        )
+
     # Si no llegó impresiones de Page Insights, usar reach * 1.5 (heurística)
     if "impresiones" not in df.columns or df["impresiones"].fillna(0).sum() == 0:
         if "alcance" in df.columns:
             df["impresiones"] = (df["alcance"].fillna(0) * 1.5).round().astype(int)
 
-    return df.sort_values("fecha").reset_index(drop=True)
+    return df.reset_index(drop=True)
 
 
 def fetch_meta_instagram_data(
