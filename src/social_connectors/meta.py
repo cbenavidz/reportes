@@ -237,13 +237,16 @@ def _fetch_facebook_posts(
     # IMPORTANTE: usar /published_posts (no /posts) para mejor cobertura.
     # comments.summary(total_count): pages_read_engagement bastá.
     # attachments: para clasificar tipo de post (foto/video/reel/álbum/etc.)
+    # insights: paid vs organic reach (requires ads_read or post-level analytics)
     fields = (
         "id,created_time,message,permalink_url,status_type,"
         "attachments{media_type,type,subattachments{media_type}},"
         "likes.summary(total_count).limit(0),"
         "comments.summary(total_count).limit(0),"
         "shares,"
-        "reactions.summary(total_count).limit(0)"
+        "reactions.summary(total_count).limit(0),"
+        "insights.metric(post_impressions,post_impressions_paid,"
+        "post_impressions_organic_unique,post_impressions_paid_unique)"
     )
     params = {
         "fields": fields,
@@ -251,16 +254,36 @@ def _fetch_facebook_posts(
         "until": until_unix,
         "limit": 100,
     }
-    rows = []
-    # Intentar primero /published_posts (incluye historic), fallback a /posts
-    data = _try_get(f"/{page_id}/published_posts", params, token=token)
-    if not data:
-        data = _try_get(f"/{page_id}/posts", params, token=token)
-    if not data:
+    # Paginar para soportar períodos largos (12 meses → 200-500 posts)
+    all_data = []
+    next_url_path = f"/{page_id}/published_posts"
+    next_params = params
+    pages_fetched = 0
+    MAX_PAGES = 20  # safety: 20×100 = 2000 posts
+    while next_url_path and pages_fetched < MAX_PAGES:
+        data = _try_get(next_url_path, next_params, token=token)
+        if not data and pages_fetched == 0:
+            # Fallback al endpoint /posts si /published_posts no funciona
+            data = _try_get(f"/{page_id}/posts", next_params, token=token)
+        if not data:
+            break
+        all_data.extend(data.get("data", []))
+        # Pagination via cursor
+        paging = data.get("paging", {})
+        cursors = paging.get("cursors", {})
+        after = cursors.get("after")
+        if not after or not data.get("data"):
+            break
+        next_params = {**params, "after": after}
+        pages_fetched += 1
+
+    if not all_data:
         return pd.DataFrame(columns=[
             "fecha", "post_id", "mensaje", "url",
             "likes", "comentarios", "compartidos", "reacciones_total",
         ])
+    # Reformat para reusar el loop existente
+    data = {"data": all_data}
     for p in data.get("data", []):
         created_full = p.get("created_time", "")
         created = created_full[:10]
@@ -298,6 +321,21 @@ def _fetch_facebook_posts(
         )
         # Clasificar tipo de post desde attachments + status_type
         tipo_post = _classify_facebook_post_type(p)
+        # Métricas paid vs organic per-post (insights edge)
+        paid_imp, paid_reach, total_imp = 0, 0, 0
+        insights_data = (p.get("insights") or {}).get("data") or []
+        for ins in insights_data:
+            name = ins.get("name", "")
+            values = ins.get("values") or []
+            if not values:
+                continue
+            value = values[0].get("value", 0) or 0
+            if name == "post_impressions":
+                total_imp = int(value or 0)
+            elif name == "post_impressions_paid":
+                paid_imp = int(value or 0)
+            elif name == "post_impressions_paid_unique":
+                paid_reach = int(value or 0)
         rows.append({
             "fecha": created,
             "hora": hora,
@@ -309,6 +347,10 @@ def _fetch_facebook_posts(
             "comentarios": comments_total,
             "compartidos": shares_total,
             "reacciones_total": reactions_total,
+            "impresiones_total": total_imp,
+            "impresiones_pagadas": paid_imp,
+            "alcance_pagado": paid_reach,
+            "es_pagado": paid_imp > 0,
         })
     if not rows:
         return pd.DataFrame(columns=[

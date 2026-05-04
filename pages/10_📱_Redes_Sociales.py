@@ -81,7 +81,8 @@ with col_p3:
     quick = st.radio(
         "Atajos",
         options=["Personalizado", "Últimos 7 días", "Últimos 30 días",
-                 "Últimos 90 días", "Mes actual", "Mes anterior"],
+                 "Últimos 90 días", "Últimos 12 meses",
+                 "Mes actual", "Mes anterior"],
         index=2, horizontal=False, key="rs_atajo",
     )
 
@@ -92,6 +93,8 @@ if quick != "Personalizado":
         fecha_desde, fecha_hasta = today - timedelta(days=30), today
     elif quick == "Últimos 90 días":
         fecha_desde, fecha_hasta = today - timedelta(days=90), today
+    elif quick == "Últimos 12 meses":
+        fecha_desde, fecha_hasta = today - timedelta(days=365), today
     elif quick == "Mes actual":
         fecha_desde, fecha_hasta = today.replace(day=1), today
     elif quick == "Mes anterior":
@@ -420,6 +423,61 @@ def _render_breakdown_by_type(top_df: pd.DataFrame, color: str, title: str):
     )
 
 
+def _render_paid_summary(top_df: pd.DataFrame, color: str, title: str):
+    """Resume métricas de posts pagados vs orgánicos."""
+    if top_df is None or top_df.empty:
+        return
+    if "impresiones_pagadas" not in top_df.columns:
+        return
+
+    paid_df = top_df[top_df.get("es_pagado", False) == True]
+    organic_df = top_df[top_df.get("es_pagado", False) != True]
+
+    n_paid = len(paid_df)
+    n_organic = len(organic_df)
+    if n_paid == 0:
+        return  # Si no hay posts pagados, no mostramos sección
+
+    st.markdown(f"##### 💰 Posts pagados vs orgánicos — {title}")
+
+    paid_imp = int(paid_df["impresiones_pagadas"].sum())
+    paid_reach = int(paid_df["alcance_pagado"].sum())
+    paid_eng = int(paid_df["engagement"].sum())
+    organic_imp = int(organic_df.get("impresiones_total", pd.Series([0])).sum())
+    organic_eng = int(organic_df["engagement"].sum())
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("📢 Posts pagados", f"{n_paid:,}", help="Posts que recibieron pauta")
+    c2.metric("🆓 Posts orgánicos", f"{n_organic:,}")
+    c3.metric("👁️ Impresiones pagadas", f"{paid_imp:,}")
+    c4.metric("🎯 Alcance pagado", f"{paid_reach:,}")
+
+    # Engagement promedio comparativo
+    avg_paid = paid_eng / n_paid if n_paid else 0
+    avg_organic = organic_eng / n_organic if n_organic else 0
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("❤️ Eng. avg pagado", f"{avg_paid:,.0f}")
+    c6.metric("❤️ Eng. avg orgánico", f"{avg_organic:,.0f}")
+    if avg_organic > 0:
+        ratio = avg_paid / avg_organic
+        c7.metric(
+            "📊 Multiplicador", f"{ratio:.1f}×",
+            help="Ratio engagement promedio pagado / orgánico"
+        )
+    if paid_imp > 0:
+        # Estimación de "CPM-equivalente" no real pero útil como benchmark
+        c8.metric(
+            "📈 % impresiones pagas",
+            f"{(paid_imp / max(paid_imp + organic_imp, 1)) * 100:.1f}%",
+        )
+
+    st.info(
+        "ℹ️ **Nota sobre métricas de pauta**: Para ver gasto, CPC, CTR y "
+        "ROAS en detalle, necesitamos agregar el permiso `ads_read` al token "
+        "de Meta. Pídeme y te guío en hacerlo (5 min)."
+    )
+
+
 def _render_recommendations(
     top_df: pd.DataFrame,
     df_period: pd.DataFrame,
@@ -668,7 +726,9 @@ def _platform_tab_meta(
                 ):
                     df = fetch_data_fn(fecha_desde, fecha_hasta)
                     df_prev = fetch_data_fn(fecha_desde_prev, fecha_hasta_prev)
-                    top = fetch_top_fn(fecha_desde, fecha_hasta, n=20)
+                    # n=200 para que el desglose por tipo capture toda la
+                    # diversidad de formatos (no solo el top 20).
+                    top = fetch_top_fn(fecha_desde, fecha_hasta, n=200)
                     st.session_state["social_data"][platform_key] = df
                     st.session_state["social_data"][f"{platform_key}_prev"] = df_prev
                     st.session_state["social_data"][f"{platform_key}_top"] = top
@@ -730,6 +790,11 @@ def _platform_tab_meta(
     # 5. Desglose por tipo de post (Foto/Video/Reel/etc.)
     if top is not None and not top.empty:
         _render_breakdown_by_type(top, color, title)
+        st.markdown("---")
+
+    # 6. Posts pagados vs orgánicos
+    if top is not None and not top.empty:
+        _render_paid_summary(top, color, title)
         st.markdown("---")
 
     # 7. Top posts
