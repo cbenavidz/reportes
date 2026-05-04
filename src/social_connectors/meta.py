@@ -138,17 +138,16 @@ def _unpack_reactions(value):
     return {"likes": 0, "loves": 0, "wows": 0, "haha": 0, "sads": 0, "angrys": 0}
 
 
-def _fetch_facebook_posts_aggregated(
+def _fetch_facebook_posts(
     page_id: str,
     date_from: date,
     date_to: date,
     token: str,
 ) -> pd.DataFrame:
     """
-    Trae los posts del período y agrega likes/comments/shares por día.
-
-    Page Insights ya no expone likes/comments/shares totales en v23.0.
-    Hay que ir a nivel post y sumar.
+    Trae los posts del período con todas sus métricas de engagement.
+    Devuelve DataFrame con UN POST POR FILA — se usa para agregados,
+    top posts, y métricas de engagement.
     """
     since_unix = int(datetime.combine(date_from, datetime.min.time()).timestamp())
     until_unix = int(datetime.combine(
@@ -156,7 +155,7 @@ def _fetch_facebook_posts_aggregated(
     ).timestamp())
 
     fields = (
-        "id,created_time,message,"
+        "id,created_time,message,permalink_url,"
         "likes.summary(true).limit(0),"
         "comments.summary(true).limit(0),"
         "shares,"
@@ -169,56 +168,323 @@ def _fetch_facebook_posts_aggregated(
         "limit": 100,
     }
     rows = []
-    next_url = f"/{page_id}/posts"
-    next_params = params
-    pages_fetched = 0
-    while next_url and pages_fetched < 10:  # safety: max 10 páginas (1000 posts)
-        data = _try_get(next_url, next_params, token=token)
-        if not data:
-            break
-        for p in data.get("data", []):
-            created = p.get("created_time", "")[:10]
-            if not created:
-                continue
-            likes_total = (p.get("likes") or {}).get("summary", {}).get("total_count", 0)
-            comments_total = (p.get("comments") or {}).get("summary", {}).get("total_count", 0)
-            shares_total = (p.get("shares") or {}).get("count", 0)
-            reactions_total = (p.get("reactions") or {}).get("summary", {}).get("total_count", 0)
-            rows.append({
-                "fecha": created,
-                "post_id": p.get("id"),
-                "n_posts": 1,
-                "likes": likes_total,
-                "comentarios": comments_total,
-                "compartidos": shares_total,
-                "reacciones_total": reactions_total,
-            })
-        # Pagination via cursors — el "next" viene en data.paging.next
-        paging = data.get("paging", {})
-        next_full = paging.get("next")
-        if not next_full:
-            break
-        # next_full es URL completa con params; resetear next_params para no duplicar
-        # Truco: pasamos solo el access_token vía nuestro helper
-        # Pero como _get prepende BASE_URL, necesitamos otro approach.
-        # Por simplicidad: cortamos el bucle aquí (1 página = 100 posts)
-        break
-
+    data = _try_get(f"/{page_id}/posts", params, token=token)
+    if not data:
+        return pd.DataFrame(columns=[
+            "fecha", "post_id", "mensaje", "url",
+            "likes", "comentarios", "compartidos", "reacciones_total",
+        ])
+    for p in data.get("data", []):
+        created = p.get("created_time", "")[:10]
+        if not created:
+            continue
+        likes_total = (p.get("likes") or {}).get("summary", {}).get("total_count", 0)
+        comments_total = (p.get("comments") or {}).get("summary", {}).get("total_count", 0)
+        shares_total = (p.get("shares") or {}).get("count", 0)
+        reactions_total = (p.get("reactions") or {}).get("summary", {}).get("total_count", 0)
+        rows.append({
+            "fecha": created,
+            "post_id": p.get("id"),
+            "mensaje": (p.get("message") or "")[:200],
+            "url": p.get("permalink_url", ""),
+            "likes": likes_total,
+            "comentarios": comments_total,
+            "compartidos": shares_total,
+            "reacciones_total": reactions_total,
+        })
     if not rows:
+        return pd.DataFrame(columns=[
+            "fecha", "post_id", "mensaje", "url",
+            "likes", "comentarios", "compartidos", "reacciones_total",
+        ])
+    df = pd.DataFrame(rows)
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df["engagement"] = df["likes"] + df["comentarios"] + df["compartidos"]
+    return df.sort_values("engagement", ascending=False).reset_index(drop=True)
+
+
+def _fetch_facebook_posts_aggregated(
+    page_id: str,
+    date_from: date,
+    date_to: date,
+    token: str,
+) -> pd.DataFrame:
+    """Posts agregados por día — lo que la página principal usa."""
+    posts = _fetch_facebook_posts(page_id, date_from, date_to, token)
+    if posts.empty:
         return pd.DataFrame(columns=[
             "fecha", "n_posts", "likes", "comentarios", "compartidos", "reacciones_total",
         ])
-
-    df = pd.DataFrame(rows)
-    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.normalize()
-    agg = df.groupby("fecha", as_index=False).agg({
+    posts2 = posts.copy()
+    posts2["fecha"] = pd.to_datetime(posts2["fecha"]).dt.normalize()
+    posts2["n_posts"] = 1
+    return posts2.groupby("fecha", as_index=False).agg({
         "n_posts": "sum",
         "likes": "sum",
         "comentarios": "sum",
         "compartidos": "sum",
         "reacciones_total": "sum",
     })
-    return agg
+
+
+def fetch_meta_facebook_top_posts(
+    date_from: date,
+    date_to: date,
+    n: int = 10,
+) -> pd.DataFrame:
+    """Top N posts del período por engagement (likes + comentarios + compartidos)."""
+    cfg = get_secret_dict("meta") or {}
+    page_id = cfg.get("facebook_page_id")
+    if not page_id:
+        raise RuntimeError("Falta facebook_page_id en secrets.")
+    page_token = _get_page_access_token() or cfg.get("access_token")
+    posts = _fetch_facebook_posts(page_id, date_from, date_to, page_token)
+    return posts.head(n)
+
+
+def fetch_meta_facebook_monthly_evolution(
+    months: int = 12,
+) -> pd.DataFrame:
+    """
+    Trae evolución MENSUAL de KPIs de Facebook para los últimos N meses.
+
+    Estrategia:
+      - Itera de 90 días en 90 días hacia atrás (límite Meta API).
+      - Concatena resultados.
+      - Agrupa por mes y devuelve DataFrame con columnas:
+        mes, seguidores_fin_mes, nuevos_seguidores, engagement,
+        alcance, n_posts.
+    """
+    cfg = get_secret_dict("meta") or {}
+    page_id = cfg.get("facebook_page_id")
+    if not page_id:
+        raise RuntimeError("Falta facebook_page_id en secrets.")
+    page_token = _get_page_access_token() or cfg.get("access_token")
+
+    today = date.today()
+    months_back = months
+    all_rows = []
+
+    # Itera en chunks de 90 días hacia atrás
+    chunk_end = today
+    chunk_start = chunk_end - timedelta(days=90)
+    months_covered = 0
+    while months_covered < months_back:
+        # Insights diarios de este chunk (page_fans, page_fan_adds, etc.)
+        for metric, alias in [
+            ("page_fans", "seguidores"),
+            ("page_fan_adds", "nuevos_seguidores"),
+            ("page_post_engagements", "engagement"),
+            ("page_impressions_unique", "alcance"),
+        ]:
+            for v in _fetch_metric_safe(
+                f"/{page_id}", metric, "day", chunk_start, chunk_end, page_token
+            ):
+                all_rows.append({
+                    "fecha": v["fecha"],
+                    "metric": alias,
+                    "value": v["value"] if not isinstance(v["value"], dict) else 0,
+                })
+        # Posts del chunk
+        try:
+            posts = _fetch_facebook_posts(
+                page_id, chunk_start, chunk_end, page_token
+            )
+            for _, p in posts.iterrows():
+                all_rows.append({
+                    "fecha": p["fecha"].strftime("%Y-%m-%d") if hasattr(p["fecha"], "strftime") else str(p["fecha"])[:10],
+                    "metric": "n_posts",
+                    "value": 1,
+                })
+        except Exception:  # noqa: BLE001
+            pass
+
+        months_covered += 3  # ~3 meses por chunk
+        chunk_end = chunk_start - timedelta(days=1)
+        chunk_start = chunk_end - timedelta(days=90)
+
+    if not all_rows:
+        return pd.DataFrame(columns=[
+            "mes", "seguidores_fin_mes", "nuevos_seguidores",
+            "engagement", "alcance", "n_posts",
+        ])
+
+    df = pd.DataFrame(all_rows)
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df = df.dropna(subset=["fecha"])
+    df["mes"] = df["fecha"].dt.to_period("M").dt.to_timestamp()
+
+    # Pivote: una fila por mes
+    df["value"] = pd.to_numeric(df["value"], errors="coerce").fillna(0)
+
+    monthly = df.groupby(["mes", "metric"], as_index=False)["value"].agg(
+        # Para 'seguidores' nos interesa el ÚLTIMO valor del mes (snapshot)
+        # Para los demás, el SUMATORIO
+        # Hack: distinguimos por metric en post-process
+        "sum"
+    )
+
+    # Pivot to wide format
+    wide = monthly.pivot(index="mes", columns="metric", values="value").reset_index()
+
+    # Seguidores: tomar el valor MÁS ALTO del mes (asumimos crecimiento)
+    if "seguidores" in df["metric"].unique():
+        seguidores_mes = (
+            df[df["metric"] == "seguidores"]
+            .groupby("mes")["value"].last()
+            .reset_index()
+            .rename(columns={"value": "seguidores_fin_mes"})
+        )
+        wide = wide.drop(columns=["seguidores"], errors="ignore")
+        wide = wide.merge(seguidores_mes, on="mes", how="left")
+
+    # Asegurar columnas estándar
+    for col in ["seguidores_fin_mes", "nuevos_seguidores", "engagement",
+                "alcance", "n_posts"]:
+        if col not in wide.columns:
+            wide[col] = 0
+        wide[col] = wide[col].fillna(0)
+
+    # Solo últimos N meses
+    wide = wide.sort_values("mes").tail(months_back).reset_index(drop=True)
+    return wide[[
+        "mes", "seguidores_fin_mes", "nuevos_seguidores",
+        "engagement", "alcance", "n_posts",
+    ]]
+
+
+def fetch_meta_instagram_monthly_evolution(
+    months: int = 12,
+) -> pd.DataFrame:
+    """Evolución mensual de IG. Igual lógica que FB pero con métricas IG."""
+    cfg = get_secret_dict("meta") or {}
+    ig_id = cfg.get("instagram_user_id")
+    if not ig_id:
+        raise RuntimeError("Falta instagram_user_id en secrets.")
+    page_token = _get_page_access_token() or cfg.get("access_token")
+
+    today = date.today()
+    all_rows = []
+
+    chunk_end = today
+    chunk_start = chunk_end - timedelta(days=90)
+    months_covered = 0
+    while months_covered < months:
+        for metric, alias in [
+            ("reach", "alcance"),
+            ("follower_count", "nuevos_seguidores"),
+            ("profile_views", "vistas_perfil"),
+            ("accounts_engaged", "cuentas_engagement"),
+        ]:
+            for v in _fetch_metric_safe(
+                f"/{ig_id}", metric, "day", chunk_start, chunk_end, page_token
+            ):
+                value = v["value"]
+                if isinstance(value, dict):
+                    value = value.get("value", 0)
+                all_rows.append({
+                    "fecha": v["fecha"],
+                    "metric": alias,
+                    "value": value,
+                })
+        # Media (posts/reels)
+        fields = "id,timestamp,like_count,comments_count"
+        params = {
+            "fields": fields,
+            "since": int(datetime.combine(chunk_start, datetime.min.time()).timestamp()),
+            "until": int(datetime.combine(chunk_end, datetime.min.time()).timestamp()),
+            "limit": 100,
+        }
+        data = _try_get(f"/{ig_id}/media", params, token=page_token)
+        if data:
+            for m in data.get("data", []):
+                ts = m.get("timestamp", "")[:10]
+                if not ts:
+                    continue
+                media_date = datetime.strptime(ts, "%Y-%m-%d").date()
+                if media_date < chunk_start or media_date > chunk_end:
+                    continue
+                all_rows.append({
+                    "fecha": ts, "metric": "n_posts", "value": 1,
+                })
+                all_rows.append({
+                    "fecha": ts, "metric": "likes",
+                    "value": int(m.get("like_count", 0) or 0),
+                })
+                all_rows.append({
+                    "fecha": ts, "metric": "comentarios",
+                    "value": int(m.get("comments_count", 0) or 0),
+                })
+
+        months_covered += 3
+        chunk_end = chunk_start - timedelta(days=1)
+        chunk_start = chunk_end - timedelta(days=90)
+
+    if not all_rows:
+        return pd.DataFrame(columns=[
+            "mes", "alcance", "nuevos_seguidores", "n_posts", "likes", "comentarios",
+        ])
+
+    df = pd.DataFrame(all_rows)
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df = df.dropna(subset=["fecha"])
+    df["mes"] = df["fecha"].dt.to_period("M").dt.to_timestamp()
+    df["value"] = pd.to_numeric(df["value"], errors="coerce").fillna(0)
+
+    monthly = df.groupby(["mes", "metric"], as_index=False)["value"].sum()
+    wide = monthly.pivot(index="mes", columns="metric", values="value").reset_index()
+
+    for col in ["alcance", "nuevos_seguidores", "n_posts", "likes", "comentarios",
+                "vistas_perfil", "cuentas_engagement"]:
+        if col not in wide.columns:
+            wide[col] = 0
+        wide[col] = wide[col].fillna(0)
+
+    wide = wide.sort_values("mes").tail(months).reset_index(drop=True)
+    return wide
+
+
+def fetch_meta_instagram_top_posts(
+    date_from: date,
+    date_to: date,
+    n: int = 10,
+) -> pd.DataFrame:
+    """Top N posts/reels de IG por engagement."""
+    cfg = get_secret_dict("meta") or {}
+    ig_id = cfg.get("instagram_user_id")
+    if not ig_id:
+        raise RuntimeError("Falta instagram_user_id en secrets.")
+    page_token = _get_page_access_token() or cfg.get("access_token")
+    fields = "id,timestamp,media_type,media_url,permalink,caption,like_count,comments_count"
+    params = {"fields": fields, "limit": 100}
+    data = _try_get(f"/{ig_id}/media", params, token=page_token)
+    if not data:
+        return pd.DataFrame()
+    rows = []
+    for m in data.get("data", []):
+        ts = m.get("timestamp", "")[:10]
+        if not ts:
+            continue
+        media_date = datetime.strptime(ts, "%Y-%m-%d").date()
+        if media_date < date_from or media_date > date_to:
+            continue
+        likes = int(m.get("like_count", 0) or 0)
+        comments = int(m.get("comments_count", 0) or 0)
+        rows.append({
+            "fecha": ts,
+            "post_id": m.get("id"),
+            "tipo": m.get("media_type", ""),
+            "caption": (m.get("caption") or "")[:200],
+            "url": m.get("permalink", ""),
+            "likes": likes,
+            "comentarios": comments,
+            "engagement": likes + comments,
+        })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["fecha"] = pd.to_datetime(df["fecha"])
+    return df.sort_values("engagement", ascending=False).head(n).reset_index(drop=True)
 
 
 def fetch_meta_facebook_data(

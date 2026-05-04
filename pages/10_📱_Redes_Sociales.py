@@ -2,17 +2,12 @@
 """
 Página: Redes Sociales y Google Analytics.
 
-Versión inicial: cargas CSVs exportados manualmente desde cada plataforma.
-La app detecta automáticamente el formato y calcula KPIs.
-
-Plataformas soportadas:
-  - Facebook (Meta Business Suite)
-  - Instagram (Meta Business Suite)
-  - TikTok (TikTok Business / Creator)
-  - Google Analytics 4
-
-Cuando se obtengan tokens de API, los conectores se reemplazarán por
-descargas en vivo.
+Reporte enriquecido con:
+  - KPIs principales del período + comparativa vs período anterior
+  - Histórico mensual (12 meses) de seguidores, engagement, posts, alcance
+  - Top posts del período con preview y links
+  - Tabla diaria de detalle
+  - Soporte API (Meta, GA4) + fallback CSV manual
 """
 from __future__ import annotations
 
@@ -27,7 +22,11 @@ from src.auth import logout_button, require_auth
 from src.social_connectors import (
     fetch_ga4_data,
     fetch_meta_facebook_data,
+    fetch_meta_facebook_monthly_evolution,
+    fetch_meta_facebook_top_posts,
     fetch_meta_instagram_data,
+    fetch_meta_instagram_monthly_evolution,
+    fetch_meta_instagram_top_posts,
     is_ga4_configured,
     is_meta_configured,
     is_tiktok_configured,
@@ -49,16 +48,15 @@ logout_button()
 
 st.title("📱 Redes Sociales y Google Analytics")
 st.caption(
-    "Análisis unificado de Facebook, Instagram, TikTok y Google Analytics. "
-    "Por ahora carga CSVs exportados manualmente desde cada plataforma. "
-    "Próximamente: conexión vía API para actualización automática."
+    "Análisis unificado con KPIs, evolución mensual, top posts y comparativa "
+    "vs período anterior. Conexión vía API a Meta + GA4. CSV manual como fallback."
 )
 
-# Inicializar storage en session_state
+# Inicializar storage
 if "social_data" not in st.session_state:
     st.session_state["social_data"] = {
-        "facebook": None,
-        "instagram": None,
+        "facebook": None, "facebook_monthly": None, "facebook_top": None,
+        "instagram": None, "instagram_monthly": None, "instagram_top": None,
         "tiktok": None,
         "ga4": None,
     }
@@ -100,8 +98,58 @@ if quick != "Personalizado":
         fecha_desde, fecha_hasta = last_prev.replace(day=1), last_prev
 
 
+# Agrupación temporal (Día / Semana / Mes / Trimestre)
+periodo_dias_total = (fecha_hasta - fecha_desde).days + 1
+default_group = (
+    "Mes" if periodo_dias_total > 120
+    else "Semana" if periodo_dias_total > 35
+    else "Día"
+)
+group_options = ["Día", "Semana", "Mes", "Trimestre"]
+group_idx = group_options.index(default_group)
+agrupacion = st.radio(
+    "Agrupar por",
+    options=group_options,
+    index=group_idx,
+    horizontal=True,
+    key="rs_agrupacion",
+    help=(
+        "Si tu período es largo (varios meses), agrupa por Semana o Mes "
+        "para ver la evolución."
+    ),
+)
+GROUP_FREQ = {
+    "Día": "D", "Semana": "W-MON", "Mes": "MS", "Trimestre": "QS",
+}[agrupacion]
+
+
+# Período anterior (para comparativa)
+periodo_dias = (fecha_hasta - fecha_desde).days + 1
+fecha_desde_prev = fecha_desde - timedelta(days=periodo_dias)
+fecha_hasta_prev = fecha_desde - timedelta(days=1)
+
+
 # ---------------------------------------------------------------------------
-# Tabs por plataforma
+# Helpers
+# ---------------------------------------------------------------------------
+def _delta_pct(actual: float, anterior: float) -> str | None:
+    """Calcula % cambio. Retorna None si no se puede comparar."""
+    if anterior is None or anterior == 0:
+        return None
+    return ((actual - anterior) / anterior) * 100
+
+
+def _fmt_delta(actual: float, anterior: float | None) -> str:
+    """Formato '↑ +12.3%' o '↓ -5.1%' o ''."""
+    if anterior is None or anterior == 0:
+        return ""
+    pct = ((actual - anterior) / anterior) * 100
+    arrow = "↑" if pct >= 0 else "↓"
+    return f"{arrow} {pct:+.1f}%"
+
+
+# ---------------------------------------------------------------------------
+# Tabs
 # ---------------------------------------------------------------------------
 tab_fb, tab_ig, tab_tt, tab_ga, tab_cmp = st.tabs([
     "📘 Facebook", "📸 Instagram", "🎵 TikTok",
@@ -109,51 +157,376 @@ tab_fb, tab_ig, tab_tt, tab_ga, tab_cmp = st.tabs([
 ])
 
 
-def _platform_tab(
+def _render_kpi_grid(
+    df: pd.DataFrame,
+    df_prev: pd.DataFrame | None,
+    icon: str,
+    is_ig: bool = False,
+):
+    """Renderiza grid de 8 KPIs con comparativa al período anterior."""
+    k = compute_period_kpis(df, fecha_desde, fecha_hasta)
+    k_prev = (
+        compute_period_kpis(df_prev, fecha_desde_prev, fecha_hasta_prev)
+        if df_prev is not None and not df_prev.empty
+        else {"alcance": 0, "engagement": 0, "likes": 0, "comentarios": 0,
+              "compartidos": 0, "impresiones": 0, "engagement_rate": 0, "n_dias": 0}
+    )
+
+    # Seguidores: tomamos el último valor de la columna 'seguidores' si existe
+    seguidores_actual = 0
+    seguidores_prev = 0
+    n_posts_actual = 0
+    n_posts_prev = 0
+    if not df.empty:
+        if "seguidores" in df.columns:
+            sub = df.dropna(subset=["fecha"])
+            sub = sub[(sub["fecha"] >= pd.Timestamp(fecha_desde))
+                      & (sub["fecha"] <= pd.Timestamp(fecha_hasta))]
+            seguidores_actual = int(sub["seguidores"].dropna().iloc[-1]) if not sub["seguidores"].dropna().empty else 0
+        if "n_posts" in df.columns:
+            sub = df.dropna(subset=["fecha"])
+            sub = sub[(sub["fecha"] >= pd.Timestamp(fecha_desde))
+                      & (sub["fecha"] <= pd.Timestamp(fecha_hasta))]
+            n_posts_actual = int(sub["n_posts"].fillna(0).sum())
+    if df_prev is not None and not df_prev.empty:
+        if "seguidores" in df_prev.columns:
+            sub = df_prev.dropna(subset=["fecha"])
+            sub = sub[(sub["fecha"] >= pd.Timestamp(fecha_desde_prev))
+                      & (sub["fecha"] <= pd.Timestamp(fecha_hasta_prev))]
+            seguidores_prev = int(sub["seguidores"].dropna().iloc[-1]) if not sub["seguidores"].dropna().empty else 0
+        if "n_posts" in df_prev.columns:
+            sub = df_prev.dropna(subset=["fecha"])
+            sub = sub[(sub["fecha"] >= pd.Timestamp(fecha_desde_prev))
+                      & (sub["fecha"] <= pd.Timestamp(fecha_hasta_prev))]
+            n_posts_prev = int(sub["n_posts"].fillna(0).sum())
+
+    st.markdown(f"##### 📊 KPIs del período ({fecha_desde} → {fecha_hasta})")
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric(
+        "👥 Seguidores",
+        f"{seguidores_actual:,}",
+        delta=_fmt_delta(seguidores_actual, seguidores_prev) or None,
+    )
+    c2.metric(
+        "📝 Posts publicados",
+        f"{n_posts_actual:,}",
+        delta=_fmt_delta(n_posts_actual, n_posts_prev) or None,
+    )
+    c3.metric(
+        f"{icon} Alcance",
+        f"{int(k['alcance']):,}",
+        delta=_fmt_delta(k["alcance"], k_prev["alcance"]) or None,
+    )
+    c4.metric(
+        "👁️ Impresiones",
+        f"{int(k['impresiones']):,}",
+        delta=_fmt_delta(k["impresiones"], k_prev["impresiones"]) or None,
+    )
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric(
+        "❤️ Engagement",
+        f"{int(k['engagement']):,}",
+        delta=_fmt_delta(k["engagement"], k_prev["engagement"]) or None,
+    )
+    c6.metric(
+        "👍 Likes",
+        f"{int(k['likes']):,}",
+        delta=_fmt_delta(k["likes"], k_prev["likes"]) or None,
+    )
+    c7.metric(
+        "💬 Comentarios",
+        f"{int(k['comentarios']):,}",
+        delta=_fmt_delta(k["comentarios"], k_prev["comentarios"]) or None,
+    )
+    c8.metric(
+        "📈 Engagement rate",
+        f"{k['engagement_rate']:.2f}%",
+        delta=_fmt_delta(k["engagement_rate"], k_prev["engagement_rate"]) or None,
+    )
+
+
+def _render_monthly_evolution(monthly_df: pd.DataFrame, color: str, title: str):
+    """Renderiza evolución mensual con gráficas."""
+    if monthly_df is None or monthly_df.empty:
+        st.info("Aún no se ha cargado la evolución mensual. Click el botón arriba.")
+        return
+
+    df = monthly_df.copy()
+    df["mes_label"] = pd.to_datetime(df["mes"]).dt.strftime("%Y-%m")
+
+    st.markdown(f"##### 📈 Evolución mensual — {title}")
+
+    # 4 gráficas: seguidores, engagement, alcance, posts
+    col_a, col_b = st.columns(2)
+    with col_a:
+        if "seguidores_fin_mes" in df.columns and df["seguidores_fin_mes"].sum() > 0:
+            fig = px.line(
+                df, x="mes_label", y="seguidores_fin_mes",
+                markers=True, color_discrete_sequence=[color],
+                labels={"mes_label": "Mes", "seguidores_fin_mes": "Seguidores"},
+                title="Seguidores totales (fin de mes)",
+            )
+            fig.update_layout(height=300, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+        elif "alcance" in df.columns:
+            fig = px.line(
+                df, x="mes_label", y="alcance", markers=True,
+                color_discrete_sequence=[color],
+                labels={"mes_label": "Mes", "alcance": "Alcance"},
+                title="Alcance mensual",
+            )
+            fig.update_layout(height=300, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with col_b:
+        if "nuevos_seguidores" in df.columns and df["nuevos_seguidores"].sum() > 0:
+            fig = px.bar(
+                df, x="mes_label", y="nuevos_seguidores",
+                color_discrete_sequence=[color],
+                labels={"mes_label": "Mes", "nuevos_seguidores": "Nuevos"},
+                title="Nuevos seguidores por mes",
+            )
+            fig.update_layout(height=300, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+    col_c, col_d = st.columns(2)
+    with col_c:
+        if "engagement" in df.columns and df["engagement"].sum() > 0:
+            fig = px.bar(
+                df, x="mes_label", y="engagement",
+                color_discrete_sequence=[color],
+                labels={"mes_label": "Mes", "engagement": "Engagement"},
+                title="Engagement total por mes",
+            )
+            fig.update_layout(height=300, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+    with col_d:
+        if "n_posts" in df.columns and df["n_posts"].sum() > 0:
+            fig = px.bar(
+                df, x="mes_label", y="n_posts",
+                color_discrete_sequence=[color],
+                labels={"mes_label": "Mes", "n_posts": "Posts"},
+                title="Posts publicados por mes",
+            )
+            fig.update_layout(height=300, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Tabla detalle mensual
+    with st.expander("📋 Detalle mensual (tabla)", expanded=False):
+        show_df = df.copy()
+        show_df["mes"] = show_df["mes_label"]
+        show_df = show_df.drop(columns=["mes_label"])
+        st.dataframe(
+            show_df, use_container_width=True, hide_index=True,
+        )
+
+
+def _render_top_posts(top_df: pd.DataFrame, title: str):
+    """Renderiza tabla de top posts del período."""
+    if top_df is None or top_df.empty:
+        return
+    st.markdown(f"##### 🔥 Top posts del período — {title}")
+    show_df = top_df.copy()
+    if "fecha" in show_df.columns:
+        show_df["fecha"] = pd.to_datetime(show_df["fecha"]).dt.strftime("%Y-%m-%d")
+    cols_order = [c for c in [
+        "fecha", "mensaje", "caption", "tipo",
+        "likes", "comentarios", "compartidos", "engagement", "url",
+    ] if c in show_df.columns]
+    show_df = show_df[cols_order]
+    st.dataframe(
+        show_df,
+        column_config={
+            "url": st.column_config.LinkColumn("Ver post", display_text="🔗"),
+            "mensaje": st.column_config.TextColumn("Mensaje", width="large"),
+            "caption": st.column_config.TextColumn("Caption", width="large"),
+            "likes": st.column_config.NumberColumn(format="%,d"),
+            "comentarios": st.column_config.NumberColumn(format="%,d"),
+            "compartidos": st.column_config.NumberColumn(format="%,d"),
+            "engagement": st.column_config.NumberColumn(format="%,d"),
+        },
+        use_container_width=True, hide_index=True, height=400,
+    )
+
+
+def _aggregate_by_period(df: pd.DataFrame, freq: str) -> pd.DataFrame:
+    """
+    Agrupa el DataFrame por la frecuencia seleccionada (D/W-MON/MS/QS).
+    - Métricas acumulables (likes, engagement, alcance, etc.) → SUMA
+    - 'seguidores' (snapshot lifetime) → ÚLTIMO valor del período
+    """
+    if df is None or df.empty or "fecha" not in df.columns:
+        return pd.DataFrame()
+    sub = df.dropna(subset=["fecha"]).copy()
+    sub = sub[(sub["fecha"] >= pd.Timestamp(fecha_desde))
+              & (sub["fecha"] <= pd.Timestamp(fecha_hasta))]
+    if sub.empty:
+        return pd.DataFrame()
+    sub = sub.set_index("fecha").sort_index()
+
+    sum_cols = [c for c in sub.columns if c not in ("seguidores",)]
+    last_cols = [c for c in sub.columns if c == "seguidores"]
+
+    agg_dict = {}
+    for c in sum_cols:
+        if pd.api.types.is_numeric_dtype(sub[c]):
+            agg_dict[c] = "sum"
+    for c in last_cols:
+        if pd.api.types.is_numeric_dtype(sub[c]):
+            agg_dict[c] = "last"
+
+    if not agg_dict:
+        return pd.DataFrame()
+
+    grouped = sub.resample(freq).agg(agg_dict).reset_index()
+    return grouped
+
+
+def _render_tendency(df: pd.DataFrame, color: str, title: str):
+    """Gráfica de engagement agrupada por la frecuencia seleccionada."""
+    grouped = _aggregate_by_period(df, GROUP_FREQ)
+    if grouped.empty or "engagement" not in grouped.columns:
+        return
+    st.markdown(f"##### 📈 Engagement por {agrupacion.lower()} — {title}")
+    fig = px.area(
+        grouped, x="fecha", y="engagement",
+        color_discrete_sequence=[color],
+        labels={"fecha": "Fecha", "engagement": "Engagement"},
+        markers=True,
+    )
+    fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def _render_kpis_grouped(df: pd.DataFrame, color: str, title: str):
+    """
+    Tabla + 4 gráficas de evolución de KPIs por período seleccionado
+    (Día/Semana/Mes/Trimestre).
+    """
+    grouped = _aggregate_by_period(df, GROUP_FREQ)
+    if grouped.empty:
+        return
+    st.markdown(f"##### 📊 KPIs por {agrupacion.lower()} — {title}")
+
+    # 4 gráficas en grid
+    metrics_to_chart = []
+    for col, label in [
+        ("alcance", "Alcance"),
+        ("engagement", "Engagement"),
+        ("likes", "Likes"),
+        ("n_posts", "Posts publicados"),
+    ]:
+        if col in grouped.columns and grouped[col].sum() > 0:
+            metrics_to_chart.append((col, label))
+
+    if metrics_to_chart:
+        cols_pair = st.columns(2)
+        for i, (col, label) in enumerate(metrics_to_chart):
+            with cols_pair[i % 2]:
+                fig = px.bar(
+                    grouped, x="fecha", y=col,
+                    color_discrete_sequence=[color],
+                    labels={"fecha": agrupacion, col: label},
+                    title=label,
+                )
+                fig.update_layout(
+                    height=260, margin=dict(l=0, r=0, t=40, b=0),
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+    # Seguidores como línea (snapshot)
+    if "seguidores" in grouped.columns and grouped["seguidores"].sum() > 0:
+        fig = px.line(
+            grouped, x="fecha", y="seguidores",
+            color_discrete_sequence=[color],
+            labels={"fecha": agrupacion, "seguidores": "Seguidores"},
+            markers=True, title="Seguidores totales",
+        )
+        fig.update_layout(height=260, margin=dict(l=0, r=0, t=40, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+
+    with st.expander(f"📋 Tabla por {agrupacion.lower()}", expanded=False):
+        show_df = grouped.copy()
+        if agrupacion == "Mes":
+            show_df["fecha"] = pd.to_datetime(show_df["fecha"]).dt.strftime("%Y-%m")
+        elif agrupacion == "Trimestre":
+            show_df["fecha"] = pd.to_datetime(show_df["fecha"]).dt.to_period("Q").astype(str)
+        elif agrupacion == "Semana":
+            show_df["fecha"] = pd.to_datetime(show_df["fecha"]).dt.strftime("Sem %W (%Y-%m-%d)")
+        else:
+            show_df["fecha"] = pd.to_datetime(show_df["fecha"]).dt.strftime("%Y-%m-%d")
+        st.dataframe(show_df, use_container_width=True, hide_index=True)
+
+
+def _platform_tab_meta(
     platform_key: str,
     icon: str,
     title: str,
-    instrucciones: str,
     color: str,
-    api_status: str = "no_configured",  # 'configured' | 'no_configured' | 'pending'
-    api_fetch_fn=None,
+    fetch_data_fn,
+    fetch_monthly_fn,
+    fetch_top_fn,
+    instrucciones: str,
+    api_status: str = "no_configured",
 ):
-    """Renderiza una pestaña genérica de plataforma con soporte API + CSV."""
+    """Renderiza pestaña Facebook o Instagram con todo el detalle."""
     st.markdown(f"### {icon} {title}")
 
-    # Banner de estado de API
     if api_status == "configured":
-        st.success(
-            f"✅ API conectada — datos en vivo. "
-            "Cambia el período arriba y los datos se actualizan."
-        )
-    elif api_status == "pending":
-        st.warning(
-            f"⏳ API en proceso de aprobación. Mientras tanto, sube CSV manual."
-        )
+        st.success("✅ API conectada — datos en vivo.")
     else:
-        st.info(
-            f"ℹ️ API no configurada. Sube CSV manual o configura las "
-            f"credenciales para datos en vivo (ver guía de setup abajo)."
-        )
+        st.info("ℹ️ API no configurada. Sube CSV manual.")
 
-    with st.expander(f"📥 Setup API + cómo obtener CSV de {title}", expanded=False):
+    with st.expander(f"📥 Setup API + cómo obtener CSV", expanded=False):
         st.markdown(instrucciones)
 
-    # Si hay API → fetch en vivo
-    if api_status == "configured" and api_fetch_fn is not None:
-        if st.button(f"🔄 Actualizar datos de {title}", key=f"refresh_{platform_key}"):
+    # Botones de descarga
+    if api_status == "configured":
+        c1, c2, c3 = st.columns(3)
+        if c1.button(
+            f"🔄 Datos del período ({fecha_desde} → {fecha_hasta})",
+            key=f"refresh_{platform_key}", use_container_width=True,
+        ):
             try:
-                with st.spinner(f"Descargando de {title}..."):
-                    df = api_fetch_fn(fecha_desde, fecha_hasta)
+                with st.spinner(f"Descargando datos del período + período anterior..."):
+                    df = fetch_data_fn(fecha_desde, fecha_hasta)
+                    df_prev = fetch_data_fn(fecha_desde_prev, fecha_hasta_prev)
                     st.session_state["social_data"][platform_key] = df
+                    st.session_state["social_data"][f"{platform_key}_prev"] = df_prev
                     st.success(f"✅ {len(df):,} días descargados.")
             except Exception as exc:  # noqa: BLE001
-                st.error(f"Error al descargar de {title}: {exc}")
+                st.error(f"Error: {exc}")
 
-    # Upload manual (siempre disponible)
+        if c2.button(
+            f"📅 Histórico mensual (12 meses)",
+            key=f"refresh_{platform_key}_monthly", use_container_width=True,
+        ):
+            try:
+                with st.spinner("Descargando histórico mensual (puede tardar 1-2 min)..."):
+                    monthly = fetch_monthly_fn(months=12)
+                    st.session_state["social_data"][f"{platform_key}_monthly"] = monthly
+                    st.success(f"✅ {len(monthly):,} meses descargados.")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Error: {exc}")
+
+        if c3.button(
+            f"🔥 Top posts del período",
+            key=f"refresh_{platform_key}_top", use_container_width=True,
+        ):
+            try:
+                with st.spinner("Descargando top posts..."):
+                    top = fetch_top_fn(fecha_desde, fecha_hasta, n=10)
+                    st.session_state["social_data"][f"{platform_key}_top"] = top
+                    st.success(f"✅ {len(top):,} posts.")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Error: {exc}")
+
+    # CSV upload (siempre disponible)
     uploaded = st.file_uploader(
-        f"O sube CSV manual de {title}",
+        f"O sube CSV manual",
         type=["csv", "xlsx"],
         key=f"upload_{platform_key}",
     )
@@ -165,69 +538,64 @@ def _platform_tab(
             else:
                 df, fmt = parse_csv_auto(uploaded)
             st.session_state["social_data"][platform_key] = df
-            st.success(
-                f"✅ CSV cargado · Formato detectado: `{fmt}` · "
-                f"{len(df):,} filas"
-            )
+            st.success(f"✅ CSV cargado · {fmt} · {len(df):,} filas")
         except Exception as exc:  # noqa: BLE001
-            st.error(f"No se pudo leer el archivo: {exc}")
+            st.error(f"No se pudo leer: {exc}")
 
     df = st.session_state["social_data"].get(platform_key)
+    df_prev = st.session_state["social_data"].get(f"{platform_key}_prev")
+    monthly = st.session_state["social_data"].get(f"{platform_key}_monthly")
+    top = st.session_state["social_data"].get(f"{platform_key}_top")
+
     if df is None or df.empty:
         st.info(
-            f"Sube un CSV de {title} para ver los KPIs. "
-            "Mira la guía de arriba para saber cómo descargarlo."
+            "Click los botones arriba para descargar datos. "
+            "Empieza por **Datos del período**."
         )
         return
 
-    # KPIs del período
-    kpis = compute_period_kpis(df, fecha_desde, fecha_hasta)
+    # 1. KPIs con comparativa
+    _render_kpi_grid(df, df_prev, icon)
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric(f"{icon} Alcance", f"{int(kpis['alcance']):,}")
-    c2.metric("👁️ Impresiones", f"{int(kpis['impresiones']):,}")
-    c3.metric("❤️ Engagement", f"{int(kpis['engagement']):,}")
-    c4.metric("📈 Engagement rate", f"{kpis['engagement_rate']:.2f}%")
+    # 2. Tendencia agrupada (Día/Semana/Mes según selector)
+    _render_tendency(df, color, title)
 
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("👍 Likes", f"{int(kpis['likes']):,}")
-    c6.metric("💬 Comentarios", f"{int(kpis['comentarios']):,}")
-    c7.metric("🔁 Compartidos", f"{int(kpis['compartidos']):,}")
-    c8.metric("📅 Días con datos", f"{kpis['n_dias']:,}")
+    st.markdown("---")
 
-    # Tendencia diaria
-    st.markdown(f"##### 📈 Tendencia diaria de Engagement — {title}")
-    daily = compute_daily_aggregation(df, "engagement")
-    daily = daily[
-        (daily["fecha"] >= fecha_desde) & (daily["fecha"] <= fecha_hasta)
-    ] if not daily.empty else daily
-    if not daily.empty:
-        fig = px.area(
-            daily, x="fecha", y="engagement",
-            color_discrete_sequence=[color],
-            labels={"fecha": "Fecha", "engagement": "Engagement"},
-        )
-        fig.update_layout(height=300, margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
-    else:
-        st.info("Sin datos en el período seleccionado.")
+    # 3. KPIs agrupados (gráficas + tabla por período)
+    _render_kpis_grouped(df, color, title)
 
-    # Tabla de detalle
-    with st.expander(f"📋 Detalle ({len(df):,} filas)", expanded=False):
-        st.dataframe(df, use_container_width=True, hide_index=True, height=300)
+    st.markdown("---")
+
+    # 4. Evolución mensual histórica (12 meses, requiere descarga separada)
+    if monthly is not None and not monthly.empty:
+        _render_monthly_evolution(monthly, color, title)
+        st.markdown("---")
+
+    # 5. Top posts
+    _render_top_posts(top, title)
+
+    if top is not None and not top.empty:
+        st.markdown("---")
+
+    # 6. Detalle diario (raw)
+    with st.expander(f"📋 Detalle diario raw ({len(df):,} filas)", expanded=False):
+        st.dataframe(df, use_container_width=True, hide_index=True, height=400)
 
 
 # ---------------------------------------------------------------------------
 # Facebook
 # ---------------------------------------------------------------------------
 with tab_fb:
-    _platform_tab(
+    _platform_tab_meta(
         platform_key="facebook",
         icon="📘",
         title="Facebook",
         color="#1877F2",
+        fetch_data_fn=fetch_meta_facebook_data,
+        fetch_monthly_fn=fetch_meta_facebook_monthly_evolution,
+        fetch_top_fn=fetch_meta_facebook_top_posts,
         api_status="configured" if is_meta_configured() else "no_configured",
-        api_fetch_fn=fetch_meta_facebook_data if is_meta_configured() else None,
         instrucciones="""
 **Pasos para descargar el CSV de Facebook:**
 
@@ -235,17 +603,10 @@ with tab_fb:
 2. Selecciona tu Página de Facebook.
 3. Menú lateral → **Insights** (Estadísticas).
 4. Arriba elige el rango de fechas (recomendado: últimos 90 días).
-5. Click el botón **Exportar datos** (arriba a la derecha).
-6. Selecciona:
-   - Tipo de datos: **Datos de la página** o **Datos de publicaciones**.
-   - Formato: **CSV** o **Excel**.
-7. Descarga y sube aquí el archivo.
+5. Click **Exportar datos** → **CSV** o **Excel**.
+6. Sube aquí el archivo.
 
-**Métricas que se procesan automáticamente:**
-- Impresiones, alcance, engagement, likes, comentarios, compartidos.
-- Engagement rate (calculado).
-
-**Nota:** la primera vez puede tardar unos minutos en generar el CSV.
+**API:** ya configurado en secrets — usa los botones de descarga.
 """,
     )
 
@@ -254,97 +615,114 @@ with tab_fb:
 # Instagram
 # ---------------------------------------------------------------------------
 with tab_ig:
-    _platform_tab(
+    _platform_tab_meta(
         platform_key="instagram",
         icon="📸",
         title="Instagram",
         color="#E4405F",
+        fetch_data_fn=fetch_meta_instagram_data,
+        fetch_monthly_fn=fetch_meta_instagram_monthly_evolution,
+        fetch_top_fn=fetch_meta_instagram_top_posts,
         api_status="configured" if is_meta_configured() else "no_configured",
-        api_fetch_fn=fetch_meta_instagram_data if is_meta_configured() else None,
         instrucciones="""
 **Pasos para descargar el CSV de Instagram:**
 
 1. Entra a [Meta Business Suite](https://business.facebook.com).
-2. Cambia a tu cuenta de Instagram (selector arriba a la izquierda).
-3. Menú lateral → **Insights** (Estadísticas).
-4. Arriba elige el rango de fechas.
-5. Click **Exportar datos** → **CSV** o **Excel**.
-6. Sube aquí el archivo.
+2. Cambia a tu cuenta de Instagram.
+3. Menú lateral → **Insights**.
+4. **Exportar datos** → **CSV** o **Excel**.
+5. Sube aquí.
 
-**Alternativa desde la app móvil de Instagram (más simple, datos limitados):**
-- Perfil → Menú (☰) → **Insights** → toca cualquier métrica → swipe arriba para ver más datos.
-- (No hay export directo desde móvil; usa Meta Business Suite en web.)
-
-**Métricas que se procesan:**
-- Reach, impressions, likes, comments, saves, shares, profile visits.
+**API:** ya configurado en secrets.
 """,
     )
 
 
 # ---------------------------------------------------------------------------
-# TikTok
+# TikTok (sin cambios — pendiente de App Review)
 # ---------------------------------------------------------------------------
 with tab_tt:
-    _platform_tab(
-        platform_key="tiktok",
-        icon="🎵",
-        title="TikTok",
-        color="#FE2C55",
-        api_status="pending" if is_tiktok_configured() else "no_configured",
-        api_fetch_fn=None,  # esqueleto pendiente
-        instrucciones="""
-**Pasos para descargar el CSV de TikTok:**
-
-1. Entra a [TikTok Studio](https://studio.tiktok.com) o [TikTok Business](https://business.tiktok.com).
-2. Asegúrate de tener una cuenta **Business** o **Creator** (las personales no exportan datos).
-3. Menú → **Analytics** (Análisis).
-4. Arriba elige el rango de fechas (máximo 60 días en algunos planes).
-5. Hay tres pestañas para descargar:
-   - **Visión general** (Overview): vistas de perfil, seguidores, engagement total.
-   - **Contenido** (Content): por video — vistas, likes, comments, shares.
-   - **Seguidores** (Followers): demografía, crecimiento.
-6. Click el botón **Descargar datos** (icono de descarga arriba a la derecha).
-7. Selecciona **CSV** y descarga.
-8. Sube aquí el archivo.
-
-**Métricas que se procesan:**
-- Video views, likes, comments, shares, profile visits, seguidores ganados.
-""",
-    )
+    st.markdown("### 🎵 TikTok")
+    if is_tiktok_configured():
+        st.warning("⏳ API en proceso de aprobación.")
+    else:
+        st.info("ℹ️ API no configurada. Sube CSV manual.")
+    with st.expander("📥 Cómo obtener CSV de TikTok", expanded=False):
+        st.markdown("""
+**Pasos:**
+1. Entra a [TikTok Studio](https://studio.tiktok.com) o TikTok Business.
+2. Asegúrate de tener cuenta **Business** o **Creator**.
+3. Menú → **Analytics**.
+4. Ajusta rango de fechas.
+5. **Descargar datos** → **CSV**.
+6. Sube aquí.
+""")
+    uploaded = st.file_uploader("Sube CSV de TikTok", type=["csv", "xlsx"], key="upload_tiktok")
+    if uploaded is not None:
+        try:
+            if uploaded.name.endswith(".xlsx"):
+                df_raw = pd.read_excel(uploaded)
+                df, fmt = parse_csv_auto(df_raw)
+            else:
+                df, fmt = parse_csv_auto(uploaded)
+            st.session_state["social_data"]["tiktok"] = df
+            st.success(f"✅ {len(df):,} filas")
+        except Exception as exc:
+            st.error(f"Error: {exc}")
+    df_tt = st.session_state["social_data"].get("tiktok")
+    if df_tt is not None and not df_tt.empty:
+        k = compute_period_kpis(df_tt, fecha_desde, fecha_hasta)
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Alcance", f"{int(k['alcance']):,}")
+        c2.metric("Impresiones", f"{int(k['impresiones']):,}")
+        c3.metric("Engagement", f"{int(k['engagement']):,}")
+        c4.metric("Engagement rate", f"{k['engagement_rate']:.2f}%")
 
 
 # ---------------------------------------------------------------------------
 # Google Analytics 4
 # ---------------------------------------------------------------------------
 with tab_ga:
-    _platform_tab(
-        platform_key="ga4",
-        icon="📊",
-        title="Google Analytics",
-        color="#F9AB00",
-        api_status="configured" if is_ga4_configured() else "no_configured",
-        api_fetch_fn=fetch_ga4_data if is_ga4_configured() else None,
-        instrucciones="""
-**Pasos para descargar el CSV de Google Analytics 4:**
+    st.markdown("### 📊 Google Analytics 4")
+    if is_ga4_configured():
+        st.success("✅ API conectada.")
+    else:
+        st.info("ℹ️ API no configurada. Sube CSV manual o configura en secrets.")
+    with st.expander("📥 Setup API + CSV manual", expanded=False):
+        st.markdown("""
+**Setup API:** ver `SETUP_REDES_SOCIALES.md` (sección Google Analytics 4).
 
+**CSV manual:**
 1. Entra a [analytics.google.com](https://analytics.google.com).
-2. Selecciona tu propiedad (la cuenta de tu sitio web).
-3. Menú lateral → **Informes** → **Adquisición** (o el reporte que prefieras).
-4. Arriba ajusta el rango de fechas.
-5. Click el icono de **Compartir / Descargar** (esquina superior derecha) → **Descargar archivo** → **CSV**.
-6. Sube aquí el archivo.
-
-**Reportes recomendados para empezar:**
-- **Adquisición → Visión general del tráfico**: sesiones, usuarios por canal.
-- **Engagement → Páginas y pantallas**: páginas más vistas.
-- **Monetización → Visión general**: si tienes ecommerce, ingresos y conversiones.
-
-**Métricas que se procesan:**
-- Sesiones, usuarios, páginas vistas, tasa de rebote, conversiones, ingresos.
-
-**Más adelante:** podemos conectar la API de GA4 directamente para no tener que exportar manualmente.
-""",
-    )
+2. **Informes → Adquisición** (o el reporte que prefieras).
+3. Ajusta rango de fechas.
+4. **Compartir / Descargar → CSV**.
+5. Sube aquí.
+""")
+    if is_ga4_configured():
+        if st.button("🔄 Descargar datos GA4", key="refresh_ga4"):
+            try:
+                with st.spinner("Descargando..."):
+                    df_ga = fetch_ga4_data(fecha_desde, fecha_hasta)
+                    st.session_state["social_data"]["ga4"] = df_ga
+                    st.success(f"✅ {len(df_ga):,} días descargados.")
+            except Exception as exc:
+                st.error(f"Error: {exc}")
+    uploaded = st.file_uploader("Sube CSV de GA4", type=["csv", "xlsx"], key="upload_ga4")
+    if uploaded is not None:
+        try:
+            if uploaded.name.endswith(".xlsx"):
+                df_raw = pd.read_excel(uploaded)
+                df, fmt = parse_csv_auto(df_raw)
+            else:
+                df, fmt = parse_csv_auto(uploaded)
+            st.session_state["social_data"]["ga4"] = df
+            st.success(f"✅ {len(df):,} filas")
+        except Exception as exc:
+            st.error(f"Error: {exc}")
+    df_ga = st.session_state["social_data"].get("ga4")
+    if df_ga is not None and not df_ga.empty:
+        st.dataframe(df_ga, use_container_width=True, hide_index=True, height=400)
 
 
 # ---------------------------------------------------------------------------
@@ -353,21 +731,19 @@ with tab_ga:
 with tab_cmp:
     st.markdown("### 🆚 Comparativo entre plataformas")
     st.caption(
-        "Métricas combinadas de las plataformas que tengan datos cargados. "
-        "Sube CSVs en cada pestaña primero."
+        "Métricas combinadas de las plataformas con datos cargados."
     )
 
     cargadas = [
         (k, v) for k, v in st.session_state["social_data"].items()
         if v is not None and not v.empty
+        and k in ("facebook", "instagram", "tiktok", "ga4")
     ]
     if not cargadas:
         st.info(
-            "Aún no has cargado ningún CSV. Ve a las pestañas de cada "
-            "plataforma y sube los datos."
+            "Aún no has cargado datos. Ve a las pestañas y descarga primero."
         )
     else:
-        # KPIs por plataforma
         rows = []
         for plat, df in cargadas:
             k = compute_period_kpis(df, fecha_desde, fecha_hasta)
@@ -396,7 +772,6 @@ with tab_cmp:
             use_container_width=True, hide_index=True,
         )
 
-        # Gráfica comparativa de engagement
         if cmp_df["Engagement"].sum() > 0:
             st.markdown("##### 📊 Engagement por plataforma")
             fig = px.bar(
@@ -409,32 +784,6 @@ with tab_cmp:
             )
             fig.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
             fig.update_layout(
-                height=380, margin=dict(l=0, r=0, t=10, b=0),
-                showlegend=False,
+                height=380, margin=dict(l=0, r=0, t=10, b=0), showlegend=False,
             )
             st.plotly_chart(fig, use_container_width=True)
-
-        # Tendencia diaria comparativa
-        st.markdown("##### 📈 Tendencia diaria comparativa de Engagement")
-        all_daily = []
-        for plat, df in cargadas:
-            d = compute_daily_aggregation(df, "engagement")
-            d = d[
-                (d["fecha"] >= fecha_desde) & (d["fecha"] <= fecha_hasta)
-            ] if not d.empty else d
-            if not d.empty:
-                d = d.copy()
-                d["plataforma"] = plat.title()
-                all_daily.append(d)
-        if all_daily:
-            daily_combined = pd.concat(all_daily, ignore_index=True)
-            fig_d = px.line(
-                daily_combined, x="fecha", y="engagement", color="plataforma",
-                color_discrete_map={
-                    "Facebook": "#1877F2", "Instagram": "#E4405F",
-                    "Tiktok": "#FE2C55", "Ga4": "#F9AB00",
-                },
-                markers=True,
-            )
-            fig_d.update_layout(height=380, margin=dict(l=0, r=0, t=10, b=0))
-            st.plotly_chart(fig_d, use_container_width=True)
