@@ -124,6 +124,37 @@ def _fetch_metric_safe(
     return out
 
 
+def _fetch_metric_total_value(
+    endpoint: str,
+    metric: str,
+    date_from: date,
+    date_to: date,
+    token: str,
+) -> int | None:
+    """
+    Llama insights de IG (v22+) con metric_type=total_value.
+    Devuelve UN solo número (total del período) o None si falla.
+
+    Necesario para IG: en v25.0 las métricas de cuenta IG ya no
+    soportan time-series y devuelven total_value: {value: N}.
+    """
+    params = {
+        "metric": metric,
+        "period": "day",
+        "since": str(date_from),
+        "until": str(date_to),
+        "metric_type": "total_value",
+    }
+    data = _try_get(f"{endpoint}/insights", params, token=token)
+    if not data:
+        return None
+    for m in data.get("data", []):
+        tv = m.get("total_value", {})
+        if isinstance(tv, dict) and "value" in tv:
+            return int(tv["value"] or 0)
+    return None
+
+
 def _unpack_reactions(value):
     """`page_actions_post_reactions_total` viene como dict — extraemos."""
     if isinstance(value, dict):
@@ -265,15 +296,26 @@ def fetch_meta_facebook_monthly_evolution(
     months_back = months
     all_rows = []
 
+    # Snapshot actual de seguidores (para reconstruir histórico)
+    page_data = _try_get(
+        f"/{page_id}", {"fields": "fan_count,followers_count"},
+        token=page_token,
+    )
+    seguidores_actuales = 0
+    if page_data:
+        seguidores_actuales = int(
+            page_data.get("followers_count", 0) or page_data.get("fan_count", 0) or 0
+        )
+
     # Itera en chunks de 90 días hacia atrás
     chunk_end = today
     chunk_start = chunk_end - timedelta(days=90)
     months_covered = 0
     while months_covered < months_back:
-        # Insights diarios de este chunk (page_fans, page_fan_adds, etc.)
+        # Insights diarios de este chunk (en v25.0+ page_fans NO existe)
         for metric, alias in [
-            ("page_fans", "seguidores"),
             ("page_fan_adds", "nuevos_seguidores"),
+            ("page_daily_follows", "follows_diarios"),
             ("page_post_engagements", "engagement"),
             ("page_impressions_unique", "alcance"),
         ]:
@@ -327,16 +369,18 @@ def fetch_meta_facebook_monthly_evolution(
     # Pivot to wide format
     wide = monthly.pivot(index="mes", columns="metric", values="value").reset_index()
 
-    # Seguidores: tomar el valor MÁS ALTO del mes (asumimos crecimiento)
-    if "seguidores" in df["metric"].unique():
-        seguidores_mes = (
-            df[df["metric"] == "seguidores"]
-            .groupby("mes")["value"].last()
-            .reset_index()
-            .rename(columns={"value": "seguidores_fin_mes"})
+    # Reconstruir seguidores_fin_mes: actuales - sum(follows_diarios) en meses futuros
+    # (Como page_fans no existe en v25.0, usamos el snapshot actual + delta)
+    if seguidores_actuales > 0 and "follows_diarios" in wide.columns:
+        wide = wide.sort_values("mes", ascending=False).reset_index(drop=True)
+        wide["follows_diarios"] = wide["follows_diarios"].fillna(0)
+        # seguidores al fin de cada mes = actuales - follows posteriores
+        wide["seguidores_fin_mes"] = (
+            seguidores_actuales - wide["follows_diarios"].cumsum().shift(1).fillna(0)
         )
-        wide = wide.drop(columns=["seguidores"], errors="ignore")
-        wide = wide.merge(seguidores_mes, on="mes", how="left")
+        wide = wide.sort_values("mes").reset_index(drop=True)
+    elif seguidores_actuales > 0:
+        wide["seguidores_fin_mes"] = seguidores_actuales
 
     # Asegurar columnas estándar
     for col in ["seguidores_fin_mes", "nuevos_seguidores", "engagement",
@@ -356,92 +400,69 @@ def fetch_meta_facebook_monthly_evolution(
 def fetch_meta_instagram_monthly_evolution(
     months: int = 12,
 ) -> pd.DataFrame:
-    """Evolución mensual de IG. Igual lógica que FB pero con métricas IG."""
+    """
+    Evolución mensual de IG basada en posts (/media endpoint).
+
+    NOTA v25.0: las métricas account-level de IG ya no soportan time
+    series, solo total_value por período. Por eso esta función se basa
+    en posts reales (que sí tienen timestamps).
+    """
     cfg = get_secret_dict("meta") or {}
     ig_id = cfg.get("instagram_user_id")
     if not ig_id:
         raise RuntimeError("Falta instagram_user_id en secrets.")
     page_token = _get_page_access_token() or cfg.get("access_token")
 
-    today = date.today()
-    all_rows = []
+    # Snapshot actual de seguidores
+    ig_data = _try_get(
+        f"/{ig_id}", {"fields": "followers_count,media_count"},
+        token=page_token,
+    )
+    seguidores_actuales = 0
+    if ig_data:
+        seguidores_actuales = int(ig_data.get("followers_count", 0) or 0)
 
-    chunk_end = today
-    chunk_start = chunk_end - timedelta(days=90)
-    months_covered = 0
-    while months_covered < months:
-        for metric, alias in [
-            ("reach", "alcance"),
-            ("follower_count", "nuevos_seguidores"),
-            ("profile_views", "vistas_perfil"),
-            ("accounts_engaged", "cuentas_engagement"),
-        ]:
-            for v in _fetch_metric_safe(
-                f"/{ig_id}", metric, "day", chunk_start, chunk_end, page_token
-            ):
-                value = v["value"]
-                if isinstance(value, dict):
-                    value = value.get("value", 0)
-                all_rows.append({
-                    "fecha": v["fecha"],
-                    "metric": alias,
-                    "value": value,
-                })
-        # Media (posts/reels)
-        fields = "id,timestamp,like_count,comments_count"
-        params = {
-            "fields": fields,
-            "since": int(datetime.combine(chunk_start, datetime.min.time()).timestamp()),
-            "until": int(datetime.combine(chunk_end, datetime.min.time()).timestamp()),
-            "limit": 100,
-        }
-        data = _try_get(f"/{ig_id}/media", params, token=page_token)
-        if data:
-            for m in data.get("data", []):
-                ts = m.get("timestamp", "")[:10]
-                if not ts:
-                    continue
+    # Pull all media (paginated) — limitado a las últimas 100 publicaciones
+    fields = "id,timestamp,like_count,comments_count,media_type"
+    params = {"fields": fields, "limit": 100}
+    data = _try_get(f"/{ig_id}/media", params, token=page_token)
+    rows = []
+    if data:
+        cutoff = date.today() - timedelta(days=months * 31)
+        for m in data.get("data", []):
+            ts = m.get("timestamp", "")[:10]
+            if not ts:
+                continue
+            try:
                 media_date = datetime.strptime(ts, "%Y-%m-%d").date()
-                if media_date < chunk_start or media_date > chunk_end:
-                    continue
-                all_rows.append({
-                    "fecha": ts, "metric": "n_posts", "value": 1,
-                })
-                all_rows.append({
-                    "fecha": ts, "metric": "likes",
-                    "value": int(m.get("like_count", 0) or 0),
-                })
-                all_rows.append({
-                    "fecha": ts, "metric": "comentarios",
-                    "value": int(m.get("comments_count", 0) or 0),
-                })
+            except ValueError:
+                continue
+            if media_date < cutoff:
+                continue
+            rows.append({
+                "fecha": ts,
+                "n_posts": 1,
+                "likes": int(m.get("like_count", 0) or 0),
+                "comentarios": int(m.get("comments_count", 0) or 0),
+            })
 
-        months_covered += 3
-        chunk_end = chunk_start - timedelta(days=1)
-        chunk_start = chunk_end - timedelta(days=90)
-
-    if not all_rows:
+    if not rows:
         return pd.DataFrame(columns=[
-            "mes", "alcance", "nuevos_seguidores", "n_posts", "likes", "comentarios",
+            "mes", "seguidores_fin_mes", "n_posts", "likes", "comentarios",
+            "engagement",
         ])
 
-    df = pd.DataFrame(all_rows)
-    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-    df = df.dropna(subset=["fecha"])
+    df = pd.DataFrame(rows)
+    df["fecha"] = pd.to_datetime(df["fecha"])
     df["mes"] = df["fecha"].dt.to_period("M").dt.to_timestamp()
-    df["value"] = pd.to_numeric(df["value"], errors="coerce").fillna(0)
-
-    monthly = df.groupby(["mes", "metric"], as_index=False)["value"].sum()
-    wide = monthly.pivot(index="mes", columns="metric", values="value").reset_index()
-
-    for col in ["alcance", "nuevos_seguidores", "n_posts", "likes", "comentarios",
-                "vistas_perfil", "cuentas_engagement"]:
-        if col not in wide.columns:
-            wide[col] = 0
-        wide[col] = wide[col].fillna(0)
-
-    wide = wide.sort_values("mes").tail(months).reset_index(drop=True)
-    return wide
+    monthly = df.groupby("mes", as_index=False).agg({
+        "n_posts": "sum",
+        "likes": "sum",
+        "comentarios": "sum",
+    })
+    monthly["engagement"] = monthly["likes"] + monthly["comentarios"]
+    monthly["seguidores_fin_mes"] = seguidores_actuales  # Solo tenemos snapshot
+    return monthly.sort_values("mes").tail(months).reset_index(drop=True)
 
 
 def fetch_meta_instagram_top_posts(
@@ -505,18 +526,17 @@ def fetch_meta_facebook_data(
 
     page_token = _get_page_access_token() or cfg.get("access_token")
 
-    # --- Insights de Página ---
+    # --- Insights de Página (v25.0+) ---
+    # NOTA: page_fans y page_fan_removes están deprecadas en v25.0.
+    # page_daily_follows reemplaza a page_fans para histórico diario.
     metrics_day = [
         ("page_impressions", "impresiones"),
         ("page_impressions_unique", "alcance"),
         ("page_post_engagements", "engagement_total"),
         ("page_fan_adds", "nuevos_seguidores"),
-        ("page_fan_removes", "perdida_seguidores"),
+        ("page_daily_follows", "follows_diarios"),
         ("page_video_views", "vistas_video"),
         ("page_views_total", "vistas_pagina"),
-    ]
-    metrics_lifetime = [
-        ("page_fans", "seguidores"),
     ]
 
     rows: dict[str, dict] = {}
@@ -528,12 +548,18 @@ def fetch_meta_facebook_data(
             fecha = v["fecha"]
             rows.setdefault(fecha, {"fecha": fecha})[alias] = v["value"]
 
-    for metric, alias in metrics_lifetime:
-        for v in _fetch_metric_safe(
-            f"/{page_id}", metric, "day", date_from, date_to, page_token
-        ):
-            fecha = v["fecha"]
-            rows.setdefault(fecha, {"fecha": fecha})[alias] = v["value"]
+    # --- Seguidores totales (snapshot via field directo) ---
+    # `fan_count` y `followers_count` funcionan como fields del Page
+    # incluso cuando el insights metric `page_fans` está deprecado.
+    page_data = _try_get(
+        f"/{page_id}", {"fields": "fan_count,followers_count"},
+        token=page_token,
+    )
+    seguidores_actuales = 0
+    if page_data:
+        seguidores_actuales = int(
+            page_data.get("followers_count", 0) or page_data.get("fan_count", 0) or 0
+        )
 
     # --- Reacciones (vienen como dict, hay que desempacarlas) ---
     for v in _fetch_metric_safe(
@@ -551,6 +577,19 @@ def fetch_meta_facebook_data(
     df = pd.DataFrame(list(rows.values()))
     if not df.empty:
         df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.normalize()
+
+    # --- Reconstruir seguidores históricos: actuales - sum(daily_follows futuros) ---
+    # Esto da el conteo aproximado de seguidores cada día.
+    if seguidores_actuales > 0 and not df.empty and "follows_diarios" in df.columns:
+        df = df.sort_values("fecha", ascending=False).reset_index(drop=True)
+        df["follows_diarios"] = df["follows_diarios"].fillna(0)
+        # Cumulative: para cada día, seguidores = actuales - follows desde mañana hasta hoy
+        # (simplificación: actuales menos follows posteriores a la fecha)
+        df["seguidores"] = seguidores_actuales - df["follows_diarios"].cumsum().shift(1).fillna(0)
+        df = df.sort_values("fecha").reset_index(drop=True)
+    elif seguidores_actuales > 0 and not df.empty:
+        # Fallback: poner el conteo actual en todas las filas
+        df["seguidores"] = seguidores_actuales
 
     # --- Posts agregados (likes, comentarios, compartidos reales) ---
     posts_df = _fetch_facebook_posts_aggregated(page_id, date_from, date_to, page_token)
@@ -602,54 +641,59 @@ def fetch_meta_instagram_data(
     page_token = _get_page_access_token() or cfg.get("access_token")
 
     # --- Insights del perfil IG ---
-    # En v23.0 IG cambió mucho. Probamos varias.
-    metrics = [
-        ("reach", "alcance"),
-        ("follower_count", "nuevos_seguidores"),
-        ("profile_views", "vistas_perfil"),
-        ("website_clicks", "clicks_web"),
-        ("accounts_engaged", "cuentas_engagement"),
-    ]
+    # IMPORTANTE: en v25.0 IG insights devuelven UN SOLO total_value
+    # por período (no time series). Hay que usar metric_type=total_value.
+    period_totals: dict[str, int] = {}
+    for metric, alias in [
+        ("reach", "alcance_periodo"),
+        ("accounts_engaged", "cuentas_engagement_periodo"),
+        ("profile_views", "vistas_perfil_periodo"),
+        ("website_clicks", "clicks_web_periodo"),
+        ("follower_count", "nuevos_seguidores_periodo"),
+    ]:
+        val = _fetch_metric_total_value(
+            f"/{ig_id}", metric, date_from, date_to, page_token
+        )
+        if val is not None:
+            period_totals[alias] = val
 
-    rows: dict[str, dict] = {}
-    for metric, alias in metrics:
-        for v in _fetch_metric_safe(
-            f"/{ig_id}", metric, "day", date_from, date_to, page_token
-        ):
-            fecha = v["fecha"]
-            value = v["value"]
-            if isinstance(value, dict):
-                value = value.get("value", 0)
-            rows.setdefault(fecha, {"fecha": fecha})[alias] = value
+    # Snapshot actual de seguidores IG
+    ig_data = _try_get(
+        f"/{ig_id}", {"fields": "followers_count,media_count"},
+        token=page_token,
+    )
+    if ig_data:
+        period_totals["seguidores_actual"] = int(
+            ig_data.get("followers_count", 0) or 0
+        )
+        period_totals["total_media"] = int(ig_data.get("media_count", 0) or 0)
 
-    df = pd.DataFrame(list(rows.values()))
-    if not df.empty:
-        df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce").dt.normalize()
-
-    # --- Media (posts/reels) agregados ---
-    media_df = _fetch_instagram_media_aggregated(
+    # --- Media (posts/reels) agregados — esto SÍ tiene daily breakdown ---
+    df = _fetch_instagram_media_aggregated(
         ig_id, date_from, date_to, page_token
     )
 
-    if df.empty and media_df.empty:
-        return pd.DataFrame()
+    # Si no hay media en el período, crear estructura mínima
     if df.empty:
-        df = media_df
-    elif media_df.empty:
-        df["likes"] = 0
-        df["comentarios"] = 0
-        df["impresiones"] = 0
-        df["n_posts"] = 0
-    else:
-        df = df.merge(media_df, on="fecha", how="outer")
-        for c in ["likes", "comentarios", "impresiones", "n_posts"]:
-            if c in df.columns:
-                df[c] = df[c].fillna(0).astype(int)
+        df = pd.DataFrame({
+            "fecha": [pd.Timestamp(date_to)],
+            "n_posts": [0], "likes": [0], "comentarios": [0],
+        })
 
-    df["compartidos"] = 0  # IG no expone shares totales fácilmente
-    df["engagement"] = (
-        df.get("likes", 0) + df.get("comentarios", 0)
-    )
+    df["compartidos"] = 0  # IG no expone shares totales en API pública
+    df["engagement"] = df.get("likes", 0) + df.get("comentarios", 0)
+    df["seguidores"] = period_totals.get("seguidores_actual", 0)
+
+    # Inyectar totales del período en el ÚLTIMO día (para que sum() en
+    # compute_period_kpis los recoja una sola vez como total).
+    if not df.empty:
+        df = df.sort_values("fecha").reset_index(drop=True)
+        last_idx = df.index[-1]
+        df.at[last_idx, "alcance"] = period_totals.get("alcance_periodo", 0)
+        df.at[last_idx, "vistas_perfil"] = period_totals.get("vistas_perfil_periodo", 0)
+        df.at[last_idx, "clicks_web"] = period_totals.get("clicks_web_periodo", 0)
+        df.at[last_idx, "cuentas_engagement"] = period_totals.get("cuentas_engagement_periodo", 0)
+        df.at[last_idx, "nuevos_seguidores_total"] = period_totals.get("nuevos_seguidores_periodo", 0)
 
     return df.sort_values("fecha").reset_index(drop=True)
 
