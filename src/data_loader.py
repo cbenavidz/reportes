@@ -385,6 +385,49 @@ def load_invoice_lines(
     )
 
 
+# ---------------------------------------------------------------------------
+# Loaders para Estados Financieros
+# ---------------------------------------------------------------------------
+
+ACCOUNT_MOVEMENTS_CACHE_VERSION = 1
+
+
+@st.cache_data(ttl=900, show_spinner="Descargando plan de cuentas...")
+def load_chart_of_accounts(
+    company_ids: tuple[int, ...] | None = None,
+    _cache_v: int = 1,
+) -> "pd.DataFrame":
+    """Descarga plan de cuentas (account.account)."""
+    from .extractor import extract_chart_of_accounts
+    client = get_odoo_client()
+    return extract_chart_of_accounts(
+        client, company_ids=list(company_ids) if company_ids else None
+    )
+
+
+@st.cache_data(ttl=900, show_spinner="Descargando movimientos contables (puede tardar)...")
+def load_account_movements(
+    months_back: int = 24,
+    company_ids: tuple[int, ...] | None = None,
+    _cache_v: int = ACCOUNT_MOVEMENTS_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """
+    Descarga TODOS los movimientos contables (account.move.line) en el rango.
+    Usado por reportes de Estados Financieros (Balance, P&L, KTNO, Flujo).
+    """
+    from datetime import date as _date, timedelta
+    from .extractor import extract_account_movements
+    client = get_odoo_client()
+    cutoff = _date.today()
+    date_from = cutoff - timedelta(days=30 * months_back)
+    return extract_account_movements(
+        client,
+        date_from=date_from,
+        date_to=cutoff,
+        company_ids=list(company_ids) if company_ids else None,
+    )
+
+
 def test_connection_summary() -> dict:
     """Para mostrar en la UI: estado de conexión a Odoo."""
     try:

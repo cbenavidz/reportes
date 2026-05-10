@@ -772,6 +772,124 @@ def _normalize_invoice_lines(records: list[dict]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Extracción para Estados Financieros (Balance, P&L, KTNO, Flujo)
+# ---------------------------------------------------------------------------
+
+ACCOUNT_FIELDS = [
+    "id", "code", "name", "account_type",
+    "company_id", "currency_id", "deprecated", "reconcile",
+]
+
+# Tipos de cuenta de Odoo (`account_type`):
+#   asset_receivable, asset_cash, asset_current, asset_non_current,
+#   asset_prepayments, asset_fixed,
+#   liability_payable, liability_credit_card, liability_current, liability_non_current,
+#   equity, equity_unaffected,
+#   income, income_other, expense, expense_depreciation, expense_direct_cost,
+#   off_balance
+
+
+def extract_chart_of_accounts(
+    client: OdooClient,
+    company_ids: list[int] | tuple[int, ...] | None = None,
+) -> pd.DataFrame:
+    """
+    Trae el plan de cuentas (account.account) con código, nombre y tipo.
+    """
+    domain: list = [("deprecated", "=", False)]
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
+
+    records = client.search_read(
+        "account.account",
+        domain=domain,
+        fields=ACCOUNT_FIELDS,
+        order="code asc",
+    )
+    if not records:
+        return pd.DataFrame(columns=ACCOUNT_FIELDS)
+
+    df = pd.DataFrame(records)
+    # Desempaquetar many2ones
+    for col in ("company_id", "currency_id"):
+        if col in df.columns:
+            df[col + "_name"] = df[col].apply(
+                lambda v: _unpack_m2o(v)[1] if isinstance(v, list) else None
+            )
+            df[col] = df[col].apply(
+                lambda v: _unpack_m2o(v)[0] if isinstance(v, list) else None
+            )
+    # Primer dígito del código → grupo PUC colombiano
+    df["puc_grupo"] = df["code"].astype(str).str[0]
+    return df
+
+
+def extract_account_movements(
+    client: OdooClient,
+    date_from: date | str | None = None,
+    date_to: date | str | None = None,
+    company_ids: list[int] | tuple[int, ...] | None = None,
+) -> pd.DataFrame:
+    """
+    Trae TODOS los movimientos contables (account.move.line) en el rango,
+    no solo facturas. Es la base para Balance, P&L, Flujo de efectivo.
+
+    Solo trae líneas de moves en estado `posted` para evitar duplicar
+    borradores y cancelados.
+    """
+    domain: list = [("parent_state", "=", "posted")]
+    if date_from is not None:
+        df_str = date_from.isoformat() if isinstance(date_from, date) else str(date_from)
+        domain.append(("date", ">=", df_str))
+    if date_to is not None:
+        dt_str = date_to.isoformat() if isinstance(date_to, date) else str(date_to)
+        domain.append(("date", "<=", dt_str))
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
+
+    fields = [
+        "id", "account_id", "partner_id", "move_id",
+        "date", "name", "ref",
+        "debit", "credit", "balance",
+        "company_id", "currency_id",
+        "parent_state", "journal_id",
+    ]
+    logger.info("Descargando account_movements con dominio: %s", domain)
+    records = client.search_read(
+        "account.move.line",
+        domain=domain,
+        fields=fields,
+        order="date asc, id asc",
+    )
+    logger.info("Account movements descargados: %s", len(records))
+
+    if not records:
+        return pd.DataFrame(columns=fields + [
+            "account_id_name", "partner_id_name",
+            "move_id_name", "company_id_name", "journal_id_name",
+        ])
+
+    df = pd.DataFrame(records)
+    # Desempaquetar many2ones
+    for col in ("account_id", "partner_id", "move_id", "company_id",
+                "currency_id", "journal_id"):
+        if col in df.columns:
+            df[col + "_name"] = df[col].apply(
+                lambda v: _unpack_m2o(v)[1] if isinstance(v, list) else None
+            )
+            df[col] = df[col].apply(
+                lambda v: _unpack_m2o(v)[0] if isinstance(v, list) else None
+            )
+    # Tipos numéricos
+    for c in ("debit", "credit", "balance"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # Extracción combinada para el flujo principal de la app
 # ---------------------------------------------------------------------------
 
