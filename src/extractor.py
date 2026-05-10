@@ -620,11 +620,15 @@ def extract_invoice_lines(
             prod_records = client.search_read(
                 "product.product",
                 domain=[("id", "in", product_ids)],
-                fields=["id", "categ_id", "default_code", "name", "volume"],
+                fields=[
+                    "id", "categ_id", "default_code", "name", "volume",
+                    "standard_price",  # Precio de costo para margen bruto
+                ],
             )
             cat_map: dict[int, tuple[int | None, str | None]] = {}
             code_map: dict[int, str | None] = {}
             volume_map: dict[int, float] = {}
+            cost_map: dict[int, float] = {}
             for p in prod_records:
                 cid, cname = _unpack_m2o(p.get("categ_id"))
                 cat_map[int(p["id"])] = (cid, cname)
@@ -636,6 +640,12 @@ def extract_invoice_lines(
                     volume_map[int(p["id"])] = float(vol) if vol else 0.0
                 except (TypeError, ValueError):
                     volume_map[int(p["id"])] = 0.0
+                # `standard_price` es el precio de costo unitario.
+                cost = p.get("standard_price")
+                try:
+                    cost_map[int(p["id"])] = float(cost) if cost else 0.0
+                except (TypeError, ValueError):
+                    cost_map[int(p["id"])] = 0.0
             logger.info(
                 "Enriquecimiento productos: %d productos, %d categorías únicas, "
                 "%d con volume > 0",
@@ -664,10 +674,24 @@ def extract_invoice_lines(
                     return 0.0
                 return volume_map.get(int(i), 0.0)
 
+            def _cost(i):
+                if pd.isna(i):
+                    return 0.0
+                return cost_map.get(int(i), 0.0)
+
             df["product_categ_id"] = df["product_id"].map(_cat_id)
             df["product_categ_name"] = df["product_id"].map(_cat_name)
             df["product_default_code"] = df["product_id"].map(_code)
             df["product_volume"] = df["product_id"].map(_vol)
+            df["product_standard_price"] = df["product_id"].map(_cost)
+            # Costo total de la línea = costo unitario × cantidad × signo
+            df["line_cost"] = (
+                df["product_standard_price"].fillna(0)
+                * df["quantity"].fillna(0)
+                * df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
+            )
+            # Margen bruto = price_subtotal_signed - line_cost
+            df["line_margin"] = df["price_subtotal_signed"] - df["line_cost"]
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "No se pudo enriquecer categoría de productos: %s", exc, exc_info=True
@@ -676,11 +700,17 @@ def extract_invoice_lines(
             df["product_categ_name"] = None
             df["product_default_code"] = None
             df["product_volume"] = 0.0
+            df["product_standard_price"] = 0.0
+            df["line_cost"] = 0.0
+            df["line_margin"] = df["price_subtotal_signed"]
     else:
         df["product_categ_id"] = None
         df["product_categ_name"] = None
         df["product_default_code"] = None
         df["product_volume"] = 0.0
+        df["product_standard_price"] = 0.0
+        df["line_cost"] = 0.0
+        df["line_margin"] = df["price_subtotal_signed"]
 
     # Anclar invoice_date desde el move padre (move_id ya viene como nombre,
     # pero `date` de la línea es la fecha contable que en práctica = invoice_date).

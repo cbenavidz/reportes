@@ -350,7 +350,8 @@ def filter_analysis_by_vendedor(
 #   v5: KPIs reconstruyen amount desde líneas (coincidencia exacta).
 #   v6: TODOS los reportes (mensual, vendedor, cliente) calculan desde líneas.
 #   v7: agregado `product_volume` al esquema (campo `volume` de product.product).
-INVOICE_LINES_CACHE_VERSION = 7
+#   v8: agregado `product_standard_price`, `line_cost`, `line_margin` (margen bruto).
+INVOICE_LINES_CACHE_VERSION = 8
 
 
 @st.cache_data(ttl=900, show_spinner="Descargando líneas de factura (productos)...")
