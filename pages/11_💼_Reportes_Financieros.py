@@ -140,6 +140,26 @@ if total_cost == 0 and total_sales > 0:
         "en 'Recargar datos' para refrescar el caché."
     )
 
+# Mostrar la fuente del costo/margen que se está usando (trazabilidad)
+if "cost_source" in lines.columns and not lines.empty:
+    fuentes_costo = lines["cost_source"].dropna().unique()
+    fuentes_margen = lines["margin_source"].dropna().unique() if "margin_source" in lines.columns else []
+    if "Enterprise" in str(fuentes_costo) or "Enterprise" in str(fuentes_margen):
+        st.success(
+            f"🎯 **Margen preciso (Enterprise)** — Origen: "
+            f"costo desde **{', '.join(fuentes_costo)}**, "
+            f"margen desde **{', '.join(fuentes_margen)}**. "
+            "Los costos son los históricos al momento de la venta."
+        )
+    else:
+        st.info(
+            f"ℹ️ **Margen aproximado** — Origen: costo desde "
+            f"**{', '.join(fuentes_costo)}**, margen "
+            f"**{', '.join(fuentes_margen)}**. "
+            "Usa el snapshot actual del costo (puede diferir del histórico). "
+            "Para precisión total, instala el módulo `sale_margin` en Odoo."
+        )
+
 
 # ---------------------------------------------------------------------------
 # Helpers de formato

@@ -160,6 +160,17 @@ INVOICE_LINE_FIELDS = [
     "move_type",               # heredado del move padre
     "display_type",            # 'product' / 'line_section' / 'line_note' / etc.
 ]
+
+# Campos OPCIONALES de margen (Odoo Enterprise sale_margin):
+#   `purchase_price` — costo unitario AL MOMENTO de la venta (histórico)
+#   `margin`         — margen unitario calculado por Odoo
+#   `margin_signed`  — margen con signo (NC negativo)
+# Si la base no tiene el módulo sale_margin instalado, estos no existen.
+# Los traemos solo si fields_get confirma que existen.
+OPTIONAL_MARGIN_FIELDS = ["purchase_price", "margin", "margin_signed"]
+
+# Cache de campos válidos de account.move.line por base
+_MOVELINE_FIELDS_CACHE: dict[str, list[str]] = {}
 # Nota: `price_subtotal_signed` no existe en account.move.line en algunas
 # versiones de Odoo (Odoo 19 lo quitó). Lo construimos en post-procesamiento
 # multiplicando `price_subtotal` por el signo del move_type:
@@ -177,6 +188,46 @@ def _unpack_m2o(value: Any) -> tuple[int | None, str | None]:
     if isinstance(value, (list, tuple)) and len(value) == 2:
         return int(value[0]), str(value[1])
     return None, None
+
+
+def _resolve_invoice_line_fields(client: OdooClient) -> tuple[list[str], list[str]]:
+    """
+    Devuelve (fields_to_fetch, available_margin_fields).
+
+    Verifica vía fields_get cuáles de `OPTIONAL_MARGIN_FIELDS` existen
+    realmente (depende de si el módulo sale_margin está instalado).
+    """
+    cache_key = client.credentials.db
+    if cache_key in _MOVELINE_FIELDS_CACHE:
+        cached = _MOVELINE_FIELDS_CACHE[cache_key]
+        margin_fields = [f for f in OPTIONAL_MARGIN_FIELDS if f in cached]
+        return cached, margin_fields
+
+    try:
+        all_fields = client.fields_get("account.move.line", attributes=["string"])
+        available = set(all_fields.keys())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fields_get(account.move.line) falló: %s. "
+            "Usando solo campos base (sin margen Enterprise).", exc
+        )
+        _MOVELINE_FIELDS_CACHE[cache_key] = list(INVOICE_LINE_FIELDS)
+        return list(INVOICE_LINE_FIELDS), []
+
+    margin_fields = [f for f in OPTIONAL_MARGIN_FIELDS if f in available]
+    final = list(INVOICE_LINE_FIELDS) + margin_fields
+    _MOVELINE_FIELDS_CACHE[cache_key] = final
+    if margin_fields:
+        logger.info(
+            "Campos de margen Enterprise detectados: %s",
+            ", ".join(margin_fields),
+        )
+    else:
+        logger.info(
+            "No se detectaron campos de margen Enterprise. "
+            "Margen se calculará desde product.standard_price actual."
+        )
+    return final, margin_fields
 
 
 def _resolve_partner_fields(client: OdooClient) -> list[str]:
@@ -592,11 +643,17 @@ def extract_invoice_lines(
     if company_ids:
         domain.append(("company_id", "in", list(company_ids)))
 
-    logger.info("Descargando invoice_lines con dominio: %s", domain)
+    # Resolver campos disponibles (incluyendo margen Enterprise si existe)
+    fields_to_fetch, margin_fields_available = _resolve_invoice_line_fields(client)
+
+    logger.info(
+        "Descargando invoice_lines con dominio: %s (campos margen: %s)",
+        domain, margin_fields_available or "ninguno (usaré standard_price)",
+    )
     records = client.search_read(
         "account.move.line",
         domain=domain,
-        fields=INVOICE_LINE_FIELDS,
+        fields=fields_to_fetch,
         order="date desc",
     )
     logger.info("Invoice lines descargadas: %s", len(records))
@@ -684,14 +741,49 @@ def extract_invoice_lines(
             df["product_default_code"] = df["product_id"].map(_code)
             df["product_volume"] = df["product_id"].map(_vol)
             df["product_standard_price"] = df["product_id"].map(_cost)
-            # Costo total de la línea = costo unitario × cantidad × signo
-            df["line_cost"] = (
-                df["product_standard_price"].fillna(0)
-                * df["quantity"].fillna(0)
-                * df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
-            )
-            # Margen bruto = price_subtotal_signed - line_cost
-            df["line_margin"] = df["price_subtotal_signed"] - df["line_cost"]
+
+            # --- Cálculo de costo y margen ---
+            # Prioridad para `line_cost`:
+            #   1. `purchase_price` × `quantity` × signo  (Enterprise, histórico)
+            #   2. `product.standard_price` × `quantity` × signo  (snapshot actual)
+            # Prioridad para `line_margin`:
+            #   1. `margin_signed`        (Enterprise, signed automático)
+            #   2. `margin` × signo       (Enterprise)
+            #   3. price_subtotal_signed − line_cost  (fallback manual)
+            sign_series = df["move_type"].map(
+                {"out_invoice": 1, "out_refund": -1}
+            ).fillna(1)
+
+            if "purchase_price" in df.columns:
+                # Costo histórico de Enterprise — mucho más preciso
+                df["line_cost"] = (
+                    pd.to_numeric(df["purchase_price"], errors="coerce").fillna(0)
+                    * df["quantity"].fillna(0)
+                    * sign_series
+                )
+                df["cost_source"] = "purchase_price (Enterprise, histórico)"
+            else:
+                # Fallback: snapshot actual del costo del producto
+                df["line_cost"] = (
+                    df["product_standard_price"].fillna(0)
+                    * df["quantity"].fillna(0)
+                    * sign_series
+                )
+                df["cost_source"] = "standard_price (actual)"
+
+            if "margin_signed" in df.columns:
+                df["line_margin"] = pd.to_numeric(
+                    df["margin_signed"], errors="coerce"
+                ).fillna(0)
+                df["margin_source"] = "margin_signed (Enterprise)"
+            elif "margin" in df.columns:
+                df["line_margin"] = pd.to_numeric(
+                    df["margin"], errors="coerce"
+                ).fillna(0) * sign_series
+                df["margin_source"] = "margin × signo (Enterprise)"
+            else:
+                df["line_margin"] = df["price_subtotal_signed"] - df["line_cost"]
+                df["margin_source"] = "calculado manual"
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "No se pudo enriquecer categoría de productos: %s", exc, exc_info=True
@@ -703,6 +795,8 @@ def extract_invoice_lines(
             df["product_standard_price"] = 0.0
             df["line_cost"] = 0.0
             df["line_margin"] = df["price_subtotal_signed"]
+            df["cost_source"] = "no disponible"
+            df["margin_source"] = "no disponible"
     else:
         df["product_categ_id"] = None
         df["product_categ_name"] = None
@@ -711,6 +805,8 @@ def extract_invoice_lines(
         df["product_standard_price"] = 0.0
         df["line_cost"] = 0.0
         df["line_margin"] = df["price_subtotal_signed"]
+        df["cost_source"] = "no disponible"
+        df["margin_source"] = "no disponible"
 
     # Anclar invoice_date desde el move padre (move_id ya viene como nombre,
     # pero `date` de la línea es la fecha contable que en práctica = invoice_date).
