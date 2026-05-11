@@ -910,55 +910,97 @@ def extract_chart_of_accounts(
     cayendo al mínimo (id, code, name) si los otros fallan. Compatible con
     Odoo 13/14/15/16/17/18/19 community y enterprise.
     """
-    # Niveles de fallback, de más rico a más mínimo
-    # CRÍTICO: account_type es el campo que clasifica PUC (income/expense/asset/etc.)
-    # Lo intentamos solo, sin otros campos opcionales que pueden romper la query.
-    levels = [
-        # Nivel 0 (NUEVO): solo lo esencial + account_type
-        ["id", "code", "name", "account_type"],
-        # Nivel 1: con account_type y company
-        ["id", "code", "name", "account_type", "company_id"],
-        # Nivel 2: versión vieja con user_type_id
-        ["id", "code", "name", "user_type_id", "company_id"],
-        # Nivel 3: sin tipo, con company
-        ["id", "code", "name", "company_id"],
-        # Nivel 4: mínimo absoluto
-        ["id", "code", "name"],
-    ]
+    # Cast explícito de company_ids a int (Python int, no numpy)
+    company_ids_clean: list[int] | None = None
+    if company_ids:
+        try:
+            company_ids_clean = [int(c) for c in company_ids]
+        except (TypeError, ValueError):
+            company_ids_clean = None
 
-    base_domain = [("company_id", "in", list(company_ids))] if company_ids else []
-    domains = [base_domain] * len(levels)
+    base_domain_with_co = (
+        [("company_id", "in", company_ids_clean)]
+        if company_ids_clean else []
+    )
+
+    # Cada nivel tiene SU PROPIO domain y order (más defensivo)
+    levels_config = [
+        # Nivel 0: con account_type + company
+        {
+            "fields": ["id", "code", "name", "account_type"],
+            "domain": base_domain_with_co,
+            "order": "code asc",
+        },
+        # Nivel 1: account_type sin company filter (por si company filter rompe)
+        {
+            "fields": ["id", "code", "name", "account_type"],
+            "domain": [],
+            "order": "code asc",
+        },
+        # Nivel 2: versión vieja con user_type_id
+        {
+            "fields": ["id", "code", "name", "user_type_id"],
+            "domain": base_domain_with_co,
+            "order": "code asc",
+        },
+        # Nivel 3: sin tipo, con company
+        {
+            "fields": ["id", "code", "name", "company_id"],
+            "domain": base_domain_with_co,
+            "order": "code asc",
+        },
+        # Nivel 4: mínimo con company y sin order
+        {
+            "fields": ["id", "code", "name"],
+            "domain": base_domain_with_co,
+            "order": None,
+        },
+        # Nivel 5: ABSOLUTO MÍNIMO — sin domain, sin order, solo id+code+name
+        {
+            "fields": ["id", "code", "name"],
+            "domain": [],
+            "order": None,
+        },
+        # Nivel 6: ÚLTIMO RECURSO — pedir solo id, ni siquiera filtramos campos
+        {
+            "fields": ["id", "name"],
+            "domain": [],
+            "order": None,
+        },
+    ]
 
     records = None
     last_exc = None
     used_level = 0
-    for i, (fields_try, domain_try) in enumerate(zip(levels, domains), start=1):
+    error_messages: list[str] = []
+    for i, cfg in enumerate(levels_config, start=1):
         try:
+            kwargs = {
+                "domain": cfg["domain"],
+                "fields": cfg["fields"],
+            }
+            if cfg["order"]:
+                kwargs["order"] = cfg["order"]
             logger.info(
-                "Plan de cuentas nivel %d: campos=%s domain=%s",
-                i, fields_try, domain_try,
+                "Plan de cuentas nivel %d: %s",
+                i, kwargs,
             )
-            records = client.search_read(
-                "account.account",
-                domain=domain_try,
-                fields=fields_try,
-                order="code asc",
-            )
+            records = client.search_read("account.account", **kwargs)
             used_level = i
             break  # éxito
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            logger.warning(
-                "Plan de cuentas nivel %d falló: %s. Probando siguiente nivel.",
-                i, exc,
-            )
+            err_str = f"Nivel {i} ({cfg['fields']}): {exc}"
+            error_messages.append(err_str)
+            logger.warning(err_str)
             continue
 
     if records is None:
-        # Todos los niveles fallaron → re-lanzar el último error
-        raise last_exc if last_exc else RuntimeError(
-            "No se pudo cargar el plan de cuentas con ningún set de campos."
-        )
+        # Todos fallaron → mensaje con TODOS los errores para diagnóstico
+        full_error = "\n".join(error_messages)
+        raise RuntimeError(
+            f"No se pudo cargar el plan de cuentas. Errores por nivel:\n{full_error}"
+        ) from last_exc
 
     logger.info("Plan de cuentas cargado en nivel %d: %d cuentas", used_level, len(records))
 

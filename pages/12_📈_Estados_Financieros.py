@@ -114,9 +114,17 @@ load_date_to = fecha_hasta.isoformat()
 with st.spinner(
     f"Cargando movimientos del período ({fecha_desde_prev} → {fecha_hasta})..."
 ):
-    chart = load_chart_of_accounts(
-        company_ids=filters["company_ids"],
-    )
+    try:
+        chart = load_chart_of_accounts(
+            company_ids=filters["company_ids"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        st.error(
+            f"❌ Error cargando plan de cuentas:\n\n```\n{exc}\n```\n\n"
+            "Esto indica un problema con permisos o estructura de tu Odoo. "
+            "Reporta este mensaje para resolver."
+        )
+        st.stop()
     moves = load_account_movements(
         date_from=load_date_from,
         date_to=load_date_to,
