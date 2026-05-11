@@ -178,16 +178,90 @@ def classify_account(code: str) -> dict:
     }
 
 
+# Mapeo de account_type (campo nativo de Odoo) → grupo PUC.
+# Esta es la fuente AUTORITATIVA porque Odoo asigna el tipo correctamente
+# en cada cuenta del plan, independiente de cómo numere los códigos.
+ACCOUNT_TYPE_TO_PUC = {
+    # ACTIVOS (1)
+    "asset_receivable":   {"puc": "1", "subpuc": "13", "subgrupo": "Deudores (CxC)",         "corr": True},
+    "asset_cash":         {"puc": "1", "subpuc": "11", "subgrupo": "Disponible (caja, bancos)", "corr": True},
+    "asset_current":      {"puc": "1", "subpuc": "1",  "subgrupo": "Activo corriente",       "corr": True},
+    "asset_prepayments":  {"puc": "1", "subpuc": "17", "subgrupo": "Diferidos",              "corr": True},
+    "asset_non_current":  {"puc": "1", "subpuc": "1",  "subgrupo": "Activo no corriente",    "corr": False},
+    "asset_fixed":        {"puc": "1", "subpuc": "15", "subgrupo": "Propiedad, planta y equipo", "corr": False},
+    # PASIVOS (2)
+    "liability_payable":      {"puc": "2", "subpuc": "22", "subgrupo": "Proveedores",          "corr": True},
+    "liability_credit_card":  {"puc": "2", "subpuc": "23", "subgrupo": "Tarjetas de crédito",  "corr": True},
+    "liability_current":      {"puc": "2", "subpuc": "2",  "subgrupo": "Pasivo corriente",    "corr": True},
+    "liability_non_current":  {"puc": "2", "subpuc": "2",  "subgrupo": "Pasivo no corriente", "corr": False},
+    # PATRIMONIO (3)
+    "equity":            {"puc": "3", "subpuc": "3",  "subgrupo": "Patrimonio",            "corr": False},
+    "equity_unaffected": {"puc": "3", "subpuc": "37", "subgrupo": "Resultados anteriores", "corr": False},
+    # INGRESOS (4) — income operacional, income_other no operacional
+    "income":       {"puc": "4", "subpuc": "41", "subgrupo": "Ingresos operacionales",     "corr": False},
+    "income_other": {"puc": "4", "subpuc": "42", "subgrupo": "Ingresos no operacionales",  "corr": False},
+    # GASTOS Y COSTOS (5, 6)
+    "expense":             {"puc": "5", "subpuc": "51", "subgrupo": "Gastos operacionales",   "corr": False},
+    "expense_depreciation":{"puc": "5", "subpuc": "51", "subgrupo": "Depreciaciones",         "corr": False},
+    "expense_direct_cost": {"puc": "6", "subpuc": "6",  "subgrupo": "Costo de ventas",        "corr": False},
+    # FUERA DE BALANCE
+    "off_balance":  {"puc": "8", "subpuc": "8",  "subgrupo": "Cuentas de orden",  "corr": False},
+}
+
+
+def classify_by_account_type(account_type: str) -> dict | None:
+    """Clasifica por account_type (campo nativo de Odoo). None si no mapea."""
+    if not account_type:
+        return None
+    mapping = ACCOUNT_TYPE_TO_PUC.get(account_type)
+    if not mapping:
+        return None
+    grupo_name = PUC_GROUPS.get(mapping["puc"], "Otro")
+    return {
+        "grupo": grupo_name,
+        "es_corriente": mapping["corr"],
+        "es_resultado": mapping["puc"] in ("4", "5", "6", "7"),
+        "subgrupo": mapping["subgrupo"],
+        "puc_group": mapping["puc"],
+        "puc_subgroup": mapping["subpuc"],
+    }
+
+
 def enrich_chart_with_puc(chart: pd.DataFrame) -> pd.DataFrame:
-    """Agrega columnas 'grupo', 'es_corriente', 'es_resultado', 'subgrupo'."""
+    """
+    Agrega columnas 'grupo', 'es_corriente', 'es_resultado', 'subgrupo',
+    'puc_group', 'puc_subgroup' al plan de cuentas.
+
+    Fuente PRIMARIA: `account_type` de Odoo (clasificación nativa).
+    Fallback: clasificación por código (primer dígito numérico).
+    """
     if chart is None or chart.empty:
         return chart
     out = chart.copy()
-    cls = out["code"].astype(str).apply(classify_account)
+
+    def _classify_row(row):
+        # 1. Intentar account_type primero
+        if "account_type" in row and row["account_type"]:
+            result = classify_by_account_type(row["account_type"])
+            if result:
+                return result
+        # 2. Fallback a clasificación por código
+        code_cls = classify_account(row.get("code", ""))
+        # Agregar puc_group derivado del código normalizado
+        digits = "".join(ch for ch in str(row.get("code", "") or "") if ch.isdigit())
+        digits = digits.lstrip("0")
+        puc_g = digits[0] if digits else ""
+        code_cls["puc_group"] = puc_g
+        code_cls["puc_subgroup"] = digits[:2] if len(digits) >= 2 else puc_g
+        return code_cls
+
+    cls = out.apply(_classify_row, axis=1)
     out["grupo"] = cls.apply(lambda d: d["grupo"])
     out["es_corriente"] = cls.apply(lambda d: d["es_corriente"])
     out["es_resultado"] = cls.apply(lambda d: d["es_resultado"])
     out["subgrupo"] = cls.apply(lambda d: d["subgrupo"])
+    out["puc_group"] = cls.apply(lambda d: d.get("puc_group", ""))
+    out["puc_subgroup"] = cls.apply(lambda d: d.get("puc_subgroup", ""))
     return out
 
 
@@ -236,14 +310,13 @@ def _join_moves_chart(
     if chart is None or chart.empty:
         return moves
     chart_e = enrich_chart_with_puc(chart)
-    # Agregar columna `code_normalized` para clasificación robusta
+    # Agregar columna `code_normalized` para clasificación robusta (fallback)
     if "code" in chart_e.columns:
         chart_e["code_normalized"] = chart_e["code"].apply(_normalize_code)
-    # Solo seleccionar columnas que realmente existen (el chart puede haber
-    # caído a un nivel mínimo en el fallback sin account_type)
     desired_cols = [
         "id", "code", "code_normalized", "name", "account_type",
         "grupo", "es_corriente", "es_resultado", "subgrupo",
+        "puc_group", "puc_subgroup",  # de account_type
     ]
     available_cols = [c for c in desired_cols if c in chart_e.columns]
     keep = chart_e[available_cols].rename(columns={
@@ -289,29 +362,40 @@ def compute_income_statement(
             "tabla_detalle": pd.DataFrame(),
         }
 
-    # Usar código normalizado (sin prefijos F, ceros iniciales, etc.)
-    code_col = "account_code_norm" if "account_code_norm" in sub.columns else "account_code"
-    codes = sub[code_col].astype(str)
+    # Clasificación PRIMARIA: puc_group y puc_subgroup (derivados de
+    # account_type de Odoo). Fallback a account_code_norm si no hay.
+    if "puc_group" in sub.columns:
+        puc_g = sub["puc_group"].astype(str)
+        puc_sg = sub["puc_subgroup"].astype(str) if "puc_subgroup" in sub.columns else puc_g
+    else:
+        # Fallback: usar código normalizado
+        code_col = "account_code_norm" if "account_code_norm" in sub.columns else "account_code"
+        codes = sub[code_col].astype(str)
+        puc_g = codes.str[:1]
+        puc_sg = codes.str[:2]
 
     # Para cuentas de resultado:
-    #   Ingresos (4xxx): saldo NORMAL es crédito → balance NEGATIVO
-    #     credit - debit = ingreso positivo
-    #   Gastos/Costos (5,6,7xxx): saldo normal es débito
-    #     debit - credit = gasto positivo
+    #   Ingresos (4): saldo normal es crédito → credit - debit = ingreso positivo
+    #   Gastos/Costos (5,6,7): saldo normal es débito → debit - credit
     sub["monto_ingreso"] = (sub["credit"] - sub["debit"]).where(
-        codes.str.startswith("4"), 0
+        puc_g == "4", 0
     )
     sub["monto_gasto"] = (sub["debit"] - sub["credit"]).where(
-        codes.str.startswith(("5", "6", "7")), 0
+        puc_g.isin(["5", "6", "7"]), 0
     )
 
-    ingresos_op = float(sub.loc[codes.str.startswith("41"), "monto_ingreso"].sum())
-    ingresos_no_op = float(sub.loc[codes.str.startswith("42"), "monto_ingreso"].sum())
-    costo_ventas = float(sub.loc[codes.str.startswith("6"), "monto_gasto"].sum())
-    gastos_admin = float(sub.loc[codes.str.startswith("51"), "monto_gasto"].sum())
-    gastos_ventas = float(sub.loc[codes.str.startswith("52"), "monto_gasto"].sum())
-    gastos_no_op = float(sub.loc[codes.str.startswith("53"), "monto_gasto"].sum())
-    impto_renta = float(sub.loc[codes.str.startswith("54"), "monto_gasto"].sum())
+    ingresos_op = float(sub.loc[puc_sg == "41", "monto_ingreso"].sum())
+    ingresos_no_op = float(sub.loc[puc_sg == "42", "monto_ingreso"].sum())
+    costo_ventas = float(sub.loc[puc_g == "6", "monto_gasto"].sum())
+    gastos_admin = float(sub.loc[puc_sg == "51", "monto_gasto"].sum())
+    gastos_ventas = float(sub.loc[puc_sg == "52", "monto_gasto"].sum())
+    gastos_no_op = float(sub.loc[puc_sg == "53", "monto_gasto"].sum())
+    impto_renta = float(sub.loc[puc_sg == "54", "monto_gasto"].sum())
+
+    # Si no hay distinción fina entre 51/52/53 (account_type "expense" genérico),
+    # todos los gastos van a gastos_admin como fallback
+    if (gastos_admin == 0 and gastos_ventas == 0 and gastos_no_op == 0):
+        gastos_admin = float(sub.loc[puc_g == "5", "monto_gasto"].sum())
 
     utilidad_bruta = ingresos_op - costo_ventas
     utilidad_operacional = utilidad_bruta - gastos_admin - gastos_ventas
@@ -378,6 +462,7 @@ def compute_balance_sheet(
         keep_cols = [c for c in [
             "id", "code", "code_normalized", "name", "grupo",
             "es_corriente", "es_resultado", "subgrupo",
+            "puc_group", "puc_subgroup", "account_type",
         ] if c in chart_e.columns]
         keep = chart_e[keep_cols].rename(columns={
             "id": "account_id", "code": "account_code",
@@ -403,24 +488,40 @@ def compute_balance_sheet(
     sub["saldo_deudor"] = sub["debit"] - sub["credit"]
     sub["saldo_acreedor"] = sub["credit"] - sub["debit"]
 
-    # Filtrar solo cuentas de balance (1, 2, 3) — no incluimos resultados
-    # porque el efecto del P&L del período se refleja en la utilidad de
-    # ejercicios anteriores cuando se cierra el año. Para no doble-contar,
-    # incluimos las cuentas 4-7 también pero como parte del patrimonio
-    # del ejercicio en curso.
-    is_asset = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str).str.startswith("1")
-    is_liab = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str).str.startswith("2")
-    is_equity = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str).str.startswith("3")
-    is_result = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str).str.startswith(("4", "5", "6", "7"))
+    # Clasificación PRIMARIA por puc_group (de account_type Odoo)
+    if "puc_group" in sub.columns:
+        puc_g = sub["puc_group"].astype(str)
+    else:
+        puc_g = sub.get(
+            "account_code_norm",
+            sub.get("account_code", pd.Series([""] * len(sub)))
+        ).astype(str).str[:1]
+    is_asset = puc_g == "1"
+    is_liab = puc_g == "2"
+    is_equity = puc_g == "3"
+    is_result = puc_g.isin(["4", "5", "6", "7"])
 
-    # Por cuenta
+    # Por cuenta — agregar puc_group para clasificar
+    groupby_cols = ["account_code", "account_name", "grupo", "subgrupo", "es_corriente"]
+    if "puc_group" in sub.columns:
+        groupby_cols.append("puc_group")
     by_account = sub.groupby(
-        ["account_code", "account_name", "grupo", "subgrupo", "es_corriente"],
-        as_index=False,
+        groupby_cols, as_index=False,
     ).agg(saldo_deudor=("saldo_deudor", "sum"), saldo_acreedor=("saldo_acreedor", "sum"))
 
+    # Función helper para filtrar por puc_group con fallback a código
+    def _filter_puc(df: pd.DataFrame, group: str) -> pd.DataFrame:
+        if "puc_group" in df.columns:
+            return df[df["puc_group"].astype(str) == group].copy()
+        return df[
+            df.get(
+                "account_code_norm",
+                df.get("account_code", pd.Series([""] * len(df)))
+            ).astype(str).str.startswith(group)
+        ].copy()
+
     # Activo: saldo deudor positivo
-    activos = by_account[by_account.get("account_code_norm", by_account["account_code"]).astype(str).str.startswith("1")].copy()
+    activos = _filter_puc(by_account, "1")
     activos["saldo"] = activos["saldo_deudor"]
     activos = activos[activos["saldo"] != 0].sort_values(
         ["es_corriente", "subgrupo", "account_code"], ascending=[False, True, True],
@@ -430,7 +531,7 @@ def compute_balance_sheet(
     activo_total = activo_corriente + activo_no_corriente
 
     # Pasivo: saldo acreedor positivo
-    pasivos = by_account[by_account.get("account_code_norm", by_account["account_code"]).astype(str).str.startswith("2")].copy()
+    pasivos = _filter_puc(by_account, "2")
     pasivos["saldo"] = pasivos["saldo_acreedor"]
     pasivos = pasivos[pasivos["saldo"] != 0].sort_values(
         ["es_corriente", "subgrupo", "account_code"], ascending=[False, True, True],
@@ -439,8 +540,8 @@ def compute_balance_sheet(
     pasivo_no_corriente = float(pasivos.loc[~pasivos["es_corriente"], "saldo"].sum())
     pasivo_total = pasivo_corriente + pasivo_no_corriente
 
-    # Patrimonio: saldo acreedor de cuentas 3xxx + utilidad del período
-    patrimonio_cuentas = by_account[by_account.get("account_code_norm", by_account["account_code"]).astype(str).str.startswith("3")].copy()
+    # Patrimonio: saldo acreedor de cuentas 3 + utilidad del período
+    patrimonio_cuentas = _filter_puc(by_account, "3")
     patrimonio_cuentas["saldo"] = patrimonio_cuentas["saldo_acreedor"]
     patrimonio_cuentas = patrimonio_cuentas[patrimonio_cuentas["saldo"] != 0].sort_values(
         "account_code"
@@ -508,6 +609,7 @@ def compute_working_capital(
         keep_cols = [c for c in [
             "id", "code", "code_normalized", "name", "grupo",
             "es_corriente", "es_resultado", "subgrupo",
+            "puc_group", "puc_subgroup", "account_type",
         ] if c in chart_e.columns]
         keep = chart_e[keep_cols].rename(columns={
             "id": "account_id", "code": "account_code",
@@ -528,17 +630,25 @@ def compute_working_capital(
 
     sub["saldo_deudor"] = sub["debit"] - sub["credit"]
     sub["saldo_acreedor"] = sub["credit"] - sub["debit"]
-    code = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str)
+
+    # Clasificación: usar puc_subgroup (de account_type) si existe, sino código
+    if "puc_subgroup" in sub.columns:
+        subg = sub["puc_subgroup"].astype(str)
+    else:
+        subg = sub.get(
+            "account_code_norm",
+            sub.get("account_code", pd.Series([""] * len(sub)))
+        ).astype(str).str[:2]
 
     # KTNO components
-    cxc = float(sub.loc[code.str.startswith("13"), "saldo_deudor"].sum())
-    inventario = float(sub.loc[code.str.startswith("14"), "saldo_deudor"].sum())
-    proveedores = float(sub.loc[code.str.startswith("22"), "saldo_acreedor"].sum())
+    cxc = float(sub.loc[subg == "13", "saldo_deudor"].sum())
+    inventario = float(sub.loc[subg == "14", "saldo_deudor"].sum())
+    proveedores = float(sub.loc[subg == "22", "saldo_acreedor"].sum())
     ktno = cxc + inventario - proveedores
 
     # Otros componentes
-    disponible = float(sub.loc[code.str.startswith("11"), "saldo_deudor"].sum())
-    obl_fin = float(sub.loc[code.str.startswith("21"), "saldo_acreedor"].sum())
+    disponible = float(sub.loc[subg == "11", "saldo_deudor"].sum())
+    obl_fin = float(sub.loc[subg == "21", "saldo_acreedor"].sum())
 
     activo_corriente = bs["activo_corriente"]
     pasivo_corriente = bs["pasivo_corriente"]
@@ -586,8 +696,15 @@ def compute_cash_flow(
             "tabla_por_contraparte": pd.DataFrame(),
         }
 
-    code = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str)
-    cash_lines = sub[code.str.startswith("11")].copy()
+    # Filtrar cuentas de disponible (11xx en PUC, o asset_cash en account_type)
+    if "puc_subgroup" in sub.columns:
+        is_cash = sub["puc_subgroup"].astype(str) == "11"
+    else:
+        is_cash = sub.get(
+            "account_code_norm",
+            sub.get("account_code", pd.Series([""] * len(sub)))
+        ).astype(str).str.startswith("11")
+    cash_lines = sub[is_cash].copy()
     if cash_lines.empty:
         return {
             "entradas": 0, "salidas": 0, "neto": 0,
@@ -604,7 +721,14 @@ def compute_cash_flow(
     historico = _filter_moves(moves, None, pd.Timestamp(date_from) - pd.Timedelta(days=1))
     historico = _join_moves_chart(historico, chart)
     if not historico.empty:
-        hist_cash = historico[historico["account_code"].astype(str).str.startswith("11")]
+        if "puc_subgroup" in historico.columns:
+            hist_is_cash = historico["puc_subgroup"].astype(str) == "11"
+        else:
+            hist_is_cash = historico.get(
+                "account_code_norm",
+                historico.get("account_code", pd.Series([""] * len(historico)))
+            ).astype(str).str.startswith("11")
+        hist_cash = historico[hist_is_cash]
         saldo_inicial = float((hist_cash["debit"] - hist_cash["credit"]).sum())
     else:
         saldo_inicial = 0
@@ -657,8 +781,14 @@ def compute_expenses_breakdown(
             "por_mes": pd.DataFrame(),
         }
 
-    code = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str)
-    gastos = sub[code.str.startswith(("5", "6"))].copy()
+    if "puc_group" in sub.columns:
+        is_exp = sub["puc_group"].astype(str).isin(["5", "6"])
+    else:
+        is_exp = sub.get(
+            "account_code_norm",
+            sub.get("account_code", pd.Series([""] * len(sub)))
+        ).astype(str).str.startswith(("5", "6"))
+    gastos = sub[is_exp].copy()
     if gastos.empty:
         return {
             "total_gastos": 0,
@@ -713,15 +843,29 @@ def compute_pnl_monthly_evolution(
         return pd.DataFrame()
 
     sub["mes"] = pd.to_datetime(sub["date"]).dt.to_period("M").dt.to_timestamp()
-    code = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str)
 
-    sub["ingreso_op"] = (sub["credit"] - sub["debit"]).where(code.str.startswith("41"), 0)
-    sub["ingreso_no_op"] = (sub["credit"] - sub["debit"]).where(code.str.startswith("42"), 0)
-    sub["costo"] = (sub["debit"] - sub["credit"]).where(code.str.startswith("6"), 0)
-    sub["gasto_admin"] = (sub["debit"] - sub["credit"]).where(code.str.startswith("51"), 0)
-    sub["gasto_ventas"] = (sub["debit"] - sub["credit"]).where(code.str.startswith("52"), 0)
-    sub["gasto_no_op"] = (sub["debit"] - sub["credit"]).where(code.str.startswith("53"), 0)
-    sub["impto"] = (sub["debit"] - sub["credit"]).where(code.str.startswith("54"), 0)
+    # Clasificación PRIMARIA: puc_group/puc_subgroup (de account_type)
+    if "puc_group" in sub.columns:
+        puc_g = sub["puc_group"].astype(str)
+        puc_sg = sub["puc_subgroup"].astype(str) if "puc_subgroup" in sub.columns else puc_g
+    else:
+        codes = sub.get(
+            "account_code_norm",
+            sub.get("account_code", pd.Series([""] * len(sub)))
+        ).astype(str)
+        puc_g = codes.str[:1]
+        puc_sg = codes.str[:2]
+
+    sub["ingreso_op"] = (sub["credit"] - sub["debit"]).where(puc_sg == "41", 0)
+    sub["ingreso_no_op"] = (sub["credit"] - sub["debit"]).where(puc_sg == "42", 0)
+    sub["costo"] = (sub["debit"] - sub["credit"]).where(puc_g == "6", 0)
+    sub["gasto_admin"] = (sub["debit"] - sub["credit"]).where(puc_sg == "51", 0)
+    sub["gasto_ventas"] = (sub["debit"] - sub["credit"]).where(puc_sg == "52", 0)
+    sub["gasto_no_op"] = (sub["debit"] - sub["credit"]).where(puc_sg == "53", 0)
+    sub["impto"] = (sub["debit"] - sub["credit"]).where(puc_sg == "54", 0)
+    # Si no hay subdivisión 51/52/53 (account_type genérico), todo a admin
+    if sub["gasto_admin"].sum() == 0 and sub["gasto_ventas"].sum() == 0:
+        sub["gasto_admin"] = (sub["debit"] - sub["credit"]).where(puc_g == "5", 0)
 
     monthly = sub.groupby("mes", as_index=False).agg(
         ingreso_op=("ingreso_op", "sum"),

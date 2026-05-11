@@ -911,32 +911,23 @@ def extract_chart_of_accounts(
     Odoo 13/14/15/16/17/18/19 community y enterprise.
     """
     # Niveles de fallback, de más rico a más mínimo
+    # CRÍTICO: account_type es el campo que clasifica PUC (income/expense/asset/etc.)
+    # Lo intentamos solo, sin otros campos opcionales que pueden romper la query.
     levels = [
-        # Nivel 1: rico, con todos los campos opcionales
-        ["id", "code", "name", "account_type", "company_id",
-         "currency_id", "deprecated", "reconcile"],
-        # Nivel 2: sin account_type (versiones viejas usan user_type_id)
-        ["id", "code", "name", "user_type_id", "company_id", "deprecated"],
-        # Nivel 3: sin filtros de tipo, solo lo básico + company
+        # Nivel 0 (NUEVO): solo lo esencial + account_type
+        ["id", "code", "name", "account_type"],
+        # Nivel 1: con account_type y company
+        ["id", "code", "name", "account_type", "company_id"],
+        # Nivel 2: versión vieja con user_type_id
+        ["id", "code", "name", "user_type_id", "company_id"],
+        # Nivel 3: sin tipo, con company
         ["id", "code", "name", "company_id"],
-        # Nivel 4: mínimo absoluto (siempre existe en cualquier Odoo)
+        # Nivel 4: mínimo absoluto
         ["id", "code", "name"],
     ]
 
-    domains = [
-        # Nivel 1: con deprecated y company_id
-        [("deprecated", "=", False)] + (
-            [("company_id", "in", list(company_ids))] if company_ids else []
-        ),
-        # Nivel 2: con deprecated y company_id
-        [("deprecated", "=", False)] + (
-            [("company_id", "in", list(company_ids))] if company_ids else []
-        ),
-        # Nivel 3: sin deprecated
-        [("company_id", "in", list(company_ids))] if company_ids else [],
-        # Nivel 4: sin nada
-        [],
-    ]
+    base_domain = [("company_id", "in", list(company_ids))] if company_ids else []
+    domains = [base_domain] * len(levels)
 
     records = None
     last_exc = None
