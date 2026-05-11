@@ -400,7 +400,7 @@ ACCOUNT_MOVEMENTS_CACHE_VERSION = 2  # Cargar solo período seleccionado, no his
 @st.cache_data(ttl=900, show_spinner="Descargando plan de cuentas...")
 def load_chart_of_accounts(
     company_ids: tuple[int, ...] | None = None,
-    _cache_v: int = 1,
+    _cache_v: int = 3,  # bump: forzar recarga con account_type
 ) -> "pd.DataFrame":
     """Descarga plan de cuentas (account.account)."""
     from .extractor import extract_chart_of_accounts

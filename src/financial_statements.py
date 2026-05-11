@@ -209,6 +209,105 @@ ACCOUNT_TYPE_TO_PUC = {
 }
 
 
+def classify_by_name(name: str) -> dict | None:
+    """
+    Clasifica por palabras clave en el nombre (fallback de último recurso
+    cuando no hay account_type ni código PUC parseable). Usa keywords del
+    PUC colombiano.
+    """
+    if not name:
+        return None
+    n = name.lower().strip()
+
+    # INGRESOS (4)
+    if any(kw in n for kw in [
+        "venta de", "ventas gravad", "ventas excluida", "ingresos por",
+        "comercio al por", "devolución en venta", "descuento en venta",
+    ]):
+        if "no operacional" in n or "financier" in n or "rendimi" in n:
+            return _puc_dict("4", "42", "Ingresos no operacionales", False)
+        return _puc_dict("4", "41", "Ingresos operacionales", False)
+    if "ingreso" in n and "no operac" in n:
+        return _puc_dict("4", "42", "Ingresos no operacionales", False)
+    if "ingreso" in n:
+        return _puc_dict("4", "41", "Ingresos operacionales", False)
+
+    # COSTOS (6)
+    if any(kw in n for kw in [
+        "costo de venta", "costo de mercanc", "costo de comercializ",
+    ]):
+        return _puc_dict("6", "6", "Costo de ventas", False)
+
+    # GASTOS (5)
+    if any(kw in n for kw in [
+        "gastos de personal", "gastos de admin", "gastos generales",
+        "gasto de", "honorarios", "arrendamiento", "servicios públicos",
+    ]):
+        if "venta" in n or "distribuci" in n or "comercial" in n:
+            return _puc_dict("5", "52", "Gastos de ventas", False)
+        return _puc_dict("5", "51", "Gastos administrativos", False)
+    if "gastos financier" in n or "intereses" in n:
+        return _puc_dict("5", "53", "Gastos no operacionales", False)
+    if "impuesto de renta" in n or "impuesto renta" in n:
+        return _puc_dict("5", "54", "Impuesto de renta", False)
+
+    # ACTIVOS (1)
+    if any(kw in n for kw in [
+        "banco ", "bco ", "caja ", "cajas ", "efectivo", "fiduciar",
+        "addi", "sistecredit",
+    ]):
+        return _puc_dict("1", "11", "Disponible (caja, bancos)", True)
+    if any(kw in n for kw in [
+        "clientes", "deudores", "cuentas por cobrar",
+        "anticipos a", "préstamo a empleado",
+    ]):
+        return _puc_dict("1", "13", "Deudores (CxC)", True)
+    if "inventario" in n or "mercanc" in n:
+        return _puc_dict("1", "14", "Inventarios", True)
+    if "iva descontable" in n or "iva por cobrar" in n or "anticipo de imp" in n:
+        return _puc_dict("1", "13", "Deudores (impuestos)", True)
+    if any(kw in n for kw in [
+        "edifici", "construc", "maquinaria", "equipo de", "muebles",
+        "vehícul", "terreno", "depreciaci",
+    ]):
+        return _puc_dict("1", "15", "Propiedad, planta y equipo", False)
+
+    # PASIVOS (2)
+    if "proveed" in n or "a proveedor" in n:
+        return _puc_dict("2", "22", "Proveedores", True)
+    if any(kw in n for kw in [
+        "obligacion financ", "obligaciones bancar", "préstamo bancar",
+    ]):
+        return _puc_dict("2", "21", "Obligaciones financieras", True)
+    if "iva generado" in n or "iva por pagar" in n or "retención en la fuente" in n:
+        return _puc_dict("2", "24", "Impuestos por pagar", True)
+    if "prestaciones" in n or "salario por pagar" in n or "cesantía" in n:
+        return _puc_dict("2", "25", "Obligaciones laborales", True)
+    if "cuentas por pagar" in n:
+        return _puc_dict("2", "23", "Cuentas por pagar", True)
+
+    # PATRIMONIO (3)
+    if any(kw in n for kw in [
+        "capital social", "capital suscrito", "reserva", "utilidad del ejercicio",
+        "patrimonio",
+    ]):
+        return _puc_dict("3", "3", "Patrimonio", False)
+
+    return None
+
+
+def _puc_dict(grupo: str, subgrupo: str, nombre_sub: str, corriente: bool) -> dict:
+    """Helper para crear dict de clasificación."""
+    return {
+        "grupo": PUC_GROUPS.get(grupo, "Otro"),
+        "es_corriente": corriente,
+        "es_resultado": grupo in ("4", "5", "6", "7"),
+        "subgrupo": nombre_sub,
+        "puc_group": grupo,
+        "puc_subgroup": subgrupo,
+    }
+
+
 def classify_by_account_type(account_type: str) -> dict | None:
     """Clasifica por account_type (campo nativo de Odoo). None si no mapea."""
     if not account_type:
@@ -240,20 +339,32 @@ def enrich_chart_with_puc(chart: pd.DataFrame) -> pd.DataFrame:
     out = chart.copy()
 
     def _classify_row(row):
-        # 1. Intentar account_type primero
+        # 1. PRIMARIO: account_type de Odoo (más confiable)
         if "account_type" in row and row["account_type"]:
             result = classify_by_account_type(row["account_type"])
             if result:
                 return result
-        # 2. Fallback a clasificación por código
-        code_cls = classify_account(row.get("code", ""))
-        # Agregar puc_group derivado del código normalizado
-        digits = "".join(ch for ch in str(row.get("code", "") or "") if ch.isdigit())
+        # 2. SECUNDARIO: clasificar por nombre (palabras clave PUC)
+        name_cls = classify_by_name(row.get("name", ""))
+        if name_cls:
+            return name_cls
+        # 3. TERCIARIO: clasificación por código (si parsea como PUC)
+        code = str(row.get("code", "") or "")
+        digits = "".join(ch for ch in code if ch.isdigit())
         digits = digits.lstrip("0")
-        puc_g = digits[0] if digits else ""
-        code_cls["puc_group"] = puc_g
-        code_cls["puc_subgroup"] = digits[:2] if len(digits) >= 2 else puc_g
-        return code_cls
+        # Solo confiar en el código si tiene 3+ dígitos significativos
+        # (códigos auxiliares como "00000004" caen a 1 dígito = no PUC)
+        if len(digits) >= 3:
+            code_cls = classify_account(code)
+            code_cls["puc_group"] = digits[0] if digits else ""
+            code_cls["puc_subgroup"] = digits[:2] if len(digits) >= 2 else digits[0]
+            return code_cls
+        # 4. Último recurso: Otro
+        return {
+            "grupo": "Otro", "es_corriente": False,
+            "es_resultado": False, "subgrupo": "Otro",
+            "puc_group": "", "puc_subgroup": "",
+        }
 
     cls = out.apply(_classify_row, axis=1)
     out["grupo"] = cls.apply(lambda d: d["grupo"])
