@@ -63,89 +63,109 @@ def classify_account(code: str) -> dict:
       es_corriente: True/False (corto plazo)
       es_resultado: True si afecta P&L (4, 5, 6, 7)
       subgrupo: descripción más fina
+
+    Robusto contra códigos con prefijos no estándar (ceros iniciales,
+    letras como "F", "A", etc.). Busca el primer dígito 1-7 dentro del
+    código que sea válido como grupo PUC.
     """
     code = str(code or "")
-    if not code or not code[0].isdigit():
+    if not code:
         return {"grupo": "Otro", "es_corriente": False,
                 "es_resultado": False, "subgrupo": "Otro"}
 
-    g = code[0]
+    # Buscar el primer dígito 1-7 en el código (saltando ceros y letras)
+    g = None
+    for ch in code:
+        if ch in "1234567":
+            g = ch
+            break
+    if g is None:
+        return {"grupo": "Otro", "es_corriente": False,
+                "es_resultado": False, "subgrupo": "Otro"}
+
+    # Para subclasificación, extraer los primeros 4 dígitos significativos
+    # (saltando ceros y letras iniciales)
+    digits = "".join(ch for ch in code if ch.isdigit())
+    digits = digits.lstrip("0")  # quitar ceros iniciales
+
+    # Reconstruir prefijos
+    g = digits[0] if digits else g
+    code_for_subclass = digits if digits else code
     grupo = PUC_GROUPS.get(g, "Otro")
     es_resultado = g in ("4", "5", "6", "7")
 
-    # Corriente vs no corriente — por código de 4 dígitos del PUC
-    p4 = code[:4] if len(code) >= 4 else code
+    # Usar code_for_subclass (dígitos sin prefijos) para subclasificar
+    c = code_for_subclass
     es_corriente = False
     subgrupo = grupo
 
     # Activos corrientes: 11 (disponible), 12 (inversiones CP), 13 (deudores),
     # 14 (inventarios), 17 (diferidos)
     if g == "1":
-        if code[:2] in ("11", "12", "13", "14", "17"):
+        if c[:2] in ("11", "12", "13", "14", "17"):
             es_corriente = True
         # Subgrupo
-        if code.startswith("11"):
+        if c.startswith("11"):
             subgrupo = "Disponible (caja, bancos)"
-        elif code.startswith("12"):
+        elif c.startswith("12"):
             subgrupo = "Inversiones"
-        elif code.startswith("13"):
+        elif c.startswith("13"):
             subgrupo = "Deudores (CxC)"
-        elif code.startswith("14"):
+        elif c.startswith("14"):
             subgrupo = "Inventarios"
-        elif code.startswith("15"):
+        elif c.startswith("15"):
             subgrupo = "Propiedad, planta y equipo"
-        elif code.startswith("16"):
+        elif c.startswith("16"):
             subgrupo = "Intangibles"
-        elif code.startswith("17"):
+        elif c.startswith("17"):
             subgrupo = "Diferidos"
-        elif code.startswith("18"):
+        elif c.startswith("18"):
             subgrupo = "Otros activos"
-        elif code.startswith("19"):
+        elif c.startswith("19"):
             subgrupo = "Valorizaciones"
-    # Pasivos corrientes: 21 (obl. financieras CP), 22, 23, 24, 25, 26 (corto plazo)
     elif g == "2":
-        if code[:2] in ("21", "22", "23", "24", "25", "26", "27", "28"):
+        if c[:2] in ("21", "22", "23", "24", "25", "26", "27", "28"):
             es_corriente = True
-        if code.startswith("21"):
+        if c.startswith("21"):
             subgrupo = "Obligaciones financieras"
-        elif code.startswith("22"):
+        elif c.startswith("22"):
             subgrupo = "Proveedores"
-        elif code.startswith("23"):
+        elif c.startswith("23"):
             subgrupo = "Cuentas por pagar"
-        elif code.startswith("24"):
+        elif c.startswith("24"):
             subgrupo = "Impuestos por pagar"
-        elif code.startswith("25"):
+        elif c.startswith("25"):
             subgrupo = "Obligaciones laborales"
-        elif code.startswith("26"):
+        elif c.startswith("26"):
             subgrupo = "Pasivos estimados"
-        elif code.startswith("27"):
+        elif c.startswith("27"):
             subgrupo = "Diferidos"
-        elif code.startswith("28"):
+        elif c.startswith("28"):
             subgrupo = "Otros pasivos"
     elif g == "3":
-        if code.startswith("31"):
+        if c.startswith("31"):
             subgrupo = "Capital social"
-        elif code.startswith("32"):
+        elif c.startswith("32"):
             subgrupo = "Superávit de capital"
-        elif code.startswith("33"):
+        elif c.startswith("33"):
             subgrupo = "Reservas"
-        elif code.startswith("36"):
+        elif c.startswith("36"):
             subgrupo = "Resultados del ejercicio"
-        elif code.startswith("37"):
+        elif c.startswith("37"):
             subgrupo = "Resultados de ejercicios anteriores"
     elif g == "4":
-        if code.startswith("41"):
+        if c.startswith("41"):
             subgrupo = "Ingresos operacionales"
-        elif code.startswith("42"):
+        elif c.startswith("42"):
             subgrupo = "Ingresos no operacionales"
     elif g == "5":
-        if code.startswith("51"):
+        if c.startswith("51"):
             subgrupo = "Gastos administrativos"
-        elif code.startswith("52"):
+        elif c.startswith("52"):
             subgrupo = "Gastos de ventas"
-        elif code.startswith("53"):
+        elif c.startswith("53"):
             subgrupo = "Gastos no operacionales"
-        elif code.startswith("54"):
+        elif c.startswith("54"):
             subgrupo = "Impuesto de renta"
     elif g == "6":
         subgrupo = "Costo de ventas"
@@ -193,6 +213,20 @@ def _filter_moves(
     return sub
 
 
+def _normalize_code(code: str) -> str:
+    """
+    Normaliza un código de cuenta para clasificación PUC:
+      - Quita prefijos no numéricos (F, A, etc.)
+      - Quita ceros iniciales
+      - Devuelve solo los dígitos significativos
+    Ejemplos: "F4135" → "4135", "00004135" → "4135", "FF1105" → "1105"
+    """
+    s = str(code or "")
+    digits = "".join(ch for ch in s if ch.isdigit())
+    digits = digits.lstrip("0")
+    return digits or s
+
+
 def _join_moves_chart(
     moves: pd.DataFrame, chart: pd.DataFrame
 ) -> pd.DataFrame:
@@ -202,16 +236,20 @@ def _join_moves_chart(
     if chart is None or chart.empty:
         return moves
     chart_e = enrich_chart_with_puc(chart)
+    # Agregar columna `code_normalized` para clasificación robusta
+    if "code" in chart_e.columns:
+        chart_e["code_normalized"] = chart_e["code"].apply(_normalize_code)
     # Solo seleccionar columnas que realmente existen (el chart puede haber
     # caído a un nivel mínimo en el fallback sin account_type)
     desired_cols = [
-        "id", "code", "name", "account_type",
+        "id", "code", "code_normalized", "name", "account_type",
         "grupo", "es_corriente", "es_resultado", "subgrupo",
     ]
     available_cols = [c for c in desired_cols if c in chart_e.columns]
     keep = chart_e[available_cols].rename(columns={
         "id": "account_id",
         "code": "account_code",
+        "code_normalized": "account_code_norm",
         "name": "account_name",
     })
     return moves.merge(keep, on="account_id", how="left")
@@ -251,25 +289,29 @@ def compute_income_statement(
             "tabla_detalle": pd.DataFrame(),
         }
 
+    # Usar código normalizado (sin prefijos F, ceros iniciales, etc.)
+    code_col = "account_code_norm" if "account_code_norm" in sub.columns else "account_code"
+    codes = sub[code_col].astype(str)
+
     # Para cuentas de resultado:
     #   Ingresos (4xxx): saldo NORMAL es crédito → balance NEGATIVO
     #     credit - debit = ingreso positivo
     #   Gastos/Costos (5,6,7xxx): saldo normal es débito
     #     debit - credit = gasto positivo
     sub["monto_ingreso"] = (sub["credit"] - sub["debit"]).where(
-        sub["account_code"].astype(str).str.startswith("4"), 0
+        codes.str.startswith("4"), 0
     )
     sub["monto_gasto"] = (sub["debit"] - sub["credit"]).where(
-        sub["account_code"].astype(str).str.startswith(("5", "6", "7")), 0
+        codes.str.startswith(("5", "6", "7")), 0
     )
 
-    ingresos_op = float(sub.loc[sub["account_code"].astype(str).str.startswith("41"), "monto_ingreso"].sum())
-    ingresos_no_op = float(sub.loc[sub["account_code"].astype(str).str.startswith("42"), "monto_ingreso"].sum())
-    costo_ventas = float(sub.loc[sub["account_code"].astype(str).str.startswith("6"), "monto_gasto"].sum())
-    gastos_admin = float(sub.loc[sub["account_code"].astype(str).str.startswith("51"), "monto_gasto"].sum())
-    gastos_ventas = float(sub.loc[sub["account_code"].astype(str).str.startswith("52"), "monto_gasto"].sum())
-    gastos_no_op = float(sub.loc[sub["account_code"].astype(str).str.startswith("53"), "monto_gasto"].sum())
-    impto_renta = float(sub.loc[sub["account_code"].astype(str).str.startswith("54"), "monto_gasto"].sum())
+    ingresos_op = float(sub.loc[codes.str.startswith("41"), "monto_ingreso"].sum())
+    ingresos_no_op = float(sub.loc[codes.str.startswith("42"), "monto_ingreso"].sum())
+    costo_ventas = float(sub.loc[codes.str.startswith("6"), "monto_gasto"].sum())
+    gastos_admin = float(sub.loc[codes.str.startswith("51"), "monto_gasto"].sum())
+    gastos_ventas = float(sub.loc[codes.str.startswith("52"), "monto_gasto"].sum())
+    gastos_no_op = float(sub.loc[codes.str.startswith("53"), "monto_gasto"].sum())
+    impto_renta = float(sub.loc[codes.str.startswith("54"), "monto_gasto"].sum())
 
     utilidad_bruta = ingresos_op - costo_ventas
     utilidad_operacional = utilidad_bruta - gastos_admin - gastos_ventas
@@ -346,10 +388,10 @@ def compute_balance_sheet(
     # ejercicios anteriores cuando se cierra el año. Para no doble-contar,
     # incluimos las cuentas 4-7 también pero como parte del patrimonio
     # del ejercicio en curso.
-    is_asset = sub["account_code"].astype(str).str.startswith("1")
-    is_liab = sub["account_code"].astype(str).str.startswith("2")
-    is_equity = sub["account_code"].astype(str).str.startswith("3")
-    is_result = sub["account_code"].astype(str).str.startswith(("4", "5", "6", "7"))
+    is_asset = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str).str.startswith("1")
+    is_liab = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str).str.startswith("2")
+    is_equity = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str).str.startswith("3")
+    is_result = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str).str.startswith(("4", "5", "6", "7"))
 
     # Por cuenta
     by_account = sub.groupby(
@@ -358,7 +400,7 @@ def compute_balance_sheet(
     ).agg(saldo_deudor=("saldo_deudor", "sum"), saldo_acreedor=("saldo_acreedor", "sum"))
 
     # Activo: saldo deudor positivo
-    activos = by_account[by_account["account_code"].astype(str).str.startswith("1")].copy()
+    activos = by_account[by_account.get("account_code_norm", by_account["account_code"]).astype(str).str.startswith("1")].copy()
     activos["saldo"] = activos["saldo_deudor"]
     activos = activos[activos["saldo"] != 0].sort_values(
         ["es_corriente", "subgrupo", "account_code"], ascending=[False, True, True],
@@ -368,7 +410,7 @@ def compute_balance_sheet(
     activo_total = activo_corriente + activo_no_corriente
 
     # Pasivo: saldo acreedor positivo
-    pasivos = by_account[by_account["account_code"].astype(str).str.startswith("2")].copy()
+    pasivos = by_account[by_account.get("account_code_norm", by_account["account_code"]).astype(str).str.startswith("2")].copy()
     pasivos["saldo"] = pasivos["saldo_acreedor"]
     pasivos = pasivos[pasivos["saldo"] != 0].sort_values(
         ["es_corriente", "subgrupo", "account_code"], ascending=[False, True, True],
@@ -378,7 +420,7 @@ def compute_balance_sheet(
     pasivo_total = pasivo_corriente + pasivo_no_corriente
 
     # Patrimonio: saldo acreedor de cuentas 3xxx + utilidad del período
-    patrimonio_cuentas = by_account[by_account["account_code"].astype(str).str.startswith("3")].copy()
+    patrimonio_cuentas = by_account[by_account.get("account_code_norm", by_account["account_code"]).astype(str).str.startswith("3")].copy()
     patrimonio_cuentas["saldo"] = patrimonio_cuentas["saldo_acreedor"]
     patrimonio_cuentas = patrimonio_cuentas[patrimonio_cuentas["saldo"] != 0].sort_values(
         "account_code"
@@ -449,7 +491,7 @@ def compute_working_capital(
 
     sub["saldo_deudor"] = sub["debit"] - sub["credit"]
     sub["saldo_acreedor"] = sub["credit"] - sub["debit"]
-    code = sub["account_code"].astype(str)
+    code = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str)
 
     # KTNO components
     cxc = float(sub.loc[code.str.startswith("13"), "saldo_deudor"].sum())
@@ -507,7 +549,7 @@ def compute_cash_flow(
             "tabla_por_contraparte": pd.DataFrame(),
         }
 
-    code = sub["account_code"].astype(str)
+    code = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str)
     cash_lines = sub[code.str.startswith("11")].copy()
     if cash_lines.empty:
         return {
@@ -578,7 +620,7 @@ def compute_expenses_breakdown(
             "por_mes": pd.DataFrame(),
         }
 
-    code = sub["account_code"].astype(str)
+    code = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str)
     gastos = sub[code.str.startswith(("5", "6"))].copy()
     if gastos.empty:
         return {
@@ -634,7 +676,7 @@ def compute_pnl_monthly_evolution(
         return pd.DataFrame()
 
     sub["mes"] = pd.to_datetime(sub["date"]).dt.to_period("M").dt.to_timestamp()
-    code = sub["account_code"].astype(str)
+    code = sub.get("account_code_norm", sub.get("account_code", pd.Series([], dtype=str))).astype(str)
 
     sub["ingreso_op"] = (sub["credit"] - sub["debit"]).where(code.str.startswith("41"), 0)
     sub["ingreso_no_op"] = (sub["credit"] - sub["debit"]).where(code.str.startswith("42"), 0)
