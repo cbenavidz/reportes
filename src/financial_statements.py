@@ -202,10 +202,14 @@ def _join_moves_chart(
     if chart is None or chart.empty:
         return moves
     chart_e = enrich_chart_with_puc(chart)
-    keep = chart_e[[
+    # Solo seleccionar columnas que realmente existen (el chart puede haber
+    # caído a un nivel mínimo en el fallback sin account_type)
+    desired_cols = [
         "id", "code", "name", "account_type",
         "grupo", "es_corriente", "es_resultado", "subgrupo",
-    ]].rename(columns={
+    ]
+    available_cols = [c for c in desired_cols if c in chart_e.columns]
+    keep = chart_e[available_cols].rename(columns={
         "id": "account_id",
         "code": "account_code",
         "name": "account_name",
