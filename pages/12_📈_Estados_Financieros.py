@@ -18,6 +18,7 @@ import streamlit as st
 from src.auth import logout_button, require_auth
 from src.data_loader import (
     compute_full_analysis,
+    load_account_balances_aggregated,
     load_account_movements,
     load_chart_of_accounts,
 )
@@ -70,9 +71,10 @@ with col_p2:
 with col_p3:
     quick = st.radio(
         "Atajos",
-        options=["Personalizado", "Año en curso", "Año anterior",
-                 "Últimos 12 meses", "Mes actual", "Mes anterior", "Trimestre actual"],
+        options=["Personalizado", "Mes actual", "Mes anterior", "Trimestre actual",
+                 "Año en curso", "Año anterior", "Últimos 12 meses"],
         index=1, horizontal=False, key="ef_atajo",
+        help="Períodos cortos cargan más rápido. 12 meses puede tardar 2-3 min."
     )
 
 if quick != "Personalizado":
@@ -98,27 +100,35 @@ st.caption(f"📅 Período: **{fecha_desde}** → **{fecha_hasta}** · Corte bal
 
 
 # ---------------------------------------------------------------------------
-# Cargar datos
+# Cargar datos — SOLO el período seleccionado + período anterior comparativo
 # ---------------------------------------------------------------------------
-# Determinar meses a cargar según el rango seleccionado (no cargar más de
-# lo necesario para reducir tiempo de descarga)
-dias_periodo = (fecha_hasta - fecha_desde).days
-# Margen extra para tener saldo inicial del balance + período anterior comparativo
-if dias_periodo <= 90:
-    HIST_MONTHS = 12   # rango corto → 12 meses (suficiente para comparativo YoY)
-elif dias_periodo <= 365:
-    HIST_MONTHS = 18   # rango anual → 18 meses
-else:
-    HIST_MONTHS = 36   # rango muy largo → 3 años
+# Esto reduce dramáticamente el tiempo de carga vs cargar 12-36 meses fijo
+periodo_dias = (fecha_hasta - fecha_desde).days + 1
+fecha_desde_prev = fecha_desde - timedelta(days=periodo_dias)
+fecha_hasta_prev = fecha_desde - timedelta(days=1)
+
+# Rango para cargar: desde inicio del período anterior hasta fin del actual
+load_date_from = fecha_desde_prev.isoformat()
+load_date_to = fecha_hasta.isoformat()
 
 with st.spinner(
-    f"Cargando movimientos contables ({HIST_MONTHS} meses)..."
+    f"Cargando movimientos del período ({fecha_desde_prev} → {fecha_hasta})..."
 ):
     chart = load_chart_of_accounts(
         company_ids=filters["company_ids"],
     )
     moves = load_account_movements(
-        months_back=HIST_MONTHS,
+        date_from=load_date_from,
+        date_to=load_date_to,
+        company_ids=filters["company_ids"],
+    )
+
+# Para el Balance General necesitamos saldos HISTÓRICOS (todo lo anterior).
+# Usamos read_group de Odoo (suma server-side, muy rápido) en vez de
+# traer todas las líneas.
+with st.spinner("Calculando saldos históricos para Balance..."):
+    balances_hist = load_account_balances_aggregated(
+        date_to=fecha_hasta.isoformat(),
         company_ids=filters["company_ids"],
     )
 
@@ -188,7 +198,10 @@ with st.expander("🔍 Diagnóstico de datos cargados", expanded=False):
     st.markdown("---")
     st.markdown("**🎯 Cuentas USADAS en movimientos (con código y saldo total)**")
     if "id" in chart.columns and "account_id" in moves.columns:
-        chart_min = chart[["id", "code", "name"]].rename(columns={"id": "account_id"})
+        # Renombrar columnas para evitar colisión con `name` de moves
+        chart_min = chart[["id", "code", "name"]].rename(
+            columns={"id": "account_id", "code": "acc_code", "name": "acc_name"}
+        )
         moves_with_code = moves.merge(chart_min, on="account_id", how="left")
         if not moves_with_code.empty:
             # Saldo total por cuenta
@@ -197,9 +210,9 @@ with st.expander("🔍 Diagnóstico de datos cargados", expanded=False):
                 - moves_with_code.get("credit", 0).fillna(0)
             )
             por_cuenta = moves_with_code.groupby(
-                ["code", "name"], as_index=False, dropna=False
+                ["acc_code", "acc_name"], as_index=False, dropna=False
             ).agg(
-                n_moves=("id", "count") if "id" in moves_with_code.columns else ("debit", "count"),
+                n_moves=("debit", "count"),
                 debit=("debit", "sum"),
                 credit=("credit", "sum"),
                 saldo_neto=("saldo_neto", "sum"),
@@ -209,16 +222,16 @@ with st.expander("🔍 Diagnóstico de datos cargados", expanded=False):
             top30 = por_cuenta.sort_values("abs_saldo", ascending=False).head(30)
             st.write("Top 30 cuentas por saldo absoluto:")
             st.dataframe(
-                top30[["code", "name", "n_moves", "debit", "credit", "saldo_neto"]],
+                top30[["acc_code", "acc_name", "n_moves", "debit", "credit", "saldo_neto"]],
                 use_container_width=True, hide_index=True, height=400,
             )
 
             # Distribución por dígito normalizado
             from src.financial_statements import _normalize_code
-            por_cuenta["code_norm"] = por_cuenta["code"].apply(_normalize_code)
+            por_cuenta["code_norm"] = por_cuenta["acc_code"].apply(_normalize_code)
             por_cuenta["first_digit_norm"] = por_cuenta["code_norm"].astype(str).str[:1]
             dist_norm = por_cuenta.groupby("first_digit_norm").agg(
-                n_cuentas=("code", "count"),
+                n_cuentas=("acc_code", "count"),
                 saldo_total=("saldo_neto", "sum"),
             ).reset_index()
             st.write("**Distribución de cuentas USADAS por primer dígito normalizado:**")
@@ -333,7 +346,7 @@ with tab_bal:
     st.markdown("## 🏦 Balance General")
     st.caption(f"Corte a: {fecha_hasta}")
 
-    bs = compute_balance_sheet(moves, chart, fecha_hasta)
+    bs = compute_balance_sheet(moves, chart, fecha_hasta, balances_hist=balances_hist)
 
     c1, c2, c3 = st.columns(3)
     c1.metric("💼 Activo Total", _money(bs["activo_total"]))
@@ -412,7 +425,7 @@ with tab_ktno:
     st.markdown("## 💧 KTNO y Capital de Trabajo")
     st.caption(f"Corte a: {fecha_hasta}")
 
-    wc = compute_working_capital(moves, chart, fecha_hasta)
+    wc = compute_working_capital(moves, chart, fecha_hasta, balances_hist=balances_hist)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("💧 Capital de Trabajo (KT)", _money(wc["kt"]),

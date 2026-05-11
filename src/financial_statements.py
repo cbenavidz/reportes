@@ -361,13 +361,33 @@ def compute_balance_sheet(
     moves: pd.DataFrame,
     chart: pd.DataFrame,
     date_to: date,
+    balances_hist: pd.DataFrame | None = None,
 ) -> dict:
     """
-    Balance General a la fecha de corte. Suma todos los movimientos hasta
-    `date_to` y calcula saldos de cuentas balance (1, 2, 3).
+    Balance General a la fecha de corte. Si se pasa `balances_hist`
+    (DataFrame con saldos agregados pre-calculados con read_group), lo usa
+    en lugar de sumar moves línea-por-línea (mucho más rápido).
     """
-    sub = _filter_moves(moves, None, date_to)
-    sub = _join_moves_chart(sub, chart)
+    # Si tenemos balances agregados, los usamos directamente
+    if balances_hist is not None and not balances_hist.empty:
+        sub = balances_hist.copy()
+        # Hacer join con chart para tener code/name
+        chart_e = enrich_chart_with_puc(chart)
+        if "code" in chart_e.columns:
+            chart_e["code_normalized"] = chart_e["code"].apply(_normalize_code)
+        keep_cols = [c for c in [
+            "id", "code", "code_normalized", "name", "grupo",
+            "es_corriente", "es_resultado", "subgrupo",
+        ] if c in chart_e.columns]
+        keep = chart_e[keep_cols].rename(columns={
+            "id": "account_id", "code": "account_code",
+            "code_normalized": "account_code_norm", "name": "account_name",
+        })
+        sub = sub.merge(keep, on="account_id", how="left")
+    else:
+        sub = _filter_moves(moves, None, date_to)
+        sub = _join_moves_chart(sub, chart)
+
     if sub.empty:
         return {
             "activo_corriente": 0, "activo_no_corriente": 0, "activo_total": 0,
@@ -469,6 +489,7 @@ def compute_working_capital(
     moves: pd.DataFrame,
     chart: pd.DataFrame,
     date_to: date,
+    balances_hist: pd.DataFrame | None = None,
 ) -> dict:
     """
     Capital de Trabajo y KTNO.
@@ -477,9 +498,25 @@ def compute_working_capital(
     KTNO (Capital de Trabajo Neto Operativo)
         = Cuentas por cobrar (13xx) + Inventarios (14xx) - Proveedores (22xx)
     """
-    bs = compute_balance_sheet(moves, chart, date_to)
-    sub = _filter_moves(moves, None, date_to)
-    sub = _join_moves_chart(sub, chart)
+    bs = compute_balance_sheet(moves, chart, date_to, balances_hist=balances_hist)
+    # Si tenemos balances agregados, los usamos
+    if balances_hist is not None and not balances_hist.empty:
+        sub = balances_hist.copy()
+        chart_e = enrich_chart_with_puc(chart)
+        if "code" in chart_e.columns:
+            chart_e["code_normalized"] = chart_e["code"].apply(_normalize_code)
+        keep_cols = [c for c in [
+            "id", "code", "code_normalized", "name", "grupo",
+            "es_corriente", "es_resultado", "subgrupo",
+        ] if c in chart_e.columns]
+        keep = chart_e[keep_cols].rename(columns={
+            "id": "account_id", "code": "account_code",
+            "code_normalized": "account_code_norm", "name": "account_name",
+        })
+        sub = sub.merge(keep, on="account_id", how="left")
+    else:
+        sub = _filter_moves(moves, None, date_to)
+        sub = _join_moves_chart(sub, chart)
     if sub.empty:
         return {
             "kt": 0, "ktno": 0,

@@ -394,7 +394,7 @@ def load_invoice_lines(
 # Loaders para Estados Financieros
 # ---------------------------------------------------------------------------
 
-ACCOUNT_MOVEMENTS_CACHE_VERSION = 1
+ACCOUNT_MOVEMENTS_CACHE_VERSION = 2  # Cargar solo período seleccionado, no histórico completo
 
 
 @st.cache_data(ttl=900, show_spinner="Descargando plan de cuentas...")
@@ -410,27 +410,81 @@ def load_chart_of_accounts(
     )
 
 
-@st.cache_data(ttl=900, show_spinner="Descargando movimientos contables (puede tardar)...")
+@st.cache_data(ttl=900, show_spinner="Descargando movimientos contables...")
 def load_account_movements(
-    months_back: int = 24,
+    months_back: int = 12,
     company_ids: tuple[int, ...] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     _cache_v: int = ACCOUNT_MOVEMENTS_CACHE_VERSION,
 ) -> "pd.DataFrame":
     """
-    Descarga TODOS los movimientos contables (account.move.line) en el rango.
-    Usado por reportes de Estados Financieros (Balance, P&L, KTNO, Flujo).
+    Descarga movimientos contables (account.move.line) en el rango.
+
+    Si se pasan `date_from` y `date_to` (strings YYYY-MM-DD), usa ese rango
+    exacto. Si no, calcula desde `months_back` hacia atrás.
     """
     from datetime import date as _date, timedelta
     from .extractor import extract_account_movements
     client = get_odoo_client()
-    cutoff = _date.today()
-    date_from = cutoff - timedelta(days=30 * months_back)
+    if date_from and date_to:
+        df_date = pd.to_datetime(date_from).date()
+        dt_date = pd.to_datetime(date_to).date()
+    else:
+        cutoff = _date.today()
+        df_date = cutoff - timedelta(days=30 * months_back)
+        dt_date = cutoff
     return extract_account_movements(
         client,
-        date_from=date_from,
-        date_to=cutoff,
+        date_from=df_date,
+        date_to=dt_date,
         company_ids=list(company_ids) if company_ids else None,
     )
+
+
+@st.cache_data(ttl=900, show_spinner="Calculando saldos contables...")
+def load_account_balances_aggregated(
+    date_to: str,
+    company_ids: tuple[int, ...] | None = None,
+    _cache_v: int = ACCOUNT_MOVEMENTS_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """
+    Saldo agregado por cuenta hasta `date_to`. Usa `read_group` de Odoo
+    para hacer la suma en el SERVIDOR (mucho más rápido que traer líneas
+    individuales). Devuelve DataFrame con account_id, debit_sum, credit_sum.
+
+    Ideal para Balance General que necesita saldo histórico completo.
+    """
+    client = get_odoo_client()
+    domain: list = [
+        ("parent_state", "=", "posted"),
+        ("date", "<=", date_to),
+    ]
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
+    try:
+        # read_group hace SUM(debit), SUM(credit) en SQL — muy rápido
+        result = client.execute_kw(
+            "account.move.line", "read_group",
+            [domain, ["account_id", "debit:sum", "credit:sum"], ["account_id"]],
+            {"lazy": False},
+        )
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame(columns=["account_id", "debit", "credit"])
+
+    rows = []
+    for r in result:
+        acc = r.get("account_id")
+        if isinstance(acc, list) and acc:
+            acc_id = acc[0]
+        else:
+            acc_id = acc
+        rows.append({
+            "account_id": acc_id,
+            "debit": float(r.get("debit", 0) or 0),
+            "credit": float(r.get("credit", 0) or 0),
+        })
+    return pd.DataFrame(rows)
 
 
 def test_connection_summary() -> dict:
