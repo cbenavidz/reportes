@@ -100,14 +100,25 @@ st.caption(f"📅 Período: **{fecha_desde}** → **{fecha_hasta}** · Corte bal
 # ---------------------------------------------------------------------------
 # Cargar datos
 # ---------------------------------------------------------------------------
-HIST_MONTHS = 36  # 3 años para soportar comparativos y saldos iniciales
+# Determinar meses a cargar según el rango seleccionado (no cargar más de
+# lo necesario para reducir tiempo de descarga)
+dias_periodo = (fecha_hasta - fecha_desde).days
+# Margen extra para tener saldo inicial del balance + período anterior comparativo
+if dias_periodo <= 90:
+    HIST_MONTHS = 12   # rango corto → 12 meses (suficiente para comparativo YoY)
+elif dias_periodo <= 365:
+    HIST_MONTHS = 18   # rango anual → 18 meses
+else:
+    HIST_MONTHS = 36   # rango muy largo → 3 años
 
-with st.spinner("Cargando movimientos contables (puede tardar 1-2 min la primera vez)..."):
-    moves = load_account_movements(
-        months_back=HIST_MONTHS,
+with st.spinner(
+    f"Cargando movimientos contables ({HIST_MONTHS} meses)..."
+):
+    chart = load_chart_of_accounts(
         company_ids=filters["company_ids"],
     )
-    chart = load_chart_of_accounts(
+    moves = load_account_movements(
+        months_back=HIST_MONTHS,
         company_ids=filters["company_ids"],
     )
 

@@ -107,10 +107,16 @@ st.caption(f"📅 Período: **{fecha_desde}** → **{fecha_hasta}**")
 # ---------------------------------------------------------------------------
 # Cargar datos
 # ---------------------------------------------------------------------------
-# Usamos 24 meses de histórico para soportar YoY y churn de largo plazo
-HIST_MONTHS = 24
+# Ajustar histórico según rango seleccionado para no cargar de más
+dias_periodo = (fecha_hasta - fecha_desde).days
+if dias_periodo <= 90:
+    HIST_MONTHS = 6    # rango corto: 6 meses
+elif dias_periodo <= 365:
+    HIST_MONTHS = 18   # rango anual: 18 meses (necesario para YoY)
+else:
+    HIST_MONTHS = 24   # rango muy largo: 24 meses
 
-with st.spinner("Cargando líneas de factura desde Odoo (24 meses)..."):
+with st.spinner(f"Cargando líneas de factura ({HIST_MONTHS} meses)..."):
     lines = load_invoice_lines(
         months_back=HIST_MONTHS,
         company_ids=filters["company_ids"],

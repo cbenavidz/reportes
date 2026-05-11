@@ -354,7 +354,9 @@ def filter_analysis_by_vendedor(
 #   v9: usar `purchase_price` y `margin_signed` (Enterprise) cuando estén
 #       disponibles; fallback a `standard_price` actual. Columnas nuevas:
 #       `cost_source`, `margin_source` para trazabilidad.
-INVOICE_LINES_CACHE_VERSION = 9
+#   v10: pasar context={'company_id': X} al fetch de productos para
+#        resolver standard_price multi-empresa (antes devolvía 0).
+INVOICE_LINES_CACHE_VERSION = 10
 
 
 @st.cache_data(ttl=900, show_spinner="Descargando líneas de factura (productos)...")

@@ -674,13 +674,27 @@ def extract_invoice_lines(
     )
     if product_ids:
         try:
+            # IMPORTANTE: standard_price es company-dependent en Odoo.
+            # Sin context={'company_id': X} devuelve 0 o el de la default company.
+            # Pasamos el primer company_id del filtro (si hay).
+            product_context: dict | None = None
+            if company_ids:
+                # context con allowed_company_ids fuerza Odoo a leer
+                # el valor del costo en la empresa correcta.
+                first_co = list(company_ids)[0]
+                product_context = {
+                    "company_id": first_co,
+                    "allowed_company_ids": list(company_ids),
+                }
+
             prod_records = client.search_read(
                 "product.product",
                 domain=[("id", "in", product_ids)],
                 fields=[
                     "id", "categ_id", "default_code", "name", "volume",
-                    "standard_price",  # Precio de costo para margen bruto
+                    "standard_price",  # Precio de costo (company-dependent)
                 ],
+                context=product_context,
             )
             cat_map: dict[int, tuple[int | None, str | None]] = {}
             code_map: dict[int, str | None] = {}
@@ -891,23 +905,75 @@ def extract_chart_of_accounts(
 ) -> pd.DataFrame:
     """
     Trae el plan de cuentas (account.account) con código, nombre y tipo.
+
+    Robust contra versiones distintas de Odoo: verifica campos disponibles
+    vía fields_get antes de pedirlos. Si `account_type` no existe (versiones
+    viejas), cae a `user_type_id`. Si `deprecated` no existe, se omite el
+    filtro.
     """
-    domain: list = [("deprecated", "=", False)]
+    # 1. Resolver campos disponibles
+    try:
+        all_fields_meta = client.fields_get("account.account", attributes=["string"])
+        available = set(all_fields_meta.keys())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fields_get(account.account) falló: %s. Usando lista conservadora.",
+            exc,
+        )
+        available = set(ACCOUNT_FIELDS)
+
+    # Lista de campos deseados, filtrados por los que existen realmente
+    fields_to_fetch = [f for f in ACCOUNT_FIELDS if f in available]
+
+    # En versiones viejas account_type se llama user_type_id
+    if "account_type" not in available and "user_type_id" in available:
+        fields_to_fetch.append("user_type_id")
+
+    # 2. Construir dominio
+    domain: list = []
+    if "deprecated" in available:
+        domain.append(("deprecated", "=", False))
     if company_ids:
         domain.append(("company_id", "in", list(company_ids)))
 
-    records = client.search_read(
-        "account.account",
-        domain=domain,
-        fields=ACCOUNT_FIELDS,
-        order="code asc",
+    logger.info(
+        "Plan de cuentas: campos=%s, dominio=%s",
+        fields_to_fetch, domain,
     )
+
+    try:
+        records = client.search_read(
+            "account.account",
+            domain=domain,
+            fields=fields_to_fetch,
+            order="code asc",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "search_read(account.account) falló con campos=%s: %s",
+            fields_to_fetch, exc,
+        )
+        # Último recurso: pedir solo id, code, name (siempre existen)
+        records = client.search_read(
+            "account.account",
+            domain=[("company_id", "in", list(company_ids))] if company_ids else [],
+            fields=["id", "code", "name"],
+            order="code asc",
+        )
+
     if not records:
-        return pd.DataFrame(columns=ACCOUNT_FIELDS)
+        return pd.DataFrame(columns=["id", "code", "name"])
 
     df = pd.DataFrame(records)
-    # Desempaquetar many2ones
-    for col in ("company_id", "currency_id"):
+
+    # Normalizar nombre del campo de tipo (account_type / user_type_id)
+    if "account_type" not in df.columns and "user_type_id" in df.columns:
+        df["account_type"] = df["user_type_id"].apply(
+            lambda v: _unpack_m2o(v)[1] if isinstance(v, list) else None
+        )
+
+    # Desempaquetar many2ones presentes
+    for col in ("company_id", "currency_id", "user_type_id"):
         if col in df.columns:
             df[col + "_name"] = df[col].apply(
                 lambda v: _unpack_m2o(v)[1] if isinstance(v, list) else None
@@ -915,6 +981,7 @@ def extract_chart_of_accounts(
             df[col] = df[col].apply(
                 lambda v: _unpack_m2o(v)[0] if isinstance(v, list) else None
             )
+
     # Primer dígito del código → grupo PUC colombiano
     df["puc_grupo"] = df["code"].astype(str).str[0]
     return df
@@ -943,14 +1010,26 @@ def extract_account_movements(
     if company_ids:
         domain.append(("company_id", "in", list(company_ids)))
 
-    fields = [
+    desired_fields = [
         "id", "account_id", "partner_id", "move_id",
         "date", "name", "ref",
         "debit", "credit", "balance",
         "company_id", "currency_id",
         "parent_state", "journal_id",
     ]
-    logger.info("Descargando account_movements con dominio: %s", domain)
+    # Filtrar a campos disponibles (defensivo contra versiones de Odoo)
+    try:
+        all_fields_meta = client.fields_get("account.move.line", attributes=["string"])
+        available = set(all_fields_meta.keys())
+        fields = [f for f in desired_fields if f in available]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "fields_get(account.move.line) falló: %s. Usando lista completa.",
+            exc,
+        )
+        fields = desired_fields
+
+    logger.info("Descargando account_movements con dominio: %s, campos=%s", domain, fields)
     records = client.search_read(
         "account.move.line",
         domain=domain,
