@@ -906,60 +906,70 @@ def extract_chart_of_accounts(
     """
     Trae el plan de cuentas (account.account) con código, nombre y tipo.
 
-    Robust contra versiones distintas de Odoo: verifica campos disponibles
-    vía fields_get antes de pedirlos. Si `account_type` no existe (versiones
-    viejas), cae a `user_type_id`. Si `deprecated` no existe, se omite el
-    filtro.
+    Estrategia defensiva: intenta progresivamente con varios sets de campos,
+    cayendo al mínimo (id, code, name) si los otros fallan. Compatible con
+    Odoo 13/14/15/16/17/18/19 community y enterprise.
     """
-    # 1. Resolver campos disponibles
-    try:
-        all_fields_meta = client.fields_get("account.account", attributes=["string"])
-        available = set(all_fields_meta.keys())
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "fields_get(account.account) falló: %s. Usando lista conservadora.",
-            exc,
+    # Niveles de fallback, de más rico a más mínimo
+    levels = [
+        # Nivel 1: rico, con todos los campos opcionales
+        ["id", "code", "name", "account_type", "company_id",
+         "currency_id", "deprecated", "reconcile"],
+        # Nivel 2: sin account_type (versiones viejas usan user_type_id)
+        ["id", "code", "name", "user_type_id", "company_id", "deprecated"],
+        # Nivel 3: sin filtros de tipo, solo lo básico + company
+        ["id", "code", "name", "company_id"],
+        # Nivel 4: mínimo absoluto (siempre existe en cualquier Odoo)
+        ["id", "code", "name"],
+    ]
+
+    domains = [
+        # Nivel 1: con deprecated y company_id
+        [("deprecated", "=", False)] + (
+            [("company_id", "in", list(company_ids))] if company_ids else []
+        ),
+        # Nivel 2: con deprecated y company_id
+        [("deprecated", "=", False)] + (
+            [("company_id", "in", list(company_ids))] if company_ids else []
+        ),
+        # Nivel 3: sin deprecated
+        [("company_id", "in", list(company_ids))] if company_ids else [],
+        # Nivel 4: sin nada
+        [],
+    ]
+
+    records = None
+    last_exc = None
+    used_level = 0
+    for i, (fields_try, domain_try) in enumerate(zip(levels, domains), start=1):
+        try:
+            logger.info(
+                "Plan de cuentas nivel %d: campos=%s domain=%s",
+                i, fields_try, domain_try,
+            )
+            records = client.search_read(
+                "account.account",
+                domain=domain_try,
+                fields=fields_try,
+                order="code asc",
+            )
+            used_level = i
+            break  # éxito
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logger.warning(
+                "Plan de cuentas nivel %d falló: %s. Probando siguiente nivel.",
+                i, exc,
+            )
+            continue
+
+    if records is None:
+        # Todos los niveles fallaron → re-lanzar el último error
+        raise last_exc if last_exc else RuntimeError(
+            "No se pudo cargar el plan de cuentas con ningún set de campos."
         )
-        available = set(ACCOUNT_FIELDS)
 
-    # Lista de campos deseados, filtrados por los que existen realmente
-    fields_to_fetch = [f for f in ACCOUNT_FIELDS if f in available]
-
-    # En versiones viejas account_type se llama user_type_id
-    if "account_type" not in available and "user_type_id" in available:
-        fields_to_fetch.append("user_type_id")
-
-    # 2. Construir dominio
-    domain: list = []
-    if "deprecated" in available:
-        domain.append(("deprecated", "=", False))
-    if company_ids:
-        domain.append(("company_id", "in", list(company_ids)))
-
-    logger.info(
-        "Plan de cuentas: campos=%s, dominio=%s",
-        fields_to_fetch, domain,
-    )
-
-    try:
-        records = client.search_read(
-            "account.account",
-            domain=domain,
-            fields=fields_to_fetch,
-            order="code asc",
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "search_read(account.account) falló con campos=%s: %s",
-            fields_to_fetch, exc,
-        )
-        # Último recurso: pedir solo id, code, name (siempre existen)
-        records = client.search_read(
-            "account.account",
-            domain=[("company_id", "in", list(company_ids))] if company_ids else [],
-            fields=["id", "code", "name"],
-            order="code asc",
-        )
+    logger.info("Plan de cuentas cargado en nivel %d: %d cuentas", used_level, len(records))
 
     if not records:
         return pd.DataFrame(columns=["id", "code", "name"])

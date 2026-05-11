@@ -237,16 +237,15 @@ def _fetch_facebook_posts(
     # IMPORTANTE: usar /published_posts (no /posts) para mejor cobertura.
     # comments.summary(total_count): pages_read_engagement bastá.
     # attachments: para clasificar tipo de post (foto/video/reel/álbum/etc.)
-    # insights: paid vs organic reach (requires ads_read or post-level analytics)
+    # NOTA: insights de post se piden APARTE (un campo embedded falla
+    # si alguna métrica no existe para algún post).
     fields = (
         "id,created_time,message,permalink_url,status_type,"
         "attachments{media_type,type,subattachments{media_type}},"
         "likes.summary(total_count).limit(0),"
         "comments.summary(total_count).limit(0),"
         "shares,"
-        "reactions.summary(total_count).limit(0),"
-        "insights.metric(post_impressions,post_impressions_paid,"
-        "post_impressions_organic_unique,post_impressions_paid_unique)"
+        "reactions.summary(total_count).limit(0)"
     )
     params = {
         "fields": fields,
@@ -321,21 +320,6 @@ def _fetch_facebook_posts(
         )
         # Clasificar tipo de post desde attachments + status_type
         tipo_post = _classify_facebook_post_type(p)
-        # Métricas paid vs organic per-post (insights edge)
-        paid_imp, paid_reach, total_imp = 0, 0, 0
-        insights_data = (p.get("insights") or {}).get("data") or []
-        for ins in insights_data:
-            name = ins.get("name", "")
-            values = ins.get("values") or []
-            if not values:
-                continue
-            value = values[0].get("value", 0) or 0
-            if name == "post_impressions":
-                total_imp = int(value or 0)
-            elif name == "post_impressions_paid":
-                paid_imp = int(value or 0)
-            elif name == "post_impressions_paid_unique":
-                paid_reach = int(value or 0)
         rows.append({
             "fecha": created,
             "hora": hora,
@@ -347,10 +331,10 @@ def _fetch_facebook_posts(
             "comentarios": comments_total,
             "compartidos": shares_total,
             "reacciones_total": reactions_total,
-            "impresiones_total": total_imp,
-            "impresiones_pagadas": paid_imp,
-            "alcance_pagado": paid_reach,
-            "es_pagado": paid_imp > 0,
+            "impresiones_total": 0,
+            "impresiones_pagadas": 0,
+            "alcance_pagado": 0,
+            "es_pagado": False,
         })
     if not rows:
         return pd.DataFrame(columns=[
@@ -385,6 +369,155 @@ def _fetch_facebook_posts_aggregated(
         "compartidos": "sum",
         "reacciones_total": "sum",
     })
+
+
+def fetch_meta_ads_insights(
+    date_from: date,
+    date_to: date,
+) -> dict:
+    """
+    Trae insights agregados de TODAS las campañas activas en el período.
+
+    Requiere permiso `ads_read`. Devuelve dict con keys:
+        - tiene_acceso: bool (False si no hay ads_read o no hay ad accounts)
+        - ad_accounts: lista de ad accounts encontradas
+        - resumen: dict con totales (spend, impressions, reach, clicks, cpc, ctr, cpm)
+        - por_account: lista de dicts con métricas por cuenta
+        - top_campañas: lista de top 10 campañas por gasto
+    """
+    cfg = get_secret_dict("meta") or {}
+    user_token = cfg.get("access_token")  # Page Token funciona si tiene ads_read
+    page_id = cfg.get("facebook_page_id")
+    if not user_token:
+        return {"tiene_acceso": False, "error": "No hay token configurado"}
+
+    # 1. Listar ad accounts del usuario
+    accounts_data = _try_get(
+        "/me/adaccounts",
+        {"fields": "id,name,account_status,currency,timezone_name", "limit": 25},
+        token=user_token,
+    )
+    if not accounts_data or not accounts_data.get("data"):
+        # Probar en el contexto del Business
+        accounts_data = _try_get(
+            f"/{page_id}/connected_instagram_account",
+            {"fields": "id"},
+            token=user_token,
+        )
+        return {
+            "tiene_acceso": False,
+            "error": (
+                "No se pudo listar ad accounts. Verifica que el token "
+                "tenga permiso ads_read y que tu usuario tenga acceso "
+                "a algún ad account."
+            ),
+        }
+
+    ad_accounts = accounts_data.get("data", [])
+
+    # 2. Para cada ad account activa, fetchear insights del período
+    since_str = str(date_from)
+    until_str = str(date_to)
+    resumen = {
+        "spend": 0, "impressions": 0, "reach": 0, "clicks": 0,
+        "cpc_promedio": 0, "ctr_promedio": 0, "cpm_promedio": 0,
+        "frequency_promedio": 0,
+        "n_accounts": 0,
+    }
+    por_account = []
+    top_campañas = []
+
+    for acc in ad_accounts:
+        acc_id = acc.get("id")  # formato: act_<id>
+        acc_name = acc.get("name", "Sin nombre")
+        currency = acc.get("currency", "USD")
+        if not acc_id:
+            continue
+
+        # Insights del ad account agregados
+        insights = _try_get(
+            f"/{acc_id}/insights",
+            {
+                "fields": "spend,impressions,reach,clicks,cpc,ctr,cpm,frequency",
+                "time_range": f'{{"since":"{since_str}","until":"{until_str}"}}',
+                "level": "account",
+            },
+            token=user_token,
+        )
+        if not insights or not insights.get("data"):
+            continue
+
+        for ins in insights.get("data", []):
+            spend = float(ins.get("spend", 0) or 0)
+            imps = int(float(ins.get("impressions", 0) or 0))
+            reach = int(float(ins.get("reach", 0) or 0))
+            clicks = int(float(ins.get("clicks", 0) or 0))
+            cpc = float(ins.get("cpc", 0) or 0)
+            ctr = float(ins.get("ctr", 0) or 0)
+            cpm = float(ins.get("cpm", 0) or 0)
+            freq = float(ins.get("frequency", 0) or 0)
+            por_account.append({
+                "account_name": acc_name,
+                "account_id": acc_id,
+                "currency": currency,
+                "spend": spend,
+                "impressions": imps,
+                "reach": reach,
+                "clicks": clicks,
+                "cpc": cpc,
+                "ctr": ctr,
+                "cpm": cpm,
+                "frequency": freq,
+            })
+            resumen["spend"] += spend
+            resumen["impressions"] += imps
+            resumen["reach"] += reach
+            resumen["clicks"] += clicks
+            resumen["n_accounts"] += 1
+
+        # Top campañas de esta account
+        camp_insights = _try_get(
+            f"/{acc_id}/insights",
+            {
+                "fields": "campaign_name,spend,impressions,reach,clicks,cpc,ctr,cpm",
+                "time_range": f'{{"since":"{since_str}","until":"{until_str}"}}',
+                "level": "campaign",
+                "limit": 50,
+            },
+            token=user_token,
+        )
+        if camp_insights:
+            for c in camp_insights.get("data", []):
+                top_campañas.append({
+                    "account": acc_name,
+                    "campaña": c.get("campaign_name", "Sin nombre"),
+                    "spend": float(c.get("spend", 0) or 0),
+                    "impressions": int(float(c.get("impressions", 0) or 0)),
+                    "reach": int(float(c.get("reach", 0) or 0)),
+                    "clicks": int(float(c.get("clicks", 0) or 0)),
+                    "cpc": float(c.get("cpc", 0) or 0),
+                    "ctr": float(c.get("ctr", 0) or 0),
+                    "cpm": float(c.get("cpm", 0) or 0),
+                })
+
+    # Calcular promedios ponderados
+    if resumen["clicks"] > 0:
+        resumen["cpc_promedio"] = resumen["spend"] / resumen["clicks"]
+    if resumen["impressions"] > 0:
+        resumen["ctr_promedio"] = (resumen["clicks"] / resumen["impressions"]) * 100
+        resumen["cpm_promedio"] = (resumen["spend"] / resumen["impressions"]) * 1000
+
+    # Sort top campaigns by spend
+    top_campañas.sort(key=lambda x: x["spend"], reverse=True)
+
+    return {
+        "tiene_acceso": True,
+        "ad_accounts": ad_accounts,
+        "resumen": resumen,
+        "por_account": por_account,
+        "top_campañas": top_campañas[:10],
+        "currency": ad_accounts[0].get("currency", "USD") if ad_accounts else "USD",
+    }
 
 
 def fetch_meta_facebook_top_posts(

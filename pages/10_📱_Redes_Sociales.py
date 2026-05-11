@@ -21,6 +21,7 @@ import streamlit as st
 from src.auth import logout_button, require_auth
 from src.social_connectors import (
     fetch_ga4_data,
+    fetch_meta_ads_insights,
     fetch_meta_facebook_data,
     fetch_meta_facebook_monthly_evolution,
     fetch_meta_facebook_top_posts,
@@ -423,59 +424,86 @@ def _render_breakdown_by_type(top_df: pd.DataFrame, color: str, title: str):
     )
 
 
-def _render_paid_summary(top_df: pd.DataFrame, color: str, title: str):
-    """Resume métricas de posts pagados vs orgánicos."""
-    if top_df is None or top_df.empty:
+def _render_ads_panel(ads_data: dict | None, color: str):
+    """Panel completo de Marketing API: gasto, CPC, CTR, top campañas."""
+    if not ads_data:
         return
-    if "impresiones_pagadas" not in top_df.columns:
+    if not ads_data.get("tiene_acceso"):
+        st.info(
+            "ℹ️ **Marketing API no disponible**: "
+            f"{ads_data.get('error', 'Verifica el permiso ads_read en el token.')}"
+        )
         return
 
-    paid_df = top_df[top_df.get("es_pagado", False) == True]
-    organic_df = top_df[top_df.get("es_pagado", False) != True]
+    resumen = ads_data.get("resumen", {})
+    if resumen.get("spend", 0) == 0:
+        st.info(
+            "ℹ️ No se encontró gasto en pauta para el período seleccionado. "
+            "Si tuviste campañas activas, verifica que el ad account esté "
+            "vinculado correctamente a tu usuario."
+        )
+        return
 
-    n_paid = len(paid_df)
-    n_organic = len(organic_df)
-    if n_paid == 0:
-        return  # Si no hay posts pagados, no mostramos sección
+    currency = ads_data.get("currency", "USD")
+    sym = "$" if currency in ("USD", "COP", "MXN", "ARS") else currency + " "
 
-    st.markdown(f"##### 💰 Posts pagados vs orgánicos — {title}")
-
-    paid_imp = int(paid_df["impresiones_pagadas"].sum())
-    paid_reach = int(paid_df["alcance_pagado"].sum())
-    paid_eng = int(paid_df["engagement"].sum())
-    organic_imp = int(organic_df.get("impresiones_total", pd.Series([0])).sum())
-    organic_eng = int(organic_df["engagement"].sum())
+    st.markdown("##### 💰 Pauta de Meta Ads — Resumen del período")
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("📢 Posts pagados", f"{n_paid:,}", help="Posts que recibieron pauta")
-    c2.metric("🆓 Posts orgánicos", f"{n_organic:,}")
-    c3.metric("👁️ Impresiones pagadas", f"{paid_imp:,}")
-    c4.metric("🎯 Alcance pagado", f"{paid_reach:,}")
+    c1.metric("💵 Gasto total", f"{sym}{resumen['spend']:,.0f} {currency}")
+    c2.metric("👁️ Impresiones", f"{resumen['impressions']:,}")
+    c3.metric("🎯 Alcance", f"{resumen['reach']:,}")
+    c4.metric("🖱️ Clicks", f"{resumen['clicks']:,}")
 
-    # Engagement promedio comparativo
-    avg_paid = paid_eng / n_paid if n_paid else 0
-    avg_organic = organic_eng / n_organic if n_organic else 0
     c5, c6, c7, c8 = st.columns(4)
-    c5.metric("❤️ Eng. avg pagado", f"{avg_paid:,.0f}")
-    c6.metric("❤️ Eng. avg orgánico", f"{avg_organic:,.0f}")
-    if avg_organic > 0:
-        ratio = avg_paid / avg_organic
-        c7.metric(
-            "📊 Multiplicador", f"{ratio:.1f}×",
-            help="Ratio engagement promedio pagado / orgánico"
-        )
-    if paid_imp > 0:
-        # Estimación de "CPM-equivalente" no real pero útil como benchmark
-        c8.metric(
-            "📈 % impresiones pagas",
-            f"{(paid_imp / max(paid_imp + organic_imp, 1)) * 100:.1f}%",
+    c5.metric("💲 CPC", f"{sym}{resumen['cpc_promedio']:.2f}", help="Costo por click")
+    c6.metric("📊 CTR", f"{resumen['ctr_promedio']:.2f}%", help="Click-through rate")
+    c7.metric("📈 CPM", f"{sym}{resumen['cpm_promedio']:.2f}", help="Costo por mil impresiones")
+    c8.metric(
+        "🎯 # Cuentas", f"{resumen['n_accounts']:,}",
+        help="Ad accounts con datos en el período"
+    )
+
+    # Por ad account
+    por_account = ads_data.get("por_account", [])
+    if len(por_account) > 1:
+        st.markdown("##### 📋 Por Ad Account")
+        df_accs = pd.DataFrame(por_account)
+        st.dataframe(
+            df_accs,
+            column_config={
+                "spend": st.column_config.NumberColumn("Gasto", format=f"{sym}%,.2f"),
+                "impressions": st.column_config.NumberColumn("Imp.", format="%,d"),
+                "reach": st.column_config.NumberColumn("Alcance", format="%,d"),
+                "clicks": st.column_config.NumberColumn("Clicks", format="%,d"),
+                "cpc": st.column_config.NumberColumn("CPC", format=f"{sym}%.2f"),
+                "ctr": st.column_config.NumberColumn("CTR", format="%.2f%%"),
+                "cpm": st.column_config.NumberColumn("CPM", format=f"{sym}%.2f"),
+                "frequency": st.column_config.NumberColumn("Freq.", format="%.2f"),
+            },
+            use_container_width=True, hide_index=True,
         )
 
-    st.info(
-        "ℹ️ **Nota sobre métricas de pauta**: Para ver gasto, CPC, CTR y "
-        "ROAS en detalle, necesitamos agregar el permiso `ads_read` al token "
-        "de Meta. Pídeme y te guío en hacerlo (5 min)."
-    )
+    # Top campañas
+    top = ads_data.get("top_campañas", [])
+    if top:
+        st.markdown("##### 🔥 Top campañas por gasto")
+        df_top = pd.DataFrame(top)
+        st.dataframe(
+            df_top,
+            column_config={
+                "campaña": st.column_config.TextColumn("Campaña", width="large"),
+                "account": st.column_config.TextColumn("Account", width="medium"),
+                "spend": st.column_config.NumberColumn("Gasto", format=f"{sym}%,.2f"),
+                "impressions": st.column_config.NumberColumn("Imp.", format="%,d"),
+                "reach": st.column_config.NumberColumn("Alcance", format="%,d"),
+                "clicks": st.column_config.NumberColumn("Clicks", format="%,d"),
+                "cpc": st.column_config.NumberColumn("CPC", format=f"{sym}%.2f"),
+                "ctr": st.column_config.NumberColumn("CTR", format="%.2f%%"),
+                "cpm": st.column_config.NumberColumn("CPM", format=f"{sym}%.2f"),
+            },
+            use_container_width=True, hide_index=True,
+        )
 
 
 def _render_recommendations(
@@ -732,6 +760,15 @@ def _platform_tab_meta(
                     st.session_state["social_data"][platform_key] = df
                     st.session_state["social_data"][f"{platform_key}_prev"] = df_prev
                     st.session_state["social_data"][f"{platform_key}_top"] = top
+                    # Marketing API (solo Facebook)
+                    if platform_key == "facebook":
+                        try:
+                            ads = fetch_meta_ads_insights(
+                                fecha_desde, fecha_hasta
+                            )
+                            st.session_state["social_data"]["facebook_ads"] = ads
+                        except Exception:  # noqa: BLE001
+                            st.session_state["social_data"]["facebook_ads"] = None
                     st.success(
                         f"✅ Listo: {len(df):,} días · {len(top):,} posts del período."
                     )
@@ -792,10 +829,12 @@ def _platform_tab_meta(
         _render_breakdown_by_type(top, color, title)
         st.markdown("---")
 
-    # 6. Posts pagados vs orgánicos
-    if top is not None and not top.empty:
-        _render_paid_summary(top, color, title)
-        st.markdown("---")
+    # 6. Marketing API: pauta, CPC, CTR, top campañas (solo FB)
+    if platform_key == "facebook":
+        ads_data = st.session_state["social_data"].get("facebook_ads")
+        if ads_data is not None:
+            _render_ads_panel(ads_data, color)
+            st.markdown("---")
 
     # 7. Top posts
     _render_top_posts(top, title)
