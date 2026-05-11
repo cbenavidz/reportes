@@ -140,6 +140,50 @@ st.success(
     f"✅ {len(moves):,} movimientos · {len(chart):,} cuentas en el plan."
 )
 
+# Diagnóstico (expandible)
+with st.expander("🔍 Diagnóstico de datos cargados", expanded=False):
+    cdiag1, cdiag2 = st.columns(2)
+
+    with cdiag1:
+        st.markdown("**Plan de cuentas (chart)**")
+        st.write(f"Columnas: `{list(chart.columns)}`")
+        st.write(f"Total cuentas: {len(chart):,}")
+        if not chart.empty and "code" in chart.columns:
+            st.write("Primeras 5 cuentas:")
+            st.dataframe(chart.head(5), hide_index=True)
+            # Distribución por primer dígito
+            chart["_d1"] = chart["code"].astype(str).str[:1]
+            dist = chart["_d1"].value_counts().sort_index()
+            st.write(f"Distribución por primer dígito del código:")
+            st.write(dist.to_dict())
+
+    with cdiag2:
+        st.markdown("**Movimientos contables (moves)**")
+        st.write(f"Columnas: `{list(moves.columns)}`")
+        st.write(f"Total movimientos: {len(moves):,}")
+        if not moves.empty:
+            st.write("Primeros 3 movimientos:")
+            st.dataframe(moves.head(3), hide_index=True)
+            if "date" in moves.columns:
+                st.write(
+                    f"Rango fechas: {moves['date'].min()} → {moves['date'].max()}"
+                )
+            if "account_id" in moves.columns:
+                st.write(
+                    f"Cuentas únicas usadas en moves: "
+                    f"{moves['account_id'].nunique():,}"
+                )
+                # Verificar match con chart
+                if "id" in chart.columns:
+                    chart_ids = set(chart["id"].dropna().astype(int))
+                    move_account_ids = set(
+                        moves["account_id"].dropna().astype(int)
+                    )
+                    matched = chart_ids & move_account_ids
+                    unmatched = move_account_ids - chart_ids
+                    st.write(f"IDs que matchean entre chart y moves: {len(matched):,}")
+                    st.write(f"IDs en moves SIN match en chart: {len(unmatched):,}")
+
 
 def _money(v: float) -> str:
     return f"${v:,.0f}"
