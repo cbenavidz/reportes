@@ -184,6 +184,46 @@ with st.expander("🔍 Diagnóstico de datos cargados", expanded=False):
                     st.write(f"IDs que matchean entre chart y moves: {len(matched):,}")
                     st.write(f"IDs en moves SIN match en chart: {len(unmatched):,}")
 
+    # Diagnóstico CRÍTICO: códigos de cuentas USADAS en moves con suma
+    st.markdown("---")
+    st.markdown("**🎯 Cuentas USADAS en movimientos (con código y saldo total)**")
+    if "id" in chart.columns and "account_id" in moves.columns:
+        chart_min = chart[["id", "code", "name"]].rename(columns={"id": "account_id"})
+        moves_with_code = moves.merge(chart_min, on="account_id", how="left")
+        if not moves_with_code.empty:
+            # Saldo total por cuenta
+            moves_with_code["saldo_neto"] = (
+                moves_with_code.get("debit", 0).fillna(0)
+                - moves_with_code.get("credit", 0).fillna(0)
+            )
+            por_cuenta = moves_with_code.groupby(
+                ["code", "name"], as_index=False, dropna=False
+            ).agg(
+                n_moves=("id", "count") if "id" in moves_with_code.columns else ("debit", "count"),
+                debit=("debit", "sum"),
+                credit=("credit", "sum"),
+                saldo_neto=("saldo_neto", "sum"),
+            )
+            # Mostrar top 30 cuentas por saldo absoluto
+            por_cuenta["abs_saldo"] = por_cuenta["saldo_neto"].abs()
+            top30 = por_cuenta.sort_values("abs_saldo", ascending=False).head(30)
+            st.write("Top 30 cuentas por saldo absoluto:")
+            st.dataframe(
+                top30[["code", "name", "n_moves", "debit", "credit", "saldo_neto"]],
+                use_container_width=True, hide_index=True, height=400,
+            )
+
+            # Distribución por dígito normalizado
+            from src.financial_statements import _normalize_code
+            por_cuenta["code_norm"] = por_cuenta["code"].apply(_normalize_code)
+            por_cuenta["first_digit_norm"] = por_cuenta["code_norm"].astype(str).str[:1]
+            dist_norm = por_cuenta.groupby("first_digit_norm").agg(
+                n_cuentas=("code", "count"),
+                saldo_total=("saldo_neto", "sum"),
+            ).reset_index()
+            st.write("**Distribución de cuentas USADAS por primer dígito normalizado:**")
+            st.dataframe(dist_norm, hide_index=True)
+
 
 def _money(v: float) -> str:
     return f"${v:,.0f}"
