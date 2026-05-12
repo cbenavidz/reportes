@@ -109,6 +109,54 @@ if kpis.empty:
     st.stop()
 
 # ---------------------------------------------------------------------------
+# Filtro multi-vendedor (parte superior)
+# ---------------------------------------------------------------------------
+vendedores_disponibles = sorted(kpis["user_name"].dropna().unique().tolist())
+
+# Estado en sesión para permitir "Seleccionar todos / Ninguno"
+_VEND_KEY = "kpi_vendedor_seleccion"
+if _VEND_KEY not in st.session_state:
+    st.session_state[_VEND_KEY] = vendedores_disponibles
+
+col_sel1, col_sel2, col_sel3 = st.columns([3, 1, 1])
+with col_sel1:
+    vendedores_seleccionados = st.multiselect(
+        "🎯 Filtrar por vendedor(es)",
+        options=vendedores_disponibles,
+        default=st.session_state[_VEND_KEY],
+        key=f"{_VEND_KEY}_widget",
+        help=(
+            "Selecciona uno o varios vendedores para enfocarte en su análisis. "
+            "Por defecto se muestran todos."
+        ),
+    )
+with col_sel2:
+    if st.button("✅ Todos", use_container_width=True, key="vend_btn_todos"):
+        st.session_state[_VEND_KEY] = vendedores_disponibles
+        st.rerun()
+with col_sel3:
+    if st.button("❌ Ninguno", use_container_width=True, key="vend_btn_ninguno"):
+        st.session_state[_VEND_KEY] = []
+        st.rerun()
+
+# Persistir selección actual
+st.session_state[_VEND_KEY] = vendedores_seleccionados
+
+# Aplicar filtro
+if vendedores_seleccionados:
+    kpis = kpis[kpis["user_name"].isin(vendedores_seleccionados)].reset_index(drop=True)
+else:
+    st.info(
+        "ℹ️ No has seleccionado ningún vendedor. Usa **Todos** para verlos a todos "
+        "o elige los específicos arriba."
+    )
+    st.stop()
+
+if kpis.empty:
+    st.info("No hay vendedores que cumplan la selección.")
+    st.stop()
+
+# ---------------------------------------------------------------------------
 # Resumen global
 # ---------------------------------------------------------------------------
 st.markdown("---")
