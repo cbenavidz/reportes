@@ -446,24 +446,25 @@ def load_account_movements(
 def load_account_balances_aggregated(
     date_to: str,
     company_ids: tuple[int, ...] | None = None,
+    date_from: str | None = None,
     _cache_v: int = ACCOUNT_MOVEMENTS_CACHE_VERSION,
 ) -> "pd.DataFrame":
     """
-    Saldo agregado por cuenta hasta `date_to`. Usa `read_group` de Odoo
-    para hacer la suma en el SERVIDOR (mucho más rápido que traer líneas
-    individuales). Devuelve DataFrame con account_id, debit_sum, credit_sum.
+    Saldo agregado por cuenta usando `read_group` server-side.
 
-    Ideal para Balance General que necesita saldo histórico completo.
+    Si se pasa `date_from`, agrega solo movimientos del rango (para P&L).
+    Si no, agrega TODO hasta date_to (para Balance General histórico).
     """
     client = get_odoo_client()
     domain: list = [
         ("parent_state", "=", "posted"),
         ("date", "<=", date_to),
     ]
+    if date_from:
+        domain.append(("date", ">=", date_from))
     if company_ids:
         domain.append(("company_id", "in", list(company_ids)))
     try:
-        # read_group hace SUM(debit), SUM(credit) en SQL — muy rápido
         result = client.execute_kw(
             "account.move.line", "read_group",
             [domain, ["account_id", "debit:sum", "credit:sum"], ["account_id"]],
@@ -485,6 +486,85 @@ def load_account_balances_aggregated(
             "credit": float(r.get("credit", 0) or 0),
         })
     return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=900, show_spinner="Calculando saldos mensuales...")
+def load_account_balances_monthly(
+    date_from: str,
+    date_to: str,
+    company_ids: tuple[int, ...] | None = None,
+    _cache_v: int = ACCOUNT_MOVEMENTS_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """
+    Saldo agregado por cuenta Y por MES en el rango. Usa read_group con
+    groupby por mes — server-side, muy rápido.
+
+    Ideal para Estado de Resultados mensual (Comparativos tab).
+    """
+    client = get_odoo_client()
+    domain: list = [
+        ("parent_state", "=", "posted"),
+        ("date", ">=", date_from),
+        ("date", "<=", date_to),
+    ]
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
+    try:
+        result = client.execute_kw(
+            "account.move.line", "read_group",
+            [
+                domain,
+                ["account_id", "date", "debit:sum", "credit:sum"],
+                ["account_id", "date:month"],
+            ],
+            {"lazy": False},
+        )
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame(columns=["account_id", "mes", "debit", "credit"])
+
+    rows = []
+    for r in result:
+        acc = r.get("account_id")
+        if isinstance(acc, list) and acc:
+            acc_id = acc[0]
+        else:
+            acc_id = acc
+        mes_str = r.get("date:month")  # formato "January 2026" o similar
+        rows.append({
+            "account_id": acc_id,
+            "mes": mes_str,
+            "debit": float(r.get("debit", 0) or 0),
+            "credit": float(r.get("credit", 0) or 0),
+        })
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(ttl=900, show_spinner="Cargando movimientos de caja...")
+def load_cash_movements_only(
+    date_from: str,
+    date_to: str,
+    company_ids: tuple[int, ...] | None = None,
+    cash_account_ids: tuple[int, ...] | None = None,
+    _cache_v: int = ACCOUNT_MOVEMENTS_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """
+    Trae SOLO movimientos de las cuentas de disponible (caja/bancos).
+    Mucho más rápido que cargar todas las líneas. Usado para Flujo de Efectivo.
+    """
+    from .extractor import extract_account_movements
+    client = get_odoo_client()
+    df_date = pd.to_datetime(date_from).date()
+    dt_date = pd.to_datetime(date_to).date()
+
+    moves = extract_account_movements(
+        client,
+        date_from=df_date,
+        date_to=dt_date,
+        company_ids=list(company_ids) if company_ids else None,
+    )
+    if cash_account_ids and not moves.empty and "account_id" in moves.columns:
+        moves = moves[moves["account_id"].isin(list(cash_account_ids))]
+    return moves
 
 
 def test_connection_summary() -> dict:

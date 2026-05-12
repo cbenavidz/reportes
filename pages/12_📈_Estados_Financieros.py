@@ -17,10 +17,12 @@ import streamlit as st
 
 from src.auth import logout_button, require_auth
 from src.data_loader import (
-    compute_full_analysis,
     load_account_balances_aggregated,
+    load_account_balances_monthly,
     load_account_movements,
+    load_cash_movements_only,
     load_chart_of_accounts,
+    load_companies,
 )
 from src.ui_components import render_company_context, render_sidebar_filters
 from src.financial_statements import (
@@ -111,51 +113,54 @@ fecha_hasta_prev = fecha_desde - timedelta(days=1)
 load_date_from = fecha_desde_prev.isoformat()
 load_date_to = fecha_hasta.isoformat()
 
-with st.spinner(
-    f"Cargando movimientos del período ({fecha_desde_prev} → {fecha_hasta})..."
-):
+with st.spinner("Cargando plan de cuentas..."):
     try:
         chart = load_chart_of_accounts(
             company_ids=filters["company_ids"],
         )
     except Exception as exc:  # noqa: BLE001
         st.error(
-            f"❌ Error cargando plan de cuentas:\n\n```\n{exc}\n```\n\n"
-            "Esto indica un problema con permisos o estructura de tu Odoo. "
-            "Reporta este mensaje para resolver."
+            f"❌ Error cargando plan de cuentas:\n\n```\n{exc}\n```"
         )
         st.stop()
-    moves = load_account_movements(
-        date_from=load_date_from,
-        date_to=load_date_to,
+
+# OPTIMIZACIÓN: usar read_group server-side para TODO en lugar de traer
+# líneas individuales. Esto reduce el tiempo de minutos a segundos.
+with st.spinner("Calculando saldos del período..."):
+    # Saldos del período actual (para P&L)
+    balances_periodo = load_account_balances_aggregated(
+        date_from=fecha_desde.isoformat(),
+        date_to=fecha_hasta.isoformat(),
         company_ids=filters["company_ids"],
     )
-
-# Para el Balance General necesitamos saldos HISTÓRICOS (todo lo anterior).
-# Usamos read_group de Odoo (suma server-side, muy rápido) en vez de
-# traer todas las líneas.
-with st.spinner("Calculando saldos históricos para Balance..."):
+    # Saldos del período anterior (para comparativa)
+    balances_periodo_prev = load_account_balances_aggregated(
+        date_from=fecha_desde_prev.isoformat(),
+        date_to=fecha_hasta_prev.isoformat(),
+        company_ids=filters["company_ids"],
+    )
+    # Saldos HISTÓRICOS acumulados (para Balance General)
     balances_hist = load_account_balances_aggregated(
         date_to=fecha_hasta.isoformat(),
         company_ids=filters["company_ids"],
     )
 
+# Para flujo de efectivo necesitamos líneas individuales, pero SOLO de
+# cuentas de caja/bancos. Las identificamos del chart (PUC 11xx o
+# account_type=asset_cash) y filtramos.
+moves = pd.DataFrame()  # placeholder, se carga solo si se va a Flujo
+
 if moves is None or moves.empty:
     st.error("No se pudieron cargar movimientos contables.")
     st.stop()
 
-# Banner de empresa
-data_meta = compute_full_analysis(
-    months_back=12,
-    rotation_period_days=filters["period_days"],
-    company_ids=filters["company_ids"],
-    exclude_cash_sales=filters["exclude_cash_sales"],
-    analysis_window_days=filters.get("analysis_window_days"),
-)
-render_company_context(data_meta.get("companies"), filters["company_ids"])
+# Banner de empresa (carga ligera, solo lista de empresas)
+companies_df = load_companies()
+render_company_context(companies_df, filters["company_ids"])
 
 st.success(
-    f"✅ {len(moves):,} movimientos · {len(chart):,} cuentas en el plan."
+    f"✅ {len(chart):,} cuentas en el plan · "
+    f"{len(balances_periodo):,} cuentas con movimiento en el período"
 )
 
 # Diagnóstico (expandible)
@@ -274,13 +279,16 @@ with tab_pnl:
     st.markdown("## 📊 Estado de Resultados")
     st.caption(f"Período: {fecha_desde} → {fecha_hasta}")
 
-    pnl = compute_income_statement(moves, chart, fecha_desde, fecha_hasta)
+    pnl = compute_income_statement(
+        moves, chart, fecha_desde, fecha_hasta,
+        balances_aggregated=balances_periodo,
+    )
 
     # Período anterior (mismo número de días) para comparativa
-    periodo_dias = (fecha_hasta - fecha_desde).days + 1
-    fecha_desde_prev = fecha_desde - timedelta(days=periodo_dias)
-    fecha_hasta_prev = fecha_desde - timedelta(days=1)
-    pnl_prev = compute_income_statement(moves, chart, fecha_desde_prev, fecha_hasta_prev)
+    pnl_prev = compute_income_statement(
+        moves, chart, fecha_desde_prev, fecha_hasta_prev,
+        balances_aggregated=balances_periodo_prev,
+    )
 
     def _delta(actual: float, anterior: float) -> str | None:
         if not anterior:
@@ -520,11 +528,32 @@ with tab_ktno:
 with tab_flujo:
     st.markdown("## 💰 Flujo de Efectivo")
     st.caption(
-        f"Movimientos de cuentas de disponible (PUC 11xx) entre "
+        f"Movimientos de cuentas de disponible (caja/bancos) entre "
         f"{fecha_desde} y {fecha_hasta}."
     )
 
-    cf = compute_cash_flow(moves, chart, fecha_desde, fecha_hasta)
+    # OPTIMIZACIÓN: solo cargar líneas de cuentas de caja/bancos
+    # Identificamos esas cuentas del chart (account_type=asset_cash o PUC 11)
+    from src.financial_statements import enrich_chart_with_puc
+    chart_e = enrich_chart_with_puc(chart)
+    cash_account_ids: list[int] = []
+    if "puc_subgroup" in chart_e.columns:
+        mask = chart_e["puc_subgroup"].astype(str) == "11"
+        cash_account_ids = chart_e.loc[mask, "id"].dropna().astype(int).tolist()
+    if "account_type" in chart_e.columns:
+        mask = chart_e["account_type"] == "asset_cash"
+        cash_account_ids += chart_e.loc[mask, "id"].dropna().astype(int).tolist()
+    cash_account_ids = list(set(cash_account_ids))
+
+    with st.spinner(f"Cargando movimientos de {len(cash_account_ids)} cuentas de caja..."):
+        cash_moves = load_cash_movements_only(
+            date_from=fecha_desde.isoformat(),
+            date_to=fecha_hasta.isoformat(),
+            company_ids=filters["company_ids"],
+            cash_account_ids=tuple(cash_account_ids) if cash_account_ids else None,
+        )
+
+    cf = compute_cash_flow(cash_moves, chart, fecha_desde, fecha_hasta)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("📥 Entradas", _money(cf["entradas"]))
@@ -607,7 +636,10 @@ with tab_gastos:
     st.markdown("## 💸 Análisis de Gastos")
     st.caption(f"Período: {fecha_desde} → {fecha_hasta}")
 
-    exp = compute_expenses_breakdown(moves, chart, fecha_desde, fecha_hasta)
+    exp = compute_expenses_breakdown(
+        moves, chart, fecha_desde, fecha_hasta,
+        balances_aggregated=balances_periodo,
+    )
 
     if exp["total_gastos"] == 0:
         st.info("No hay gastos en el período seleccionado.")
