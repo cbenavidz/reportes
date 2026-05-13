@@ -77,7 +77,7 @@ class OdooClient:
         )
     """
 
-    BATCH_SIZE = 500  # Tamaño de página para evitar timeouts
+    BATCH_SIZE = 2000  # Tamaño de página (más grande = menos round-trips, ~4x más rápido)
 
     def __init__(self, credentials: OdooCredentials) -> None:
         self.credentials = credentials

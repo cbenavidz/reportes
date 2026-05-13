@@ -83,9 +83,15 @@ def render_sidebar_filters() -> dict:
             "Meses de histórico a cargar",
             min_value=3,
             max_value=36,
-            value=12,
+            value=6,
             step=3,
-            help="Cuánto histórico descargar de Odoo para calcular comportamiento de pago.",
+            help=(
+                "Cuánto histórico descargar de Odoo. Menos meses = más rápido.\n\n"
+                "• 3 meses: muy rápido (~15s) - bueno para revisar cartera actual\n"
+                "• 6 meses: rápido (~30s) - bueno para tendencia trimestral\n"
+                "• 12 meses: completo (~1-2 min) - bueno para anualizaciones\n"
+                "• 24-36 meses: lento (~3-5 min) - solo para análisis profundo"
+            ),
         )
         period_label = st.selectbox(
             "Período para rotación",
