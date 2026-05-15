@@ -243,8 +243,25 @@ def compute_negative_margin_products(
     fecha_desde: date,
     fecha_hasta: date,
 ) -> pd.DataFrame:
-    """Productos vendidos con margen negativo (alerta)."""
+    """
+    Productos vendidos REALMENTE por debajo del costo (alerta).
+
+    IMPORTANTE: solo cuenta líneas de FACTURA (out_invoice), NO notas
+    crédito. Una NC tiene ventas y costo negativos, lo que genera un
+    "margen negativo" falso que distorsiona el reporte.
+
+    Filtro: solo productos con
+      - ventas netas POSITIVAS (se vendieron de verdad)
+      - margen NEGATIVO (el costo superó el precio de venta)
+      - al menos 1 unidad vendida
+    """
     sub = _filter_lines(lines, fecha_desde, fecha_hasta)
+    if sub.empty:
+        return pd.DataFrame()
+
+    # Excluir notas crédito — solo facturas de venta reales
+    if "move_type" in sub.columns:
+        sub = sub[sub["move_type"] == "out_invoice"]
     if sub.empty:
         return pd.DataFrame()
 
@@ -257,7 +274,13 @@ def compute_negative_margin_products(
     out["margen_pct"] = out.apply(
         lambda r: _safe_pct(r["margen"], r["ventas"]), axis=1
     )
-    return out[out["margen"] < 0].sort_values("margen").reset_index(drop=True)
+    # Solo productos con ventas positivas Y margen negativo Y unidades > 0
+    out = out[
+        (out["ventas"] > 0)
+        & (out["margen"] < 0)
+        & (out["unidades"] > 0)
+    ]
+    return out.sort_values("margen").reset_index(drop=True)
 
 
 # =============================================================================
