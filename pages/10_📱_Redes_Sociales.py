@@ -998,10 +998,13 @@ with tab_cmp:
         "Métricas combinadas de las plataformas con datos cargados."
     )
 
+    # IMPORTANTE: verificar k PRIMERO y que sea DataFrame, porque
+    # social_data ahora tiene entries que NO son DataFrames (ej:
+    # facebook_ads es un dict, *_prev y *_top son DataFrames auxiliares).
     cargadas = [
         (k, v) for k, v in st.session_state["social_data"].items()
-        if v is not None and not v.empty
-        and k in ("facebook", "instagram", "tiktok", "ga4")
+        if k in ("facebook", "instagram", "tiktok", "ga4")
+        and isinstance(v, pd.DataFrame) and not v.empty
     ]
     if not cargadas:
         st.info(
