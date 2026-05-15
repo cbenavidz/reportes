@@ -147,11 +147,18 @@ with st.spinner("Calculando saldos del período..."):
 
 # Para flujo de efectivo necesitamos líneas individuales, pero SOLO de
 # cuentas de caja/bancos. Las identificamos del chart (PUC 11xx o
-# account_type=asset_cash) y filtramos.
-moves = pd.DataFrame()  # placeholder, se carga solo si se va a Flujo
+# account_type=asset_cash) y filtramos. `moves` queda vacío aquí — la
+# pestaña de Flujo lo carga bajo demanda.
+moves = pd.DataFrame()
 
-if moves is None or moves.empty:
-    st.error("No se pudieron cargar movimientos contables.")
+# Validación: si no hay NI plan de cuentas NI balances, no hay datos.
+if (chart is None or chart.empty) and (
+    balances_periodo is None or balances_periodo.empty
+) and (balances_hist is None or balances_hist.empty):
+    st.error(
+        "No se pudieron cargar datos contables. Verifica la conexión con "
+        "Odoo y que el período tenga movimientos."
+    )
     st.stop()
 
 # Banner de empresa (carga ligera, solo lista de empresas)
@@ -160,7 +167,8 @@ render_company_context(companies_df, filters["company_ids"])
 
 st.success(
     f"✅ {len(chart):,} cuentas en el plan · "
-    f"{len(balances_periodo):,} cuentas con movimiento en el período"
+    f"{len(balances_periodo):,} cuentas con movimiento en el período · "
+    f"{len(balances_hist):,} cuentas en el balance histórico"
 )
 
 # Diagnóstico (expandible)
@@ -181,74 +189,65 @@ with st.expander("🔍 Diagnóstico de datos cargados", expanded=False):
             st.write(dist.to_dict())
 
     with cdiag2:
-        st.markdown("**Movimientos contables (moves)**")
-        st.write(f"Columnas: `{list(moves.columns)}`")
-        st.write(f"Total movimientos: {len(moves):,}")
-        if not moves.empty:
-            st.write("Primeros 3 movimientos:")
-            st.dataframe(moves.head(3), hide_index=True)
-            if "date" in moves.columns:
-                st.write(
-                    f"Rango fechas: {moves['date'].min()} → {moves['date'].max()}"
-                )
-            if "account_id" in moves.columns:
-                st.write(
-                    f"Cuentas únicas usadas en moves: "
-                    f"{moves['account_id'].nunique():,}"
-                )
-                # Verificar match con chart
-                if "id" in chart.columns:
-                    chart_ids = set(chart["id"].dropna().astype(int))
-                    move_account_ids = set(
-                        moves["account_id"].dropna().astype(int)
-                    )
-                    matched = chart_ids & move_account_ids
-                    unmatched = move_account_ids - chart_ids
-                    st.write(f"IDs que matchean entre chart y moves: {len(matched):,}")
-                    st.write(f"IDs en moves SIN match en chart: {len(unmatched):,}")
-
-    # Diagnóstico CRÍTICO: códigos de cuentas USADAS en moves con suma
-    st.markdown("---")
-    st.markdown("**🎯 Cuentas USADAS en movimientos (con código y saldo total)**")
-    if "id" in chart.columns and "account_id" in moves.columns:
-        # Renombrar columnas para evitar colisión con `name` de moves
-        chart_min = chart[["id", "code", "name"]].rename(
-            columns={"id": "account_id", "code": "acc_code", "name": "acc_name"}
+        st.markdown("**Balances agregados (read_group server-side)**")
+        st.write(
+            f"Cuentas con movimiento en el período: {len(balances_periodo):,}"
         )
-        moves_with_code = moves.merge(chart_min, on="account_id", how="left")
-        if not moves_with_code.empty:
-            # Saldo total por cuenta
-            moves_with_code["saldo_neto"] = (
-                moves_with_code.get("debit", 0).fillna(0)
-                - moves_with_code.get("credit", 0).fillna(0)
+        st.write(
+            f"Cuentas en el balance histórico: {len(balances_hist):,}"
+        )
+        if not balances_periodo.empty:
+            st.write("Muestra de balances del período:")
+            st.dataframe(balances_periodo.head(5), hide_index=True)
+
+    # Diagnóstico: cuentas con saldo en el período, con su código PUC
+    st.markdown("---")
+    st.markdown("**🎯 Cuentas con saldo en el período (con código y clasificación)**")
+    if (
+        "id" in chart.columns
+        and balances_periodo is not None
+        and not balances_periodo.empty
+    ):
+        from src.financial_statements import enrich_chart_with_puc
+        chart_e = enrich_chart_with_puc(chart)
+        chart_min = chart_e[[
+            c for c in ["id", "code", "name", "account_type",
+                        "puc_group", "puc_subgroup", "grupo"]
+            if c in chart_e.columns
+        ]].rename(columns={
+            "id": "account_id", "code": "acc_code", "name": "acc_name",
+        })
+        bal_with_code = balances_periodo.merge(
+            chart_min, on="account_id", how="left"
+        )
+        if not bal_with_code.empty:
+            bal_with_code["saldo_neto"] = (
+                bal_with_code.get("debit", 0).fillna(0)
+                - bal_with_code.get("credit", 0).fillna(0)
             )
-            por_cuenta = moves_with_code.groupby(
-                ["acc_code", "acc_name"], as_index=False, dropna=False
-            ).agg(
-                n_moves=("debit", "count"),
-                debit=("debit", "sum"),
-                credit=("credit", "sum"),
-                saldo_neto=("saldo_neto", "sum"),
-            )
-            # Mostrar top 30 cuentas por saldo absoluto
-            por_cuenta["abs_saldo"] = por_cuenta["saldo_neto"].abs()
-            top30 = por_cuenta.sort_values("abs_saldo", ascending=False).head(30)
-            st.write("Top 30 cuentas por saldo absoluto:")
+            bal_with_code["abs_saldo"] = bal_with_code["saldo_neto"].abs()
+            top30 = bal_with_code.sort_values(
+                "abs_saldo", ascending=False
+            ).head(30)
+            cols_show = [c for c in [
+                "acc_code", "acc_name", "account_type", "puc_group",
+                "grupo", "debit", "credit", "saldo_neto",
+            ] if c in top30.columns]
+            st.write("Top 30 cuentas por saldo absoluto en el período:")
             st.dataframe(
-                top30[["acc_code", "acc_name", "n_moves", "debit", "credit", "saldo_neto"]],
+                top30[cols_show],
                 use_container_width=True, hide_index=True, height=400,
             )
-
-            # Distribución por dígito normalizado
-            from src.financial_statements import _normalize_code
-            por_cuenta["code_norm"] = por_cuenta["acc_code"].apply(_normalize_code)
-            por_cuenta["first_digit_norm"] = por_cuenta["code_norm"].astype(str).str[:1]
-            dist_norm = por_cuenta.groupby("first_digit_norm").agg(
-                n_cuentas=("acc_code", "count"),
-                saldo_total=("saldo_neto", "sum"),
-            ).reset_index()
-            st.write("**Distribución de cuentas USADAS por primer dígito normalizado:**")
-            st.dataframe(dist_norm, hide_index=True)
+            # Distribución por puc_group
+            if "puc_group" in bal_with_code.columns:
+                dist = bal_with_code.groupby(
+                    "puc_group", dropna=False
+                ).agg(
+                    n_cuentas=("account_id", "count"),
+                    saldo_total=("saldo_neto", "sum"),
+                ).reset_index()
+                st.write("**Distribución por grupo PUC:**")
+                st.dataframe(dist, hide_index=True)
 
 
 def _money(v: float) -> str:
