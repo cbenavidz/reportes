@@ -22,7 +22,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.auth import logout_button, require_auth
-from src.data_loader import load_companies, load_invoice_lines
+from src.data_loader import (
+    load_cartera_summary,
+    load_companies,
+    load_invoice_lines,
+)
 from src.ui_components import render_company_context, render_sidebar_filters
 from src.financial_analyzer import (
     compute_churn_clientes,
@@ -240,6 +244,65 @@ c8.metric(
     "🎫 Ticket promedio",
     _fmt_money(actual["ticket_promedio"]),
     delta=_fmt_delta(actual["ticket_promedio"], anterior["ticket_promedio"]),
+)
+
+# --- KPIs de Cartera (DSO + rotación) ---
+# Se carga aparte vía read_group server-side (rápido, sin análisis completo).
+cartera = load_cartera_summary(company_ids=filters["company_ids"])
+saldo_cartera = cartera["saldo_cartera"]
+saldo_vencido = cartera["saldo_vencido"]
+
+# DSO a nivel empresa = (CxC actual / Ventas del período) × días del período
+# Mide cuántos días de ventas están "atrapados" en cuentas por cobrar.
+ventas_periodo = actual["ventas"]
+_dias_dso = (fecha_hasta - fecha_desde).days + 1  # días inclusivos del período
+dso_empresa = (
+    (saldo_cartera / ventas_periodo * _dias_dso)
+    if ventas_periodo > 0 else 0.0
+)
+# Rotación de cartera (veces al año): cuántas veces se "renueva" la cartera
+rotacion_veces = (365.0 / dso_empresa) if dso_empresa > 0 else 0.0
+pct_vencido = (
+    (saldo_vencido / saldo_cartera * 100) if saldo_cartera > 0 else 0.0
+)
+
+st.markdown("##### 💳 Indicadores de cartera (al corte de hoy)")
+c9, c10, c11, c12 = st.columns(4)
+c9.metric(
+    "📅 DSO (días)",
+    f"{dso_empresa:.0f} días",
+    help=(
+        "Days Sales Outstanding a nivel empresa. Días promedio que tarda "
+        "en convertirse una venta en efectivo. Fórmula: "
+        "(Cuentas por Cobrar actual / Ventas del período) × días del período. "
+        "Más bajo = mejor (cobras más rápido)."
+    ),
+)
+c10.metric(
+    "🔄 Rotación cartera",
+    f"{rotacion_veces:.1f}× / año",
+    help=(
+        "Cuántas veces al año se renueva la cartera. "
+        "Fórmula: 365 / DSO. Más alto = mejor."
+    ),
+)
+c11.metric(
+    "💰 Saldo cartera",
+    _fmt_money(saldo_cartera),
+    help="Total de cuentas por cobrar pendientes al día de hoy.",
+)
+c12.metric(
+    "⚠️ Cartera vencida",
+    _fmt_money(saldo_vencido),
+    delta=f"{pct_vencido:.1f}% del total",
+    delta_color="inverse",
+    help="Saldo de facturas que ya pasaron su fecha de vencimiento.",
+)
+st.caption(
+    "ℹ️ El DSO y la rotación se calculan con el saldo de cartera ACTUAL "
+    "(no afectado por el período seleccionado arriba) vs las ventas del "
+    "período. Para análisis de cobranza detallado por cliente, ve a "
+    "**Clientes y Scoring** o **Detalle Cliente**."
 )
 
 

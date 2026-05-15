@@ -567,6 +567,69 @@ def load_cash_movements_only(
     return moves
 
 
+@st.cache_data(ttl=900, show_spinner="Calculando saldo de cartera...")
+def load_cartera_summary(
+    company_ids: tuple[int, ...] | None = None,
+    _cache_v: int = 1,
+) -> dict:
+    """
+    Saldo de cartera (CxC) vía read_group server-side — rápido.
+
+    NO hace análisis completo (scoring, DSO per-cliente, etc.). Solo trae
+    el total de saldo abierto y vencido para calcular DSO a nivel empresa.
+
+    Devuelve dict con:
+      - saldo_cartera: total amount_residual de facturas no pagadas
+      - saldo_vencido: total de facturas vencidas
+      - n_facturas_abiertas: # de facturas con saldo
+    """
+    from datetime import date as _date
+    client = get_odoo_client()
+    today_str = _date.today().isoformat()
+
+    domain_base = [
+        ("move_type", "=", "out_invoice"),
+        ("state", "=", "posted"),
+        ("payment_state", "in", ["not_paid", "partial", "in_payment"]),
+    ]
+    if company_ids:
+        domain_base = domain_base + [("company_id", "in", list(company_ids))]
+
+    try:
+        # Saldo total abierto
+        result = client.execute_kw(
+            "account.move", "read_group",
+            [domain_base, ["amount_residual_signed:sum"], []],
+            {"lazy": False},
+        )
+        saldo_cartera = float(
+            result[0].get("amount_residual_signed", 0) if result else 0
+        )
+        n_abiertas = int(result[0].get("__count", 0) if result else 0)
+
+        # Saldo vencido (invoice_date_due < hoy)
+        domain_vencido = domain_base + [("invoice_date_due", "<", today_str)]
+        result_v = client.execute_kw(
+            "account.move", "read_group",
+            [domain_vencido, ["amount_residual_signed:sum"], []],
+            {"lazy": False},
+        )
+        saldo_vencido = float(
+            result_v[0].get("amount_residual_signed", 0) if result_v else 0
+        )
+    except Exception:  # noqa: BLE001
+        return {
+            "saldo_cartera": 0.0, "saldo_vencido": 0.0,
+            "n_facturas_abiertas": 0,
+        }
+
+    return {
+        "saldo_cartera": saldo_cartera,
+        "saldo_vencido": saldo_vencido,
+        "n_facturas_abiertas": n_abiertas,
+    }
+
+
 def test_connection_summary() -> dict:
     """Para mostrar en la UI: estado de conexión a Odoo."""
     try:
