@@ -45,6 +45,81 @@ def is_meta_configured() -> bool:
     return bool(cfg.get("access_token"))
 
 
+def diagnose_meta_connection() -> dict:
+    """
+    Diagnóstico de la conexión Meta. Hace una llamada de prueba al Page
+    y devuelve el resultado o el error EXACTO (no redactado).
+
+    Devuelve dict con:
+      - ok: bool
+      - mensaje: str descriptivo
+      - detalle: respuesta o error crudo de la API
+      - token_preview: primeros/últimos chars del token (para verificar)
+    """
+    import requests
+
+    cfg = get_secret_dict("meta") or {}
+    token = cfg.get("access_token", "")
+    page_id = cfg.get("facebook_page_id", "")
+    ig_id = cfg.get("instagram_user_id", "")
+
+    if not token:
+        return {
+            "ok": False,
+            "mensaje": "No hay access_token configurado en Streamlit Secrets.",
+            "detalle": "Falta la sección [meta] o el campo access_token.",
+            "token_preview": "(vacío)",
+        }
+    if not page_id:
+        return {
+            "ok": False,
+            "mensaje": "No hay facebook_page_id configurado.",
+            "detalle": "Falta el campo facebook_page_id en [meta].",
+            "token_preview": f"{token[:12]}...{token[-6:]}",
+        }
+
+    # Llamada de prueba: traer nombre y seguidores del Page
+    try:
+        r = requests.get(
+            f"{BASE_URL}/{page_id}",
+            params={
+                "fields": "name,fan_count,followers_count",
+                "access_token": token,
+            },
+            timeout=30,
+        )
+        data = r.json()
+        if r.status_code == 200 and "name" in data:
+            return {
+                "ok": True,
+                "mensaje": (
+                    f"✅ Token válido. Página: {data.get('name')} · "
+                    f"{data.get('followers_count', data.get('fan_count', 0)):,} seguidores."
+                ),
+                "detalle": data,
+                "token_preview": f"{token[:12]}...{token[-6:]}",
+            }
+        # Error de la API — extraer el mensaje real
+        error_obj = data.get("error", {})
+        return {
+            "ok": False,
+            "mensaje": (
+                f"❌ La API rechazó el token. "
+                f"Código: {error_obj.get('code', '?')} · "
+                f"Tipo: {error_obj.get('type', '?')}"
+            ),
+            "detalle": error_obj.get("message", str(data)),
+            "token_preview": f"{token[:12]}...{token[-6:]}",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "ok": False,
+            "mensaje": f"❌ Error de red al contactar la API: {type(exc).__name__}",
+            "detalle": str(exc),
+            "token_preview": f"{token[:12]}...{token[-6:]}",
+        }
+
+
 def _get(endpoint: str, params: dict | None = None, *, token: str | None = None) -> dict:
     """Helper GET a Graph API."""
     import requests

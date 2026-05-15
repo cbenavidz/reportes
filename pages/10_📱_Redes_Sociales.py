@@ -20,6 +20,7 @@ import streamlit as st
 
 from src.auth import logout_button, require_auth
 from src.social_connectors import (
+    diagnose_meta_connection,
     fetch_ga4_data,
     fetch_meta_ads_insights,
     fetch_meta_facebook_data,
@@ -735,6 +736,23 @@ def _platform_tab_meta(
 
     if api_status == "configured":
         st.success("✅ API conectada — datos en vivo.")
+        # Diagnóstico de conexión: hace una llamada de prueba y muestra
+        # el error REAL si el token falla (no redactado).
+        with st.expander("🔍 Verificar conexión Meta API", expanded=False):
+            if st.button(
+                "Probar token ahora", key=f"diag_{platform_key}",
+            ):
+                diag = diagnose_meta_connection()
+                if diag["ok"]:
+                    st.success(diag["mensaje"])
+                else:
+                    st.error(diag["mensaje"])
+                    st.code(str(diag["detalle"]), language="text")
+                    st.caption(
+                        f"Token en uso: `{diag['token_preview']}`. "
+                        "Si el token expiró o es inválido, hay que "
+                        "regenerarlo y actualizarlo en Streamlit Secrets."
+                    )
     else:
         st.info("ℹ️ API no configurada. Sube CSV manual.")
 

@@ -2,6 +2,7 @@
 """Conectores de API para redes sociales y analytics."""
 from .ga4 import is_ga4_configured, fetch_ga4_data
 from .meta import (
+    diagnose_meta_connection,
     fetch_meta_ads_insights,
     fetch_meta_facebook_data,
     fetch_meta_facebook_monthly_evolution,
@@ -16,6 +17,7 @@ from .tiktok import is_tiktok_configured, fetch_tiktok_data
 __all__ = [
     "is_ga4_configured", "fetch_ga4_data",
     "is_meta_configured",
+    "diagnose_meta_connection",
     "fetch_meta_ads_insights",
     "fetch_meta_facebook_data",
     "fetch_meta_facebook_monthly_evolution",
