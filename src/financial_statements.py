@@ -339,26 +339,33 @@ def enrich_chart_with_puc(chart: pd.DataFrame) -> pd.DataFrame:
     out = chart.copy()
 
     def _classify_row(row):
-        # 1. PRIMARIO: account_type de Odoo (más confiable)
-        if "account_type" in row and row["account_type"]:
-            result = classify_by_account_type(row["account_type"])
+        code = str(row.get("code", "") or "").strip()
+        digits = "".join(ch for ch in code if ch.isdigit()).lstrip("0")
+        account_type = row.get("account_type", "")
+
+        # 1. PRIMARIO: código PUC si es válido (2+ dígitos significativos
+        #    empezando por 1-9). Esto es lo MÁS preciso porque distingue
+        #    subgrupos: 41 vs 42 (ingresos op vs no op), 51/52/53 (gastos
+        #    admin/ventas/no op), etc. account_type NO puede distinguir eso
+        #    porque para Odoo "expense" es expense, sin importar si es 51/52/53.
+        if len(digits) >= 2 and digits[0] in "123456789":
+            code_cls = classify_account(code)
+            code_cls["puc_group"] = digits[0]
+            code_cls["puc_subgroup"] = digits[:2]
+            return code_cls
+
+        # 2. SECUNDARIO: account_type de Odoo (para cuentas auxiliares
+        #    de balance con códigos no-PUC como "00000001", "F4135").
+        if account_type:
+            result = classify_by_account_type(account_type)
             if result:
                 return result
-        # 2. SECUNDARIO: clasificar por nombre (palabras clave PUC)
+
+        # 3. TERCIARIO: clasificar por nombre (palabras clave PUC)
         name_cls = classify_by_name(row.get("name", ""))
         if name_cls:
             return name_cls
-        # 3. TERCIARIO: clasificación por código (si parsea como PUC)
-        code = str(row.get("code", "") or "")
-        digits = "".join(ch for ch in code if ch.isdigit())
-        digits = digits.lstrip("0")
-        # Solo confiar en el código si tiene 3+ dígitos significativos
-        # (códigos auxiliares como "00000004" caen a 1 dígito = no PUC)
-        if len(digits) >= 3:
-            code_cls = classify_account(code)
-            code_cls["puc_group"] = digits[0] if digits else ""
-            code_cls["puc_subgroup"] = digits[:2] if len(digits) >= 2 else digits[0]
-            return code_cls
+
         # 4. Último recurso: Otro
         return {
             "grupo": "Otro", "es_corriente": False,
