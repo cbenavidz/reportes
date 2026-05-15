@@ -22,7 +22,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.auth import logout_button, require_auth
-from src.data_loader import compute_full_analysis, load_invoice_lines
+from src.data_loader import load_companies, load_invoice_lines
 from src.ui_components import render_company_context, render_sidebar_filters
 from src.financial_analyzer import (
     compute_churn_clientes,
@@ -107,12 +107,14 @@ st.caption(f"📅 Período: **{fecha_desde}** → **{fecha_hasta}**")
 # ---------------------------------------------------------------------------
 # Cargar datos
 # ---------------------------------------------------------------------------
-# Ajustar histórico según rango seleccionado para no cargar de más
+# Ajustar histórico según rango seleccionado para no cargar de más.
+# Menos meses = carga más rápida. El YoY necesita 12+ meses extra para
+# comparar contra el mismo mes del año anterior.
 dias_periodo = (fecha_hasta - fecha_desde).days
 if dias_periodo <= 90:
-    HIST_MONTHS = 6    # rango corto: 6 meses
+    HIST_MONTHS = 4    # rango corto: 4 meses (rápido)
 elif dias_periodo <= 365:
-    HIST_MONTHS = 18   # rango anual: 18 meses (necesario para YoY)
+    HIST_MONTHS = 15   # rango anual: 15 meses (cubre YoY)
 else:
     HIST_MONTHS = 24   # rango muy largo: 24 meses
 
@@ -122,15 +124,11 @@ with st.spinner(f"Cargando líneas de factura ({HIST_MONTHS} meses)..."):
         company_ids=filters["company_ids"],
     )
 
-# Banner de empresa(s) activa(s)
-data_meta = compute_full_analysis(
-    months_back=HIST_MONTHS,
-    rotation_period_days=filters["period_days"],
-    company_ids=filters["company_ids"],
-    exclude_cash_sales=filters["exclude_cash_sales"],
-    analysis_window_days=filters.get("analysis_window_days"),
-)
-render_company_context(data_meta.get("companies"), filters["company_ids"])
+# Banner de empresa(s) activa(s) — carga LIGERA (solo lista de empresas).
+# Antes esto llamaba compute_full_analysis() que descargaba facturas +
+# pagos + partners + hacía scoring completo — innecesario y muy lento.
+companies_df = load_companies()
+render_company_context(companies_df, filters["company_ids"])
 
 if lines is None or lines.empty:
     st.error("No se pudieron cargar líneas de factura. Verifica la conexión con Odoo.")
