@@ -59,6 +59,32 @@ st.set_page_config(
 require_auth()
 logout_button()
 
+
+def _safe_int(value, default: int = 0) -> int:
+    """
+    Convierte a int de forma segura. Maneja NaN, None, strings vacíos.
+
+    `int(float('nan'))` lanza ValueError, y el truco `nan or 0` NO funciona
+    porque NaN es "truthy" en Python. Por eso necesitamos pd.notna().
+    """
+    try:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return default
+        return int(float(value))
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(value, default: float = 0.0) -> float:
+    """Convierte a float de forma segura. Maneja NaN, None."""
+    try:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return default
+        result = float(value)
+        return default if pd.isna(result) else result
+    except (ValueError, TypeError):
+        return default
+
 st.title("🔎 Detalle por cliente")
 st.caption(
     "Análisis profundo de un cliente: KPIs, histórico, hábito de pago y "
@@ -293,12 +319,12 @@ k2.metric(
 )
 k3.metric(
     "Facturas abiertas",
-    int(cli_row.get("num_facturas_abiertas", 0) or 0),
+    _safe_int(cli_row.get("num_facturas_abiertas", 0)),
     help="# de facturas con saldo pendiente.",
 )
 k4.metric(
     "Mora máx hoy",
-    f"{int(cli_row.get('dias_vencido_max', 0) or 0)} d",
+    f"{_safe_int(cli_row.get('dias_vencido_max', 0))} d",
     help="Días vencidos de la peor factura abierta hoy.",
 )
 
@@ -351,7 +377,7 @@ k11.metric(
 )
 k12.metric(
     "Antigüedad como cliente",
-    f"{int(cli_row.get('antiguedad_dias', 0) or 0)} d",
+    f"{_safe_int(cli_row.get('antiguedad_dias', 0))} d",
     help="Días desde la primera factura registrada.",
 )
 
