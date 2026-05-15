@@ -948,13 +948,15 @@ def compute_expenses_breakdown(
             "por_mes": pd.DataFrame(),
         }
 
+    # Solo gastos (grupo 5): 51 Administrativos, 52 Ventas, 53 No operacionales/financieros
+    # NO incluir costos (grupo 6) - esos van en el costo de ventas, no en análisis de gastos
     if "puc_group" in sub.columns:
-        is_exp = sub["puc_group"].astype(str).isin(["5", "6"])
+        is_exp = sub["puc_group"].astype(str) == "5"
     else:
         is_exp = sub.get(
             "account_code_norm",
             sub.get("account_code", pd.Series([""] * len(sub)))
-        ).astype(str).str.startswith(("5", "6"))
+        ).astype(str).str.startswith("5")
     gastos = sub[is_exp].copy()
     if gastos.empty:
         return {
