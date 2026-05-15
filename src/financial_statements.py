@@ -262,7 +262,12 @@ def classify_by_name(name: str) -> dict | None:
         "anticipos a", "préstamo a empleado",
     ]):
         return _puc_dict("1", "13", "Deudores (CxC)", True)
-    if "inventario" in n or "mercanc" in n:
+    if any(kw in n for kw in [
+        "inventario", "mercanc", "existencias", "bodega", "almacén",
+        "almacen", "stock", "repuestos en", "producto terminado",
+        "materia prima", "mercader", "lubricantes en", "en tránsito",
+        "en transito",
+    ]):
         return _puc_dict("1", "14", "Inventarios", True)
     if "iva descontable" in n or "iva por cobrar" in n or "anticipo de imp" in n:
         return _puc_dict("1", "13", "Deudores (impuestos)", True)
@@ -359,6 +364,17 @@ def enrich_chart_with_puc(chart: pd.DataFrame) -> pd.DataFrame:
         if account_type:
             result = classify_by_account_type(account_type)
             if result:
+                # IMPORTANTE: Odoo NO tiene account_type específico para
+                # inventarios — las cuentas de inventario son `asset_current`
+                # genérico. Cuando el subgrupo es genérico ("1" activo
+                # corriente, "2" pasivo corriente), refinamos con el NOMBRE
+                # para distinguir inventarios (14), CxC (13), etc.
+                if result["puc_subgroup"] in ("1", "2"):
+                    name_cls = classify_by_name(row.get("name", ""))
+                    if name_cls and name_cls["puc_group"] == result["puc_group"]:
+                        # El nombre da un subgrupo más fino dentro del
+                        # mismo grupo → lo usamos.
+                        return name_cls
                 return result
 
         # 3. TERCIARIO: clasificar por nombre (palabras clave PUC)
