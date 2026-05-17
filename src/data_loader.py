@@ -391,6 +391,54 @@ def load_invoice_lines(
 
 
 # ---------------------------------------------------------------------------
+# Loaders para análisis de Compras vs Ventas
+# ---------------------------------------------------------------------------
+
+PURCHASE_LINES_CACHE_VERSION = 1
+STOCK_QUANTS_CACHE_VERSION = 1
+
+
+@st.cache_data(ttl=900, show_spinner="Descargando facturas de proveedor...")
+def load_purchase_invoice_lines(
+    date_from: str,
+    date_to: str,
+    company_ids: tuple[int, ...] | None = None,
+    _cache_v: int = PURCHASE_LINES_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """
+    Líneas de facturas de proveedor (in_invoice / in_refund) para el
+    análisis de compras vs ventas.
+    """
+    from .extractor import extract_purchase_invoice_lines
+    client = get_odoo_client()
+    df_date = pd.to_datetime(date_from).date()
+    dt_date = pd.to_datetime(date_to).date()
+    return extract_purchase_invoice_lines(
+        client,
+        date_from=df_date,
+        date_to=dt_date,
+        company_ids=list(company_ids) if company_ids else None,
+        include_refunds=True,
+    )
+
+
+@st.cache_data(ttl=900, show_spinner="Cargando stock por producto...")
+def load_stock_quants(
+    company_ids: tuple[int, ...] | None = None,
+    product_ids: tuple[int, ...] | None = None,
+    _cache_v: int = STOCK_QUANTS_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """Stock disponible por producto (read_group server-side)."""
+    from .extractor import extract_stock_quants
+    client = get_odoo_client()
+    return extract_stock_quants(
+        client,
+        company_ids=list(company_ids) if company_ids else None,
+        product_ids=list(product_ids) if product_ids else None,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Loaders para Estados Financieros
 # ---------------------------------------------------------------------------
 

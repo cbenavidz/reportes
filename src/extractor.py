@@ -1245,3 +1245,201 @@ def extract_all_for_cartera(
         "companies": extract_companies(client),
         "cutoff_date": cutoff_date,
     }
+
+
+# ---------------------------------------------------------------------------
+# Extracción de compras (facturas de proveedor) y stock
+# ---------------------------------------------------------------------------
+
+
+def extract_purchase_invoice_lines(
+    client: OdooClient,
+    date_from: date | str | None = None,
+    date_to: date | str | None = None,
+    company_ids: list[int] | tuple[int, ...] | None = None,
+    include_refunds: bool = True,
+) -> pd.DataFrame:
+    """
+    Líneas de factura de PROVEEDOR (in_invoice / in_refund) para análisis
+    de compras vs ventas.
+
+    Filtros: parent_state='posted', display_type='product', rango de fechas
+    y empresas. Devuelve cantidad, costo unitario, subtotal con signo (NC
+    de proveedor negativas), categoría y código de producto.
+    """
+    move_types = ["in_invoice"]
+    if include_refunds:
+        move_types.append("in_refund")
+
+    domain: list = [
+        ("move_type", "in", move_types),
+        ("parent_state", "=", "posted"),
+        ("display_type", "=", "product"),
+    ]
+    if date_from:
+        domain.append(("date", ">=", str(date_from)))
+    if date_to:
+        domain.append(("date", "<=", str(date_to)))
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
+
+    fields_to_fetch = list(INVOICE_LINE_FIELDS)
+
+    logger.info("Descargando purchase_invoice_lines con dominio: %s", domain)
+    records = client.search_read(
+        "account.move.line",
+        domain=domain,
+        fields=fields_to_fetch,
+        order="date desc",
+    )
+    logger.info("Purchase invoice lines descargadas: %s", len(records))
+
+    df = _normalize_invoice_lines(records)
+    if df.empty:
+        return df
+
+    # En `_normalize_invoice_lines` el signo se calcula para out_invoice/out_refund.
+    # Para compras necesitamos: in_invoice → +qty/+subtotal, in_refund → −qty/−subtotal.
+    if "move_type" in df.columns:
+        sign = df["move_type"].map(
+            {"in_invoice": 1, "in_refund": -1}
+        ).fillna(1)
+        df["price_subtotal_signed"] = df["price_subtotal"] * sign
+        df["quantity_signed"] = df["quantity"] * sign
+    else:
+        df["quantity_signed"] = df["quantity"]
+
+    # Enriquecer con categoría y código de producto
+    product_ids = (
+        df["product_id"].dropna().astype(int).unique().tolist()
+        if "product_id" in df.columns else []
+    )
+    if product_ids:
+        try:
+            product_context: dict | None = None
+            if company_ids:
+                first_co = list(company_ids)[0]
+                product_context = {
+                    "company_id": first_co,
+                    "allowed_company_ids": list(company_ids),
+                }
+            prod_records = client.search_read(
+                "product.product",
+                domain=[("id", "in", product_ids)],
+                fields=["id", "categ_id", "default_code", "name",
+                        "standard_price"],
+                context=product_context,
+            )
+            cat_map: dict[int, tuple[int | None, str | None]] = {}
+            code_map: dict[int, str | None] = {}
+            cost_map: dict[int, float] = {}
+            for p in prod_records:
+                cid, cname = _unpack_m2o(p.get("categ_id"))
+                cat_map[int(p["id"])] = (cid, cname)
+                code_map[int(p["id"])] = p.get("default_code") or None
+                cost = p.get("standard_price")
+                try:
+                    cost_map[int(p["id"])] = float(cost) if cost else 0.0
+                except (TypeError, ValueError):
+                    cost_map[int(p["id"])] = 0.0
+
+            def _cat_id(i):
+                if pd.isna(i):
+                    return None
+                return cat_map.get(int(i), (None, None))[0]
+
+            def _cat_name(i):
+                if pd.isna(i):
+                    return None
+                return cat_map.get(int(i), (None, None))[1]
+
+            def _code(i):
+                if pd.isna(i):
+                    return None
+                return code_map.get(int(i))
+
+            def _cost(i):
+                if pd.isna(i):
+                    return 0.0
+                return cost_map.get(int(i), 0.0)
+
+            df["product_categ_id"] = df["product_id"].map(_cat_id)
+            df["product_categ_name"] = df["product_id"].map(_cat_name)
+            df["product_default_code"] = df["product_id"].map(_code)
+            df["product_standard_price"] = df["product_id"].map(_cost)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "No se pudo enriquecer productos en compras: %s", exc,
+            )
+            df["product_categ_id"] = None
+            df["product_categ_name"] = None
+            df["product_default_code"] = None
+            df["product_standard_price"] = 0.0
+    else:
+        df["product_categ_id"] = None
+        df["product_categ_name"] = None
+        df["product_default_code"] = None
+        df["product_standard_price"] = 0.0
+
+    df["invoice_date"] = df["date"]
+    return df
+
+
+def extract_stock_quants(
+    client: OdooClient,
+    company_ids: list[int] | tuple[int, ...] | None = None,
+    product_ids: list[int] | tuple[int, ...] | None = None,
+) -> pd.DataFrame:
+    """
+    Stock disponible por producto desde `stock.quant`, sumando todas las
+    ubicaciones internas. Devuelve un DF con: product_id, qty_available,
+    value (valor inventariado si está disponible).
+
+    Sólo trae ubicaciones tipo `internal` (ignora vistas, clientes, etc.).
+    """
+    domain: list = [("location_id.usage", "=", "internal")]
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
+    if product_ids:
+        domain.append(("product_id", "in", list(product_ids)))
+
+    try:
+        # Usamos read_group para sumar server-side por producto (mucho más rápido)
+        result = client.execute_kw(
+            "stock.quant", "read_group",
+            [domain, ["product_id", "quantity:sum", "value:sum"], ["product_id"]],
+            {"lazy": False},
+        )
+    except Exception as exc:  # noqa: BLE001
+        # `value` puede no estar disponible en todas las bases (depende del
+        # módulo de valoración). Reintentar sin él.
+        logger.warning(
+            "read_group stock.quant con `value` falló (%s). Reintentando sin él.",
+            exc,
+        )
+        try:
+            result = client.execute_kw(
+                "stock.quant", "read_group",
+                [domain, ["product_id", "quantity:sum"], ["product_id"]],
+                {"lazy": False},
+            )
+        except Exception as exc2:  # noqa: BLE001
+            logger.error("read_group stock.quant falló: %s", exc2)
+            return pd.DataFrame(columns=["product_id", "qty_available", "stock_value"])
+
+    rows = []
+    for r in result:
+        prod = r.get("product_id")
+        if isinstance(prod, list) and prod:
+            prod_id = prod[0]
+        else:
+            prod_id = prod
+        rows.append({
+            "product_id": prod_id,
+            "qty_available": float(r.get("quantity", 0) or 0),
+            "stock_value": float(r.get("value", 0) or 0),
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return pd.DataFrame(columns=["product_id", "qty_available", "stock_value"])
+    return df
