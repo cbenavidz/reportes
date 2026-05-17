@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- Menú raíz dentro de Contabilidad -->
+    <menuitem id="menu_casa_cartera_root"
+              name="📊 Cartera"
+              parent="account.menu_finance"
+              sequence="25"/>
+
+    <menuitem id="menu_casa_cartera_clientes"
+              name="Clientes (Scoring)"
+              parent="menu_casa_cartera_root"
+              action="action_cartera_clientes"
+              sequence="10"/>
+
+    <menuitem id="menu_casa_cartera_alerts"
+              name="Alertas"
+              parent="menu_casa_cartera_root"
+              sequence="30"
+              action="action_cartera_alertas"/>
+
+    <menuitem id="menu_casa_cartera_historico"
+              name="Histórico de Scores"
+              parent="menu_casa_cartera_root"
+              sequence="40"
+              action="action_cartera_historico"/>
+
+    <!-- Actions auxiliares -->
+    <record id="action_cartera_alertas" model="ir.actions.act_window">
+        <field name="name">🚨 Alertas de Cartera</field>
+        <field name="res_model">casa.cartera.alert</field>
+        <field name="view_mode">list,form</field>
+        <field name="domain">[('resuelto', '=', False)]</field>
+    </record>
+
+    <record id="action_cartera_historico" model="ir.actions.act_window">
+        <field name="name">📈 Histórico de Scoring</field>
+        <field name="res_model">casa.cartera.score.history</field>
+        <field name="view_mode">list,graph,pivot</field>
+    </record>
+
+</odoo>

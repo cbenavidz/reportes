@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- Cron: recalcular scoring de cartera todas las noches a las 2am -->
+    <record id="cron_recompute_cartera_scoring" model="ir.cron">
+        <field name="name">Cartera: Recalcular Scoring (nocturno)</field>
+        <field name="model_id" ref="base.model_res_partner"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_recompute_cartera_scoring()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">1</field>
+        <field name="interval_type">days</field>
+        <field name="nextcall" eval="(DateTime.now() + relativedelta(hours=2)).strftime('%Y-%m-%d 02:00:00')"/>
+        <field name="active">True</field>
+    </record>
+
+    <!-- Cron: generar alertas todos los días a las 7am -->
+    <record id="cron_generate_alerts" model="ir.cron">
+        <field name="name">Cartera: Generar Alertas (7am)</field>
+        <field name="model_id" ref="model_casa_cartera_alert"/>
+        <field name="state">code</field>
+        <field name="code">model._cron_generate_alerts()</field>
+        <field name="user_id" ref="base.user_root"/>
+        <field name="interval_number">1</field>
+        <field name="interval_type">days</field>
+        <field name="nextcall" eval="(DateTime.now() + relativedelta(hours=7)).strftime('%Y-%m-%d 07:00:00')"/>
+        <field name="active">True</field>
+    </record>
+
+</odoo>

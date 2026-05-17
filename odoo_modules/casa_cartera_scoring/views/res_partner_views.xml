@@ -1,0 +1,242 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+
+    <!-- ========================================================== -->
+    <!-- 1. KANBAN: Vista visual con código de color por score      -->
+    <!-- ========================================================== -->
+    <record id="view_partner_kanban_cartera" model="ir.ui.view">
+        <field name="name">res.partner.kanban.cartera</field>
+        <field name="model">res.partner</field>
+        <field name="arch" type="xml">
+            <kanban default_group_by="cartera_score" class="o_kanban_dashboard">
+                <field name="name"/>
+                <field name="cartera_score"/>
+                <field name="cartera_dso_real"/>
+                <field name="cartera_cumplimiento_pct"/>
+                <field name="cartera_saldo_abierto"/>
+                <field name="cartera_saldo_vencido"/>
+                <field name="cartera_habito_pago"/>
+                <field name="user_id"/>
+                <templates>
+                    <t t-name="kanban-box">
+                        <div t-attf-class="oe_kanban_card oe_kanban_global_click
+                            #{record.cartera_score.raw_value == 'A' ? 'border-success' : ''}
+                            #{record.cartera_score.raw_value == 'D' ? 'border-danger' : ''}">
+                            <div class="o_kanban_record_top">
+                                <div class="o_kanban_record_headings">
+                                    <strong><field name="name"/></strong>
+                                    <br/>
+                                    <small class="text-muted">
+                                        <field name="user_id"/>
+                                    </small>
+                                </div>
+                                <field name="cartera_habito_pago" widget="badge"/>
+                            </div>
+                            <div class="o_kanban_record_body">
+                                <div class="row">
+                                    <div class="col-6">
+                                        <small>Saldo abierto</small><br/>
+                                        <strong><field name="cartera_saldo_abierto" widget="monetary"/></strong>
+                                    </div>
+                                    <div class="col-6">
+                                        <small>Vencido</small><br/>
+                                        <strong t-attf-class="#{record.cartera_saldo_vencido.raw_value > 0 ? 'text-danger' : 'text-muted'}">
+                                            <field name="cartera_saldo_vencido" widget="monetary"/>
+                                        </strong>
+                                    </div>
+                                </div>
+                                <div class="row mt-2">
+                                    <div class="col-6">
+                                        <small>DSO real</small><br/>
+                                        <field name="cartera_dso_real" widget="float" digits="[3,0]"/> días
+                                    </div>
+                                    <div class="col-6">
+                                        <small>Cumplimiento</small><br/>
+                                        <field name="cartera_cumplimiento_pct" widget="percentage"/>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </t>
+                </templates>
+            </kanban>
+        </field>
+    </record>
+
+    <!-- ========================================================== -->
+    <!-- 2. LIST: Vista tabular completa                            -->
+    <!-- ========================================================== -->
+    <record id="view_partner_list_cartera" model="ir.ui.view">
+        <field name="name">res.partner.list.cartera</field>
+        <field name="model">res.partner</field>
+        <field name="arch" type="xml">
+            <list string="Cartera" decoration-danger="cartera_score == 'D'"
+                  decoration-warning="cartera_score == 'C'"
+                  decoration-success="cartera_score == 'A'">
+                <field name="name"/>
+                <field name="user_id" optional="show"/>
+                <field name="cartera_score" widget="badge"/>
+                <field name="cartera_habito_pago" widget="badge"/>
+                <field name="cartera_saldo_abierto" widget="monetary" sum="Total"/>
+                <field name="cartera_saldo_vencido" widget="monetary" sum="Total"/>
+                <field name="cartera_dso_real" widget="float" digits="[3,0]"/>
+                <field name="cartera_plazo_otorgado"/>
+                <field name="cartera_cumplimiento_pct" widget="percentage"/>
+                <field name="cartera_facturas_abiertas_count"/>
+                <field name="cartera_facturas_vencidas_count" optional="hide"/>
+                <field name="credit_limit" optional="hide"/>
+                <field name="currency_id" invisible="1"/>
+            </list>
+        </field>
+    </record>
+
+    <!-- ========================================================== -->
+    <!-- 3. FORM: Detalle por cliente con tab "Cartera"             -->
+    <!-- ========================================================== -->
+    <record id="view_partner_form_cartera" model="ir.ui.view">
+        <field name="name">res.partner.form.cartera</field>
+        <field name="model">res.partner</field>
+        <field name="inherit_id" ref="base.view_partner_form"/>
+        <field name="arch" type="xml">
+            <xpath expr="//notebook" position="inside">
+                <page string="📊 Cartera & Scoring" name="cartera_scoring">
+                    <group>
+                        <group string="Scoring">
+                            <field name="cartera_score" widget="badge"/>
+                            <field name="cartera_habito_pago" widget="badge"/>
+                            <field name="cartera_score_fecha"/>
+                            <button name="action_recompute_cartera"
+                                    string="🔄 Recalcular ahora"
+                                    type="object" class="btn-primary"/>
+                        </group>
+                        <group string="Plazos & DSO">
+                            <field name="cartera_plazo_otorgado"/>
+                            <field name="cartera_dso_real"/>
+                            <field name="cartera_cumplimiento_pct"
+                                   widget="percentage"/>
+                        </group>
+                    </group>
+                    <group string="Saldos">
+                        <group>
+                            <field name="cartera_saldo_abierto" widget="monetary"/>
+                            <field name="cartera_saldo_vencido" widget="monetary"/>
+                        </group>
+                        <group>
+                            <field name="cartera_facturas_abiertas_count"/>
+                            <field name="cartera_facturas_vencidas_count"/>
+                            <button name="action_view_open_invoices"
+                                    string="📋 Ver facturas abiertas"
+                                    type="object" class="oe_link"/>
+                        </group>
+                    </group>
+                    <separator string="Aging buckets"/>
+                    <group col="5">
+                        <field name="cartera_aging_30" widget="monetary"/>
+                        <field name="cartera_aging_60" widget="monetary"/>
+                        <field name="cartera_aging_90" widget="monetary"/>
+                        <field name="cartera_aging_120" widget="monetary"/>
+                        <field name="cartera_aging_mas" widget="monetary"/>
+                    </group>
+                    <separator string="Histórico de scoring"/>
+                    <field name="cartera_score_history_ids" nolabel="1">
+                        <list>
+                            <field name="fecha"/>
+                            <field name="score" widget="badge"/>
+                            <field name="dso"/>
+                            <field name="cumplimiento_pct" widget="percentage"/>
+                            <field name="saldo_abierto" widget="monetary"/>
+                        </list>
+                    </field>
+                </page>
+            </xpath>
+        </field>
+    </record>
+
+    <!-- ========================================================== -->
+    <!-- 4. PIVOT: Análisis multidimensional                         -->
+    <!-- ========================================================== -->
+    <record id="view_partner_pivot_cartera" model="ir.ui.view">
+        <field name="name">res.partner.pivot.cartera</field>
+        <field name="model">res.partner</field>
+        <field name="arch" type="xml">
+            <pivot>
+                <field name="user_id" type="row"/>
+                <field name="cartera_score" type="col"/>
+                <field name="cartera_saldo_abierto" type="measure"/>
+                <field name="cartera_saldo_vencido" type="measure"/>
+                <field name="cartera_dso_real" type="measure"/>
+            </pivot>
+        </field>
+    </record>
+
+    <!-- ========================================================== -->
+    <!-- 5. GRAPH: Visualización rápida                              -->
+    <!-- ========================================================== -->
+    <record id="view_partner_graph_cartera" model="ir.ui.view">
+        <field name="name">res.partner.graph.cartera</field>
+        <field name="model">res.partner</field>
+        <field name="arch" type="xml">
+            <graph type="bar">
+                <field name="cartera_score"/>
+                <field name="cartera_saldo_abierto" type="measure"/>
+            </graph>
+        </field>
+    </record>
+
+    <!-- ========================================================== -->
+    <!-- 6. SEARCH: Filtros estándar                                 -->
+    <!-- ========================================================== -->
+    <record id="view_partner_search_cartera" model="ir.ui.view">
+        <field name="name">res.partner.search.cartera</field>
+        <field name="model">res.partner</field>
+        <field name="arch" type="xml">
+            <search>
+                <field name="name"/>
+                <field name="user_id"/>
+                <separator/>
+                <filter name="con_saldo" string="Con saldo abierto"
+                        domain="[('cartera_saldo_abierto', '>', 0)]"/>
+                <filter name="con_vencido" string="Con vencido"
+                        domain="[('cartera_saldo_vencido', '>', 0)]"/>
+                <separator/>
+                <filter name="score_a" string="Score A" domain="[('cartera_score', '=', 'A')]"/>
+                <filter name="score_b" string="Score B" domain="[('cartera_score', '=', 'B')]"/>
+                <filter name="score_c" string="Score C" domain="[('cartera_score', '=', 'C')]"/>
+                <filter name="score_d" string="Score D" domain="[('cartera_score', '=', 'D')]"/>
+                <separator/>
+                <group string="Agrupar por">
+                    <filter name="group_score" string="Score"
+                            context="{'group_by': 'cartera_score'}"/>
+                    <filter name="group_habito" string="Hábito"
+                            context="{'group_by': 'cartera_habito_pago'}"/>
+                    <filter name="group_user" string="Vendedor"
+                            context="{'group_by': 'user_id'}"/>
+                </group>
+            </search>
+        </field>
+    </record>
+
+    <!-- ========================================================== -->
+    <!-- ACTION: Cartera Clientes                                    -->
+    <!-- ========================================================== -->
+    <record id="action_cartera_clientes" model="ir.actions.act_window">
+        <field name="name">📊 Cartera de Clientes</field>
+        <field name="res_model">res.partner</field>
+        <field name="view_mode">kanban,list,form,pivot,graph</field>
+        <field name="domain">[('customer_rank', '>', 0)]</field>
+        <field name="context">{
+            'search_default_con_saldo': 1,
+            'search_default_group_score': 1,
+        }</field>
+        <field name="help" type="html">
+            <p class="o_view_nocontent_smiling_face">
+                Análisis de cartera por cliente
+            </p>
+            <p>
+                Score, DSO, hábito de pago, aging. Se recalcula cada noche
+                automáticamente.
+            </p>
+        </field>
+    </record>
+
+</odoo>

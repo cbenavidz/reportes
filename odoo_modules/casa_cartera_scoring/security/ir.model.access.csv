@@ -1,0 +1,5 @@
+id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+access_cartera_score_history_user,casa.cartera.score.history (user),model_casa_cartera_score_history,account.group_account_invoice,1,0,0,0
+access_cartera_score_history_manager,casa.cartera.score.history (mgr),model_casa_cartera_score_history,account.group_account_manager,1,1,1,1
+access_cartera_alert_user,casa.cartera.alert (user),model_casa_cartera_alert,account.group_account_invoice,1,1,0,0
+access_cartera_alert_manager,casa.cartera.alert (mgr),model_casa_cartera_alert,account.group_account_manager,1,1,1,1
