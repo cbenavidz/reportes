@@ -8,6 +8,7 @@ y devolverlos como DataFrames de pandas listos para analizar.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date, datetime
 from typing import Any
 
@@ -188,6 +189,41 @@ def _unpack_m2o(value: Any) -> tuple[int | None, str | None]:
     if isinstance(value, (list, tuple)) and len(value) == 2:
         return int(value[0]), str(value[1])
     return None, None
+
+
+# Regex para extraer el default_code del display_name de Odoo,
+# que viene como "[CODE] Nombre del producto".
+_DISPLAY_NAME_CODE_RE = re.compile(r"^\s*\[([^\]]+)\]\s*(.*)$")
+
+
+def _code_from_display_name(display_name: str | None) -> str | None:
+    """Extrae el code de un display_name '[CODE] NAME'. None si no aplica."""
+    if not display_name or not isinstance(display_name, str):
+        return None
+    m = _DISPLAY_NAME_CODE_RE.match(display_name)
+    return m.group(1).strip() if m else None
+
+
+def _backfill_code_from_name(df: "pd.DataFrame") -> "pd.DataFrame":
+    """
+    Si `product_default_code` está vacío en alguna fila pero `product_name`
+    contiene '[CODE] NAME', extrae el code del nombre. Esto cubre el caso
+    de productos eliminados/archivados donde el lookup a product.product
+    falla pero el display_name de la línea de factura sigue siendo válido.
+    """
+    if "product_default_code" not in df.columns:
+        df["product_default_code"] = None
+    if "product_name" not in df.columns:
+        return df
+
+    mask_missing = df["product_default_code"].isna() | (
+        df["product_default_code"].astype(str).str.strip().isin(["", "None"])
+    )
+    if not mask_missing.any():
+        return df
+    extracted = df.loc[mask_missing, "product_name"].map(_code_from_display_name)
+    df.loc[mask_missing, "product_default_code"] = extracted
+    return df
 
 
 def _resolve_invoice_line_fields(client: OdooClient) -> tuple[list[str], list[str]]:
@@ -874,6 +910,12 @@ def extract_invoice_lines(
     # pero `date` de la línea es la fecha contable que en práctica = invoice_date).
     # Renombramos `date` → `invoice_date` para coincidir con la API del analyzer.
     df["invoice_date"] = df["date"]
+
+    # Backfill del código desde el display_name de la línea cuando el lookup
+    # a product.product/template no devolvió un default_code (producto
+    # eliminado, archivado o sin permisos de lectura).
+    df = _backfill_code_from_name(df)
+
     return df
 
 
@@ -1455,6 +1497,8 @@ def extract_purchase_invoice_lines(
         df["product_standard_price"] = 0.0
 
     df["invoice_date"] = df["date"]
+    # Backfill del código desde el display_name cuando el lookup falla
+    df = _backfill_code_from_name(df)
     return df
 
 

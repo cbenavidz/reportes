@@ -201,6 +201,86 @@ with k7:
 with k8:
     st.metric("💎 Stock valorado", _money(summary["stock_value"]))
 
+# Botón para limpiar cache y recargar datos
+col_rl, _ = st.columns([1, 4])
+with col_rl:
+    if st.button("🔄 Recargar datos (limpia caché)", key="cv_reload"):
+        st.cache_data.clear()
+        st.rerun()
+
+# ── Diagnóstico de productos sin código/categoría ──
+with st.expander("🔍 Diagnóstico de productos", expanded=False):
+    pl = purchases_lines if purchases_lines is not None else pd.DataFrame()
+    sl = sales_lines if sales_lines is not None else pd.DataFrame()
+
+    def _diag_block(df: pd.DataFrame, label: str) -> None:
+        if df is None or df.empty:
+            st.write(f"**{label}:** sin datos")
+            return
+        n_total = len(df)
+        n_sin_cod = (
+            df["product_default_code"].isna()
+            | (df["product_default_code"].astype(str).str.strip().isin(["", "None"]))
+        ).sum() if "product_default_code" in df.columns else n_total
+        n_sin_cat = (
+            df["product_categ_name"].isna()
+            | (df["product_categ_name"].astype(str).str.strip().isin(["", "None"]))
+        ).sum() if "product_categ_name" in df.columns else n_total
+        st.write(
+            f"**{label}:** {n_total:,} líneas · "
+            f"sin código: {n_sin_cod:,} · sin categoría: {n_sin_cat:,}"
+        )
+
+    _diag_block(pl, "Compras (in_invoice)")
+    _diag_block(sl, "Ventas (out_invoice)")
+
+    # Lista de product_ids únicos sin categoría
+    st.markdown("**Productos únicos sin categoría detectados:**")
+    rows = []
+    for label, df in [("Compras", pl), ("Ventas", sl)]:
+        if df is None or df.empty:
+            continue
+        if "product_categ_name" not in df.columns:
+            continue
+        miss = df[
+            df["product_categ_name"].isna()
+            | df["product_categ_name"].astype(str).str.strip().isin(["", "None"])
+        ]
+        if miss.empty:
+            continue
+        u = miss[[
+            "product_id", "product_name", "product_default_code",
+        ]].drop_duplicates(subset="product_id").copy()
+        u["origen"] = label
+        rows.append(u)
+    if rows:
+        diag_df = pd.concat(rows, ignore_index=True).drop_duplicates(
+            subset="product_id"
+        )
+        st.caption(f"{len(diag_df):,} product_id distintos sin categoría.")
+        st.dataframe(
+            diag_df,
+            column_config={
+                "product_id": "Product ID",
+                "product_name": st.column_config.TextColumn(
+                    "Producto (display_name)", width="large"
+                ),
+                "product_default_code": "Código resuelto",
+                "origen": "Origen",
+            },
+            use_container_width=True, hide_index=True, height=300,
+        )
+        st.caption(
+            "💡 Estos product_id existen en las líneas de factura pero el "
+            "lookup a `product.product` (incluso con `active_test=False` "
+            "y fallback a `product.template`) no devuelve sus datos. "
+            "Posibles causas: (a) producto eliminado con `unlink()` en Odoo, "
+            "(b) permisos del usuario XML-RPC bloquean el acceso, "
+            "(c) productos pertenecen a otra company no permitida."
+        )
+    else:
+        st.success("✅ Todos los productos tienen categoría resuelta.")
+
 st.markdown("---")
 
 
