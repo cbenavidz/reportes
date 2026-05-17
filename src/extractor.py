@@ -677,8 +677,7 @@ def extract_invoice_lines(
             # IMPORTANTE: standard_price es company-dependent en Odoo.
             # Sin context={'company_id': X} devuelve 0 o el de la default company.
             # Pasamos el primer company_id del filtro (si hay).
-            # active_test=False: incluir productos archivados (si fueron
-            # vendidos en el pasado, su categoría sigue siendo válida).
+            # active_test=False: incluir productos archivados.
             product_context: dict = {"active_test": False}
             if company_ids:
                 # context con allowed_company_ids fuerza Odoo a leer
@@ -689,15 +688,62 @@ def extract_invoice_lines(
                     "allowed_company_ids": list(company_ids),
                 })
 
-            prod_records = client.search_read(
+            # Usar read() en vez de search_read(): ignora active_test
+            # automáticamente y devuelve TODOS los registros por ID, incluso
+            # los archivados (Odoo solo filtra por active en search/search_read,
+            # no en read).
+            prod_records = client.read(
                 "product.product",
-                domain=[("id", "in", product_ids)],
+                ids=product_ids,
                 fields=[
                     "id", "categ_id", "default_code", "name", "volume",
-                    "standard_price",  # Precio de costo (company-dependent)
+                    "standard_price", "product_tmpl_id",
                 ],
                 context=product_context,
             )
+            # Si aún faltan productos (eliminados con unlink, no solo archivados),
+            # intentamos resolverlos vía product.template.
+            found_ids = {int(p["id"]) for p in prod_records if p.get("id")}
+            missing_ids = [pid for pid in product_ids if int(pid) not in found_ids]
+            if missing_ids:
+                logger.info(
+                    "%d productos no resueltos en product.product. "
+                    "Intentando vía product.template.",
+                    len(missing_ids),
+                )
+                # Estrategia: buscar product.template cuyos variant_ids
+                # contengan estos IDs. Como product.product.id = template.id
+                # cuando hay un solo variant, intentamos read directo sobre
+                # product.template con los mismos IDs.
+                try:
+                    tmpl_records = client.read(
+                        "product.template",
+                        ids=missing_ids,
+                        fields=[
+                            "id", "categ_id", "default_code", "name",
+                            "standard_price",
+                        ],
+                        context=product_context,
+                    )
+                    # Agregamos al pool de prod_records con un flag para
+                    # diferenciar la fuente.
+                    for t in tmpl_records:
+                        prod_records.append({
+                            "id": t["id"],
+                            "categ_id": t.get("categ_id"),
+                            "default_code": t.get("default_code"),
+                            "name": t.get("name"),
+                            "volume": 0,
+                            "standard_price": t.get("standard_price", 0),
+                        })
+                    logger.info(
+                        "Resueltos %d productos adicionales vía product.template.",
+                        len(tmpl_records),
+                    )
+                except Exception as exc_tmpl:  # noqa: BLE001
+                    logger.warning(
+                        "Fallback a product.template falló: %s", exc_tmpl,
+                    )
             cat_map: dict[int, tuple[int | None, str | None]] = {}
             code_map: dict[int, str | None] = {}
             volume_map: dict[int, float] = {}
@@ -1318,8 +1364,7 @@ def extract_purchase_invoice_lines(
     )
     if product_ids:
         try:
-            # active_test=False: incluir productos archivados (su categoría
-            # sigue siendo válida aunque ya no se vendan).
+            # active_test=False: incluir productos archivados.
             product_context: dict = {"active_test": False}
             if company_ids:
                 first_co = list(company_ids)[0]
@@ -1327,13 +1372,37 @@ def extract_purchase_invoice_lines(
                     "company_id": first_co,
                     "allowed_company_ids": list(company_ids),
                 })
-            prod_records = client.search_read(
+            # read() ignora active_test automáticamente y trae registros
+            # por ID directamente, incluso si están archivados.
+            prod_records = client.read(
                 "product.product",
-                domain=[("id", "in", product_ids)],
+                ids=product_ids,
                 fields=["id", "categ_id", "default_code", "name",
                         "standard_price"],
                 context=product_context,
             )
+            # Fallback a product.template para productos eliminados con unlink
+            found_ids = {int(p["id"]) for p in prod_records if p.get("id")}
+            missing_ids = [pid for pid in product_ids if int(pid) not in found_ids]
+            if missing_ids:
+                try:
+                    tmpl_records = client.read(
+                        "product.template",
+                        ids=missing_ids,
+                        fields=["id", "categ_id", "default_code", "name",
+                                "standard_price"],
+                        context=product_context,
+                    )
+                    for t in tmpl_records:
+                        prod_records.append({
+                            "id": t["id"],
+                            "categ_id": t.get("categ_id"),
+                            "default_code": t.get("default_code"),
+                            "name": t.get("name"),
+                            "standard_price": t.get("standard_price", 0),
+                        })
+                except Exception:  # noqa: BLE001
+                    pass
             cat_map: dict[int, tuple[int | None, str | None]] = {}
             code_map: dict[int, str | None] = {}
             cost_map: dict[int, float] = {}
