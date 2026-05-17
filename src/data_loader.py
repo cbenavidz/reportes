@@ -356,7 +356,7 @@ def filter_analysis_by_vendedor(
 #       `cost_source`, `margin_source` para trazabilidad.
 #   v10: pasar context={'company_id': X} al fetch de productos para
 #        resolver standard_price multi-empresa (antes devolvía 0).
-INVOICE_LINES_CACHE_VERSION = 10
+INVOICE_LINES_CACHE_VERSION = 11  # v11: active_test=False en product.product (incluir archivados)
 
 
 @st.cache_data(ttl=900, show_spinner="Descargando líneas de factura (productos)...")
@@ -394,7 +394,7 @@ def load_invoice_lines(
 # Loaders para análisis de Compras vs Ventas
 # ---------------------------------------------------------------------------
 
-PURCHASE_LINES_CACHE_VERSION = 1
+PURCHASE_LINES_CACHE_VERSION = 2  # v2: active_test=False en product.product
 STOCK_QUANTS_CACHE_VERSION = 1
 
 

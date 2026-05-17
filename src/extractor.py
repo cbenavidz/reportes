@@ -677,15 +677,17 @@ def extract_invoice_lines(
             # IMPORTANTE: standard_price es company-dependent en Odoo.
             # Sin context={'company_id': X} devuelve 0 o el de la default company.
             # Pasamos el primer company_id del filtro (si hay).
-            product_context: dict | None = None
+            # active_test=False: incluir productos archivados (si fueron
+            # vendidos en el pasado, su categoría sigue siendo válida).
+            product_context: dict = {"active_test": False}
             if company_ids:
                 # context con allowed_company_ids fuerza Odoo a leer
                 # el valor del costo en la empresa correcta.
                 first_co = list(company_ids)[0]
-                product_context = {
+                product_context.update({
                     "company_id": first_co,
                     "allowed_company_ids": list(company_ids),
-                }
+                })
 
             prod_records = client.search_read(
                 "product.product",
@@ -1316,13 +1318,15 @@ def extract_purchase_invoice_lines(
     )
     if product_ids:
         try:
-            product_context: dict | None = None
+            # active_test=False: incluir productos archivados (su categoría
+            # sigue siendo válida aunque ya no se vendan).
+            product_context: dict = {"active_test": False}
             if company_ids:
                 first_co = list(company_ids)[0]
-                product_context = {
+                product_context.update({
                     "company_id": first_co,
                     "allowed_company_ids": list(company_ids),
-                }
+                })
             prod_records = client.search_read(
                 "product.product",
                 domain=[("id", "in", product_ids)],
