@@ -23,15 +23,18 @@ from src.data_loader import (
     load_cash_movements_only,
     load_chart_of_accounts,
     load_companies,
+    load_expense_movements,
 )
 from src.ui_components import render_company_context, render_sidebar_filters
 from src.financial_statements import (
     compute_balance_sheet,
     compute_cash_flow,
     compute_expenses_breakdown,
+    compute_expenses_comparative,
     compute_income_statement,
     compute_pnl_monthly_evolution,
     compute_working_capital,
+    enrich_chart_with_puc,
 )
 
 st.set_page_config(
@@ -633,73 +636,624 @@ with tab_flujo:
 # ---------------------------------------------------------------------------
 with tab_gastos:
     st.markdown("## 💸 Análisis de Gastos")
-    st.caption(f"Período: {fecha_desde} → {fecha_hasta}")
-
-    exp = compute_expenses_breakdown(
-        moves, chart, fecha_desde, fecha_hasta,
-        balances_aggregated=balances_periodo,
+    st.caption(
+        f"Período: {fecha_desde} → {fecha_hasta} · "
+        f"Comparativo: {fecha_desde_prev} → {fecha_hasta_prev}"
     )
 
-    if exp["total_gastos"] == 0:
-        st.info("No hay gastos en el período seleccionado.")
+    # ── 1. Identificar cuentas de gasto del chart (grupo 5) para cargar
+    #       movimientos individuales SOLO de esas cuentas (rápido).
+    chart_e = enrich_chart_with_puc(chart) if not chart.empty else chart
+    if not chart_e.empty and "puc_group" in chart_e.columns:
+        expense_accounts = chart_e[chart_e["puc_group"].astype(str) == "5"]
     else:
-        st.metric("💸 Total gastos + costos", _money(exp["total_gastos"]))
+        expense_accounts = pd.DataFrame()
 
-        # Treemap por subgrupo
-        col_a, col_b = st.columns([1, 1])
-        with col_a:
-            st.markdown("### 🗂️ Por subgrupo")
-            if not exp["por_subgrupo"].empty:
-                fig = px.pie(
-                    exp["por_subgrupo"], values="monto", names="subgrupo",
-                    title=None,
-                    color_discrete_sequence=px.colors.sequential.Reds_r,
+    expense_account_ids: tuple[int, ...] = tuple(
+        int(i) for i in expense_accounts["id"].dropna().unique()
+    ) if not expense_accounts.empty and "id" in expense_accounts.columns else ()
+
+    if not expense_account_ids:
+        st.info(
+            "No se encontraron cuentas clasificadas como gasto (grupo 5) "
+            "en el plan de cuentas."
+        )
+    else:
+        with st.spinner("Cargando movimientos de gastos..."):
+            moves_gastos = load_expense_movements(
+                date_from=fecha_desde.isoformat(),
+                date_to=fecha_hasta.isoformat(),
+                expense_account_ids=expense_account_ids,
+                company_ids=filters["company_ids"],
+            )
+            moves_gastos_prev = load_expense_movements(
+                date_from=fecha_desde_prev.isoformat(),
+                date_to=fecha_hasta_prev.isoformat(),
+                expense_account_ids=expense_account_ids,
+                company_ids=filters["company_ids"],
+            )
+
+        exp = compute_expenses_breakdown(
+            moves_gastos, chart, fecha_desde, fecha_hasta,
+        )
+        exp_prev = compute_expenses_breakdown(
+            moves_gastos_prev, chart, fecha_desde_prev, fecha_hasta_prev,
+        )
+        comp = compute_expenses_comparative(exp, exp_prev, threshold_pct=20.0)
+
+        if exp["total_gastos"] == 0:
+            st.info("No hay gastos en el período seleccionado.")
+        else:
+            # ── KPIs cabecera ──────────────────────────────────────────
+            ps = exp["por_subgrupo"]
+            top_sg = ps.iloc[0] if not ps.empty else None
+
+            k1, k2, k3, k4 = st.columns(4)
+            with k1:
+                st.metric("💸 Total gastos", _money(exp["total_gastos"]))
+            with k2:
+                delta_str = (
+                    f"{comp['delta_total']:+,.0f} "
+                    f"({comp['pct_var_total']:+.1f}%)"
                 )
-                fig.update_layout(height=400, margin=dict(l=0, r=0, t=10, b=0))
-                st.plotly_chart(fig, use_container_width=True)
+                st.metric(
+                    "vs período anterior",
+                    _money(exp_prev["total_gastos"]),
+                    delta=delta_str,
+                    delta_color=(
+                        "inverse" if comp["delta_total"] > 0 else "normal"
+                    ),
+                )
+            with k3:
+                if top_sg is not None:
+                    st.metric(
+                        "🥇 Subgrupo mayor",
+                        str(top_sg["subgrupo"]),
+                        delta=f"{top_sg['pct']:.0f}% del total",
+                        delta_color="off",
+                    )
+            with k4:
+                n_alertas = len(comp["alertas"])
+                st.metric(
+                    "🔔 Alertas",
+                    f"{n_alertas}",
+                    delta=(
+                        "ver panel abajo" if n_alertas else "sin variaciones"
+                    ),
+                    delta_color="off",
+                )
 
-        with col_b:
-            st.markdown("### 🏆 Top cuentas de gasto")
-            top_cuentas = exp["por_cuenta"].head(15)
-            fig2 = px.bar(
-                top_cuentas.sort_values("monto"),
-                x="monto", y="account_name", orientation="h",
-                color_discrete_sequence=["#ef4444"],
-                text="monto",
-            )
-            fig2.update_traces(texttemplate="%{text:,.0f}", textposition="outside")
-            fig2.update_layout(
-                height=400, margin=dict(l=0, r=0, t=10, b=0),
-                yaxis=dict(title=""), xaxis=dict(tickformat=",.0f"),
-            )
-            st.plotly_chart(fig2, use_container_width=True)
+            st.markdown("---")
 
-        # Tabla detallada
-        with st.expander("📋 Detalle completo por cuenta", expanded=False):
-            st.dataframe(
-                exp["por_cuenta"],
-                column_config={
-                    "account_code": "Código",
-                    "account_name": st.column_config.TextColumn("Cuenta", width="large"),
-                    "subgrupo": "Subgrupo",
-                    "monto": st.column_config.NumberColumn("Monto", format="$%,.0f"),
-                    "pct": st.column_config.NumberColumn("% del total", format="%.1f%%"),
-                },
-                use_container_width=True, hide_index=True, height=500,
+            # ── Sub-pestañas para organizar el detalle ─────────────────
+            tg_resumen, tg_drill, tg_evol, tg_comp, tg_tercero, tg_alert = (
+                st.tabs([
+                    "📊 Resumen",
+                    "🔍 Drill-down",
+                    "📈 Evolución mensual",
+                    "🔄 Comparativo",
+                    "🤝 Por tercero",
+                    "🔔 Alertas",
+                ])
             )
 
-        # Evolución mensual de gastos por subgrupo
-        if not exp["por_mes"].empty:
-            st.markdown("### 📈 Evolución mensual de gastos por categoría")
-            por_mes = exp["por_mes"].copy()
-            por_mes["mes_label"] = pd.to_datetime(por_mes["mes"]).dt.strftime("%Y-%m")
-            fig3 = px.bar(
-                por_mes, x="mes_label", y="monto", color="subgrupo",
-                title=None,
-            )
-            fig3.update_layout(height=400, margin=dict(l=0, r=0, t=10, b=0),
-                               yaxis=dict(tickformat=",.0f"))
-            st.plotly_chart(fig3, use_container_width=True)
+            # ─── Sub-tab: Resumen ──────────────────────────────────────
+            with tg_resumen:
+                col_a, col_b = st.columns([1, 1])
+                with col_a:
+                    st.markdown("### 🗂️ Composición por subgrupo")
+                    if not ps.empty:
+                        fig = px.pie(
+                            ps, values="monto", names="subgrupo", title=None,
+                            color_discrete_sequence=px.colors.sequential.Reds_r,
+                        )
+                        fig.update_layout(
+                            height=400, margin=dict(l=0, r=0, t=10, b=0),
+                        )
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.dataframe(
+                            ps,
+                            column_config={
+                                "subgrupo": "Subgrupo",
+                                "monto": st.column_config.NumberColumn(
+                                    "Monto", format="$%,.0f"
+                                ),
+                                "pct": st.column_config.NumberColumn(
+                                    "%", format="%.1f%%"
+                                ),
+                            },
+                            use_container_width=True, hide_index=True,
+                        )
+
+                with col_b:
+                    st.markdown("### 🏆 Top 15 cuentas")
+                    top_cuentas = exp["por_cuenta"].head(15)
+                    if not top_cuentas.empty:
+                        fig2 = px.bar(
+                            top_cuentas.sort_values("monto"),
+                            x="monto", y="account_name", orientation="h",
+                            color="subgrupo", text="monto",
+                            color_discrete_map={
+                                "Gastos administrativos": "#ef4444",
+                                "Gastos de ventas": "#f97316",
+                                "Gastos no operacionales": "#a855f7",
+                            },
+                        )
+                        fig2.update_traces(
+                            texttemplate="%{text:,.0f}",
+                            textposition="outside",
+                        )
+                        fig2.update_layout(
+                            height=440, margin=dict(l=0, r=0, t=10, b=0),
+                            yaxis=dict(title=""),
+                            xaxis=dict(tickformat=",.0f"),
+                            legend=dict(
+                                orientation="h", yanchor="bottom",
+                                y=-0.2, xanchor="left", x=0,
+                            ),
+                        )
+                        st.plotly_chart(fig2, use_container_width=True)
+
+                # Tabla detallada
+                st.markdown("### 📋 Detalle por cuenta")
+                pc_show = exp["por_cuenta"].copy()
+                if not pc_show.empty:
+                    # Búsqueda por código/nombre
+                    q = st.text_input(
+                        "Buscar cuenta",
+                        placeholder="Código o nombre…",
+                        key="exp_buscar_cuenta",
+                    )
+                    if q:
+                        q_lower = q.lower()
+                        mask = (
+                            pc_show["account_code"].astype(str)
+                            .str.lower().str.contains(q_lower, na=False)
+                            | pc_show["account_name"].astype(str)
+                            .str.lower().str.contains(q_lower, na=False)
+                        )
+                        pc_show = pc_show[mask]
+                    st.dataframe(
+                        pc_show,
+                        column_config={
+                            "account_code": "Código",
+                            "account_name": st.column_config.TextColumn(
+                                "Cuenta", width="large"
+                            ),
+                            "subgrupo": "Subgrupo",
+                            "monto": st.column_config.NumberColumn(
+                                "Monto", format="$%,.0f"
+                            ),
+                            "pct": st.column_config.NumberColumn(
+                                "% del total", format="%.1f%%"
+                            ),
+                        },
+                        use_container_width=True, hide_index=True,
+                        height=400,
+                    )
+
+            # ─── Sub-tab: Drill-down ───────────────────────────────────
+            with tg_drill:
+                st.markdown("### 🔍 Subgrupo → Cuenta → Movimiento")
+                st.caption(
+                    "Selecciona un subgrupo para ver sus cuentas, y una cuenta "
+                    "para ver los movimientos individuales."
+                )
+                col_sel1, col_sel2 = st.columns(2)
+                with col_sel1:
+                    subgrupos_disp = (
+                        exp["por_subgrupo"]["subgrupo"].tolist()
+                        if not exp["por_subgrupo"].empty else []
+                    )
+                    sel_sg = st.selectbox(
+                        "Subgrupo", options=subgrupos_disp,
+                        key="exp_sel_subgrupo",
+                    )
+                with col_sel2:
+                    cuentas_del_sg = (
+                        exp["por_cuenta"][exp["por_cuenta"]["subgrupo"] == sel_sg]
+                        if sel_sg else pd.DataFrame()
+                    )
+                    opciones_cuenta = ["(Todas las cuentas)"] + [
+                        f"{r['account_code']} — {r['account_name']}"
+                        for _, r in cuentas_del_sg.iterrows()
+                    ]
+                    sel_cta = st.selectbox(
+                        "Cuenta", options=opciones_cuenta,
+                        key="exp_sel_cuenta",
+                    )
+
+                # Mostrar cuentas del subgrupo
+                if not cuentas_del_sg.empty:
+                    st.markdown(f"**Cuentas dentro de {sel_sg}:**")
+                    st.dataframe(
+                        cuentas_del_sg,
+                        column_config={
+                            "account_code": "Código",
+                            "account_name": st.column_config.TextColumn(
+                                "Cuenta", width="large"
+                            ),
+                            "subgrupo": None,
+                            "monto": st.column_config.NumberColumn(
+                                "Monto", format="$%,.0f"
+                            ),
+                            "pct": st.column_config.NumberColumn(
+                                "% del total", format="%.1f%%"
+                            ),
+                        },
+                        use_container_width=True, hide_index=True,
+                        height=260,
+                    )
+
+                # Mostrar movimientos
+                movs = exp.get("movimientos", pd.DataFrame())
+                if not movs.empty:
+                    if sel_sg:
+                        movs = movs[movs["subgrupo"] == sel_sg]
+                    if sel_cta and sel_cta != "(Todas las cuentas)":
+                        cod = sel_cta.split(" — ")[0]
+                        movs = movs[movs["account_code"] == cod]
+
+                    st.markdown(
+                        f"**Movimientos detallados ({len(movs):,} líneas):**"
+                    )
+                    if not movs.empty:
+                        # Mostrar columnas amigables
+                        show_cols = [
+                            "date", "account_code", "account_name",
+                            "partner_name", "move_id_name", "name",
+                            "monto",
+                        ]
+                        show_cols = [c for c in show_cols if c in movs.columns]
+                        st.dataframe(
+                            movs[show_cols].head(500),
+                            column_config={
+                                "date": st.column_config.DateColumn(
+                                    "Fecha", format="YYYY-MM-DD"
+                                ),
+                                "account_code": "Código",
+                                "account_name": st.column_config.TextColumn(
+                                    "Cuenta", width="medium"
+                                ),
+                                "partner_name": "Tercero",
+                                "move_id_name": "Asiento",
+                                "name": st.column_config.TextColumn(
+                                    "Descripción", width="large"
+                                ),
+                                "monto": st.column_config.NumberColumn(
+                                    "Monto", format="$%,.0f"
+                                ),
+                            },
+                            use_container_width=True, hide_index=True,
+                            height=420,
+                        )
+                        if len(movs) > 500:
+                            st.caption(
+                                f"Mostrando primeras 500 de {len(movs):,} "
+                                "líneas."
+                            )
+
+            # ─── Sub-tab: Evolución mensual ────────────────────────────
+            with tg_evol:
+                st.markdown("### 📈 Evolución mensual por subgrupo")
+                por_mes = exp.get("por_mes", pd.DataFrame()).copy()
+                if not por_mes.empty:
+                    por_mes["mes_label"] = (
+                        pd.to_datetime(por_mes["mes"]).dt.strftime("%Y-%m")
+                    )
+                    # Barras apiladas
+                    fig3 = px.bar(
+                        por_mes, x="mes_label", y="monto", color="subgrupo",
+                        title=None, text="monto",
+                        color_discrete_map={
+                            "Gastos administrativos": "#ef4444",
+                            "Gastos de ventas": "#f97316",
+                            "Gastos no operacionales": "#a855f7",
+                        },
+                    )
+                    fig3.update_traces(
+                        texttemplate="%{text:,.0f}", textposition="inside",
+                    )
+                    fig3.update_layout(
+                        height=420, margin=dict(l=0, r=0, t=10, b=0),
+                        yaxis=dict(tickformat=",.0f"),
+                    )
+                    st.plotly_chart(fig3, use_container_width=True)
+
+                    # Línea de total mensual
+                    total_mes = por_mes.groupby(
+                        "mes_label", as_index=False
+                    )["monto"].sum()
+                    fig4 = px.line(
+                        total_mes, x="mes_label", y="monto", markers=True,
+                        text="monto", title=None,
+                    )
+                    fig4.update_traces(
+                        texttemplate="%{text:,.0f}", textposition="top center",
+                        line=dict(color="#dc2626", width=3),
+                    )
+                    fig4.update_layout(
+                        height=300, margin=dict(l=0, r=0, t=10, b=0),
+                        yaxis=dict(tickformat=",.0f"),
+                        title="Gasto total por mes",
+                    )
+                    st.plotly_chart(fig4, use_container_width=True)
+
+                    # Tabla pivote
+                    with st.expander(
+                        "📋 Tabla pivote (mes × subgrupo)", expanded=False
+                    ):
+                        pivot = por_mes.pivot_table(
+                            index="mes_label", columns="subgrupo",
+                            values="monto", aggfunc="sum", fill_value=0,
+                        ).reset_index()
+                        st.dataframe(
+                            pivot, use_container_width=True, hide_index=True,
+                        )
+                else:
+                    st.info("No hay datos mensuales para mostrar.")
+
+            # ─── Sub-tab: Comparativo ──────────────────────────────────
+            with tg_comp:
+                st.markdown("### 🔄 Variación vs período anterior")
+                st.caption(
+                    f"Actual: {fecha_desde} → {fecha_hasta} · "
+                    f"Anterior: {fecha_desde_prev} → {fecha_hasta_prev}"
+                )
+
+                vs = comp.get("variacion_subgrupo", pd.DataFrame())
+                if not vs.empty:
+                    st.markdown("**Variación por subgrupo**")
+                    st.dataframe(
+                        vs,
+                        column_config={
+                            "subgrupo": "Subgrupo",
+                            "monto_act": st.column_config.NumberColumn(
+                                "Actual", format="$%,.0f"
+                            ),
+                            "monto_prev": st.column_config.NumberColumn(
+                                "Anterior", format="$%,.0f"
+                            ),
+                            "delta": st.column_config.NumberColumn(
+                                "Δ", format="$%,.0f"
+                            ),
+                            "pct_var": st.column_config.NumberColumn(
+                                "% Var", format="%.1f%%"
+                            ),
+                        },
+                        use_container_width=True, hide_index=True,
+                    )
+
+                vc = comp.get("variacion_cuenta", pd.DataFrame())
+                if not vc.empty:
+                    st.markdown("**Variación por cuenta**")
+                    # Filtro por subgrupo
+                    sub_filter = st.multiselect(
+                        "Filtrar por subgrupo",
+                        options=sorted(vc["subgrupo"].dropna().unique()),
+                        default=[],
+                        key="exp_comp_sub_filter",
+                    )
+                    vc_show = vc.copy()
+                    if sub_filter:
+                        vc_show = vc_show[vc_show["subgrupo"].isin(sub_filter)]
+                    only_alertas = st.checkbox(
+                        "Solo cuentas con alerta",
+                        value=False, key="exp_comp_only_alert",
+                    )
+                    if only_alertas:
+                        vc_show = vc_show[vc_show["alerta"] != ""]
+
+                    st.dataframe(
+                        vc_show,
+                        column_config={
+                            "account_code": "Código",
+                            "account_name": st.column_config.TextColumn(
+                                "Cuenta", width="large"
+                            ),
+                            "subgrupo": "Subgrupo",
+                            "monto_act": st.column_config.NumberColumn(
+                                "Actual", format="$%,.0f"
+                            ),
+                            "monto_prev": st.column_config.NumberColumn(
+                                "Anterior", format="$%,.0f"
+                            ),
+                            "delta": st.column_config.NumberColumn(
+                                "Δ", format="$%,.0f"
+                            ),
+                            "pct_var": st.column_config.NumberColumn(
+                                "% Var", format="%.1f%%"
+                            ),
+                            "alerta": "Alerta",
+                        },
+                        use_container_width=True, hide_index=True,
+                        height=500,
+                    )
+
+                    # Top subidas y bajadas
+                    cs1, cs2 = st.columns(2)
+                    with cs1:
+                        st.markdown("**🔺 Top 10 subidas (Δ$)**")
+                        top_sub = vc[vc["delta"] > 0].nlargest(10, "delta")
+                        if not top_sub.empty:
+                            fig_s = px.bar(
+                                top_sub.sort_values("delta"),
+                                x="delta", y="account_name",
+                                orientation="h",
+                                color_discrete_sequence=["#dc2626"],
+                                text="delta",
+                            )
+                            fig_s.update_traces(
+                                texttemplate="+%{text:,.0f}",
+                                textposition="outside",
+                            )
+                            fig_s.update_layout(
+                                height=360, margin=dict(l=0, r=0, t=10, b=0),
+                                yaxis=dict(title=""),
+                                xaxis=dict(tickformat=",.0f"),
+                            )
+                            st.plotly_chart(fig_s, use_container_width=True)
+                    with cs2:
+                        st.markdown("**🔻 Top 10 bajadas (Δ$)**")
+                        top_baj = vc[vc["delta"] < 0].nsmallest(10, "delta")
+                        if not top_baj.empty:
+                            fig_b = px.bar(
+                                top_baj.sort_values("delta", ascending=False),
+                                x="delta", y="account_name",
+                                orientation="h",
+                                color_discrete_sequence=["#10b981"],
+                                text="delta",
+                            )
+                            fig_b.update_traces(
+                                texttemplate="%{text:,.0f}",
+                                textposition="outside",
+                            )
+                            fig_b.update_layout(
+                                height=360, margin=dict(l=0, r=0, t=10, b=0),
+                                yaxis=dict(title=""),
+                                xaxis=dict(tickformat=",.0f"),
+                            )
+                            st.plotly_chart(fig_b, use_container_width=True)
+                else:
+                    st.info("No hay datos del período anterior para comparar.")
+
+            # ─── Sub-tab: Por tercero ──────────────────────────────────
+            with tg_tercero:
+                st.markdown("### 🤝 Análisis por tercero/proveedor")
+                st.caption(
+                    "Qué proveedores concentran cada cuenta de gasto. "
+                    "Útil para negociar, detectar concentración y auditar."
+                )
+                pt = exp.get("por_tercero", pd.DataFrame())
+                if pt.empty:
+                    st.info(
+                        "No hay información de terceros en los movimientos "
+                        "de este período."
+                    )
+                else:
+                    # KPIs de concentración
+                    pt_partner = pt.groupby(
+                        ["partner_id", "partner_name"], as_index=False,
+                        dropna=False,
+                    )["monto"].sum().sort_values("monto", ascending=False)
+                    total_t = float(pt_partner["monto"].sum())
+                    n_terceros = pt_partner["partner_id"].nunique()
+                    top_3 = pt_partner.head(3)["monto"].sum()
+                    pct_top3 = (top_3 / total_t * 100) if total_t else 0
+
+                    kt1, kt2, kt3 = st.columns(3)
+                    with kt1:
+                        st.metric("Terceros distintos", f"{n_terceros:,}")
+                    with kt2:
+                        st.metric("Top 3 concentración", f"{pct_top3:.1f}%")
+                    with kt3:
+                        if not pt_partner.empty:
+                            top_p = pt_partner.iloc[0]
+                            st.metric(
+                                "🥇 Top 1",
+                                str(top_p["partner_name"])[:30],
+                                delta=_money(top_p["monto"]),
+                                delta_color="off",
+                            )
+
+                    # Filtro por subgrupo
+                    sg_t = st.selectbox(
+                        "Ver por subgrupo",
+                        options=["(Todos)"] + sorted(
+                            pt["subgrupo"].dropna().unique().tolist()
+                        ),
+                        key="exp_tercero_sub",
+                    )
+                    pt_show = pt.copy()
+                    if sg_t and sg_t != "(Todos)":
+                        pt_show = pt_show[pt_show["subgrupo"] == sg_t]
+
+                    # Top 20 terceros
+                    st.markdown("**Top 20 terceros por gasto**")
+                    top_t = pt_show.groupby(
+                        ["partner_id", "partner_name"], as_index=False,
+                        dropna=False,
+                    )["monto"].sum().sort_values(
+                        "monto", ascending=False
+                    ).head(20)
+                    if not top_t.empty:
+                        fig_t = px.bar(
+                            top_t.sort_values("monto"),
+                            x="monto", y="partner_name", orientation="h",
+                            color_discrete_sequence=["#7c3aed"],
+                            text="monto",
+                        )
+                        fig_t.update_traces(
+                            texttemplate="%{text:,.0f}",
+                            textposition="outside",
+                        )
+                        fig_t.update_layout(
+                            height=520, margin=dict(l=0, r=0, t=10, b=0),
+                            yaxis=dict(title=""),
+                            xaxis=dict(tickformat=",.0f"),
+                        )
+                        st.plotly_chart(fig_t, use_container_width=True)
+
+                    # Tabla cruzada tercero × cuenta
+                    st.markdown("**Detalle tercero × cuenta**")
+                    st.dataframe(
+                        pt_show[[
+                            "partner_name", "account_code", "account_name",
+                            "subgrupo", "monto", "pct",
+                        ]],
+                        column_config={
+                            "partner_name": st.column_config.TextColumn(
+                                "Tercero", width="medium"
+                            ),
+                            "account_code": "Código",
+                            "account_name": st.column_config.TextColumn(
+                                "Cuenta", width="large"
+                            ),
+                            "subgrupo": "Subgrupo",
+                            "monto": st.column_config.NumberColumn(
+                                "Monto", format="$%,.0f"
+                            ),
+                            "pct": st.column_config.NumberColumn(
+                                "%", format="%.1f%%"
+                            ),
+                        },
+                        use_container_width=True, hide_index=True,
+                        height=420,
+                    )
+
+            # ─── Sub-tab: Alertas ──────────────────────────────────────
+            with tg_alert:
+                st.markdown("### 🔔 Alertas automáticas")
+                st.caption(
+                    "Variaciones significativas (>20%) vs período anterior, "
+                    "gastos nuevos que no existían antes, y reducciones "
+                    "importantes."
+                )
+                alertas = comp.get("alertas", [])
+                if not alertas:
+                    st.success(
+                        "✅ Sin variaciones significativas vs el período "
+                        "anterior."
+                    )
+                else:
+                    # Agrupar por tipo
+                    df_a = pd.DataFrame(alertas)
+                    for tipo, grupo in df_a.groupby("tipo"):
+                        st.markdown(f"#### {tipo}")
+                        for _, r in grupo.iterrows():
+                            with st.container(border=True):
+                                cA, cB = st.columns([3, 1])
+                                with cA:
+                                    st.markdown(
+                                        f"**{r['cuenta']}**  "
+                                        f"\n_{r['subgrupo']}_  "
+                                        f"\n{r['detalle']}"
+                                    )
+                                with cB:
+                                    st.metric(
+                                        "Monto", _money(r["monto"]),
+                                        label_visibility="collapsed",
+                                    )
 
 
 # ---------------------------------------------------------------------------

@@ -567,6 +567,88 @@ def load_cash_movements_only(
     return moves
 
 
+@st.cache_data(ttl=900, show_spinner="Cargando movimientos de gastos...")
+def load_expense_movements(
+    date_from: str,
+    date_to: str,
+    expense_account_ids: tuple[int, ...],
+    company_ids: tuple[int, ...] | None = None,
+    _cache_v: int = ACCOUNT_MOVEMENTS_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """
+    Trae account.move.line filtrado a cuentas de gasto (grupo 5) y rango.
+
+    Mucho más rápido que cargar TODOS los movimientos: solo trae líneas
+    asociadas a las cuentas de gasto específicas que pasamos. Esto permite
+    desglose por mes real, por tercero y drill-down a movimientos.
+    """
+    from .extractor import extract_account_movements
+    if not expense_account_ids:
+        return pd.DataFrame()
+    client = get_odoo_client()
+    df_date = pd.to_datetime(date_from).date()
+    dt_date = pd.to_datetime(date_to).date()
+
+    # Pasamos el domain manualmente para incluir el filtro de account_id
+    # (extract_account_movements no acepta ese filtro directo, así que
+    # cargamos todo el rango y luego filtramos in-memory; pero ojo:
+    # un rango grande puede ser lento. Mejoramos llamando directo a
+    # search_read con el dominio completo.)
+    domain: list = [
+        ("parent_state", "=", "posted"),
+        ("date", ">=", df_date.isoformat()),
+        ("date", "<=", dt_date.isoformat()),
+        ("account_id", "in", list(expense_account_ids)),
+    ]
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
+
+    fields = [
+        "id", "account_id", "partner_id", "move_id",
+        "date", "name", "ref",
+        "debit", "credit", "balance",
+        "company_id", "journal_id",
+    ]
+    try:
+        all_fields_meta = client.fields_get(
+            "account.move.line", attributes=["string"]
+        )
+        available = set(all_fields_meta.keys())
+        fields = [f for f in fields if f in available]
+    except Exception:  # noqa: BLE001
+        pass
+
+    try:
+        records = client.search_read(
+            "account.move.line",
+            domain=domain,
+            fields=fields,
+            order="date asc, id asc",
+        )
+    except Exception:  # noqa: BLE001
+        return pd.DataFrame()
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records)
+    # Desempaquetar many2ones
+    def _m2o_id(v):
+        return v[0] if isinstance(v, list) and v else None
+    def _m2o_name(v):
+        return v[1] if isinstance(v, list) and len(v) > 1 else None
+    for col in ("account_id", "partner_id", "move_id", "company_id", "journal_id"):
+        if col in df.columns:
+            df[col + "_name"] = df[col].apply(_m2o_name)
+            df[col] = df[col].apply(_m2o_id)
+    for c in ("debit", "credit", "balance"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    return df
+
+
 @st.cache_data(ttl=900, show_spinner="Calculando saldo de cartera...")
 def load_cartera_summary(
     company_ids: tuple[int, ...] | None = None,

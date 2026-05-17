@@ -920,8 +920,33 @@ def compute_expenses_breakdown(
     date_to: date,
     balances_aggregated: pd.DataFrame | None = None,
 ) -> dict:
-    """Desglose de gastos por subgrupo, cuenta, y mes."""
-    if balances_aggregated is not None and not balances_aggregated.empty:
+    """
+    Desglose de gastos: subgrupo, cuenta, mes, tercero y movimientos.
+
+    Si recibe `moves` (account.move.line individuales), calcula TODAS las
+    dimensiones (incluyendo por_tercero y movimientos para drill-down).
+
+    Si solo recibe `balances_aggregated`, da el desglose por cuenta y
+    subgrupo pero NO por mes real ni por tercero.
+
+    Devuelve dict con:
+      - total_gastos: total del período
+      - por_subgrupo: DF (subgrupo, monto, pct)
+      - por_cuenta: DF (account_code, account_name, subgrupo, monto, pct)
+      - por_mes: DF (mes, subgrupo, monto)        [solo si hay moves]
+      - por_tercero: DF (partner_id, partner_name, subgrupo, monto, pct)
+                                                 [solo si hay moves]
+      - movimientos: DF detallado (drill-down)   [solo si hay moves]
+      - cuentas_por_subgrupo: dict subgrupo→list(account_code) — para drill-down
+    """
+    use_moves = (
+        moves is not None and not moves.empty
+        and "date" in moves.columns
+    )
+    if use_moves:
+        sub = _filter_moves(moves, date_from, date_to)
+        sub = _join_moves_chart(sub, chart)
+    elif balances_aggregated is not None and not balances_aggregated.empty:
         sub = balances_aggregated.copy()
         chart_e = enrich_chart_with_puc(chart)
         if "code" in chart_e.columns:
@@ -938,14 +963,17 @@ def compute_expenses_breakdown(
         # No tenemos `date` en aggregated → no podemos hacer breakdown por mes
         sub["date"] = pd.Timestamp(date_from)
     else:
-        sub = _filter_moves(moves, date_from, date_to)
-        sub = _join_moves_chart(sub, chart)
+        sub = pd.DataFrame()
+
     if sub.empty:
         return {
             "total_gastos": 0,
             "por_subgrupo": pd.DataFrame(),
             "por_cuenta": pd.DataFrame(),
             "por_mes": pd.DataFrame(),
+            "por_tercero": pd.DataFrame(),
+            "movimientos": pd.DataFrame(),
+            "cuentas_por_subgrupo": {},
         }
 
     # Solo gastos (grupo 5): 51 Administrativos, 52 Ventas, 53 No operacionales/financieros
@@ -964,15 +992,24 @@ def compute_expenses_breakdown(
             "por_subgrupo": pd.DataFrame(),
             "por_cuenta": pd.DataFrame(),
             "por_mes": pd.DataFrame(),
+            "por_tercero": pd.DataFrame(),
+            "movimientos": pd.DataFrame(),
+            "cuentas_por_subgrupo": {},
         }
 
     gastos["monto"] = gastos["debit"] - gastos["credit"]
     total = float(gastos["monto"].sum())
 
+    # --- Por subgrupo ---
     por_subgrupo = gastos.groupby("subgrupo", as_index=False)["monto"].sum()
-    por_subgrupo["pct"] = por_subgrupo["monto"] / total * 100 if total else 0
-    por_subgrupo = por_subgrupo.sort_values("monto", ascending=False).reset_index(drop=True)
+    por_subgrupo["pct"] = (
+        por_subgrupo["monto"] / total * 100 if total else 0
+    )
+    por_subgrupo = por_subgrupo.sort_values(
+        "monto", ascending=False
+    ).reset_index(drop=True)
 
+    # --- Por cuenta ---
     por_cuenta = gastos.groupby(
         ["account_code", "account_name", "subgrupo"], as_index=False
     )["monto"].sum()
@@ -981,14 +1018,261 @@ def compute_expenses_breakdown(
         "monto", ascending=False
     ).reset_index(drop=True)
 
-    gastos["mes"] = pd.to_datetime(gastos["date"]).dt.to_period("M").dt.to_timestamp()
-    por_mes = gastos.groupby(["mes", "subgrupo"], as_index=False)["monto"].sum()
+    cuentas_por_subgrupo = (
+        por_cuenta.groupby("subgrupo")["account_code"].apply(list).to_dict()
+    )
+
+    # --- Por mes (solo útil con moves reales) ---
+    if use_moves:
+        gastos["mes"] = (
+            pd.to_datetime(gastos["date"]).dt.to_period("M").dt.to_timestamp()
+        )
+        por_mes = gastos.groupby(
+            ["mes", "subgrupo"], as_index=False
+        )["monto"].sum()
+    else:
+        por_mes = pd.DataFrame()
+
+    # --- Por tercero (solo si moves trae partner_id) ---
+    por_tercero = pd.DataFrame()
+    if use_moves and "partner_id" in gastos.columns:
+        if "partner_id_name" in gastos.columns:
+            partner_name_col = "partner_id_name"
+        elif "partner_name" in gastos.columns:
+            partner_name_col = "partner_name"
+        else:
+            partner_name_col = None
+        if partner_name_col:
+            por_tercero = gastos.groupby(
+                [
+                    "partner_id", partner_name_col, "subgrupo",
+                    "account_code", "account_name",
+                ],
+                as_index=False, dropna=False,
+            )["monto"].sum()
+            por_tercero = por_tercero.rename(
+                columns={partner_name_col: "partner_name"}
+            )
+            por_tercero["pct"] = (
+                por_tercero["monto"] / total * 100 if total else 0
+            )
+            por_tercero = por_tercero[
+                por_tercero["monto"] != 0
+            ].sort_values("monto", ascending=False).reset_index(drop=True)
+            # Rellenar NaN en partner_name (movimientos sin tercero)
+            por_tercero["partner_name"] = por_tercero["partner_name"].fillna(
+                "(Sin tercero)"
+            )
+
+    # --- Movimientos para drill-down ---
+    movimientos = pd.DataFrame()
+    if use_moves:
+        keep = [c for c in [
+            "date", "account_code", "account_name", "subgrupo",
+            "partner_id", "partner_id_name", "partner_name",
+            "move_id_name", "name", "ref", "debit", "credit", "monto",
+        ] if c in gastos.columns]
+        movimientos = gastos[keep].copy()
+        # Unificar partner_name
+        if "partner_id_name" in movimientos.columns:
+            movimientos["partner_name"] = movimientos.get(
+                "partner_name", movimientos["partner_id_name"]
+            ).fillna(movimientos["partner_id_name"])
+        elif "partner_name" not in movimientos.columns:
+            movimientos["partner_name"] = ""
+        movimientos["partner_name"] = movimientos["partner_name"].fillna(
+            "(Sin tercero)"
+        )
+        movimientos = movimientos.sort_values(
+            ["date", "monto"], ascending=[False, False]
+        ).reset_index(drop=True)
 
     return {
         "total_gastos": total,
         "por_subgrupo": por_subgrupo,
         "por_cuenta": por_cuenta,
         "por_mes": por_mes,
+        "por_tercero": por_tercero,
+        "movimientos": movimientos,
+        "cuentas_por_subgrupo": cuentas_por_subgrupo,
+    }
+
+
+def compute_expenses_comparative(
+    current: dict,
+    previous: dict,
+    threshold_pct: float = 20.0,
+) -> dict:
+    """
+    Compara dos breakdowns de gastos (período actual vs anterior) y
+    genera tabla de variaciones + alertas.
+
+    Args:
+        current: resultado de compute_expenses_breakdown del período actual.
+        previous: resultado del período anterior.
+        threshold_pct: variación absoluta que dispara alerta (default 20%).
+
+    Devuelve dict con:
+      - variacion_subgrupo: DF (subgrupo, monto_act, monto_prev, delta, pct_var)
+      - variacion_cuenta: DF (account_code, account_name, subgrupo,
+                              monto_act, monto_prev, delta, pct_var, alerta)
+      - alertas: list[dict] con alertas tipificadas
+      - total_act, total_prev, delta_total, pct_var_total
+    """
+    pc_a = current.get("por_cuenta", pd.DataFrame()).copy()
+    pc_p = previous.get("por_cuenta", pd.DataFrame()).copy()
+    ps_a = current.get("por_subgrupo", pd.DataFrame()).copy()
+    ps_p = previous.get("por_subgrupo", pd.DataFrame()).copy()
+    total_a = float(current.get("total_gastos", 0) or 0)
+    total_p = float(previous.get("total_gastos", 0) or 0)
+
+    # --- Variación por subgrupo ---
+    if ps_a.empty and ps_p.empty:
+        variacion_subgrupo = pd.DataFrame()
+    else:
+        ps_a_min = ps_a[["subgrupo", "monto"]].rename(
+            columns={"monto": "monto_act"}
+        ) if not ps_a.empty else pd.DataFrame(columns=["subgrupo", "monto_act"])
+        ps_p_min = ps_p[["subgrupo", "monto"]].rename(
+            columns={"monto": "monto_prev"}
+        ) if not ps_p.empty else pd.DataFrame(columns=["subgrupo", "monto_prev"])
+        variacion_subgrupo = ps_a_min.merge(
+            ps_p_min, on="subgrupo", how="outer"
+        ).fillna(0)
+        variacion_subgrupo["delta"] = (
+            variacion_subgrupo["monto_act"] - variacion_subgrupo["monto_prev"]
+        )
+        variacion_subgrupo["pct_var"] = variacion_subgrupo.apply(
+            lambda r: (
+                (r["delta"] / abs(r["monto_prev"]) * 100)
+                if r["monto_prev"] not in (0, 0.0)
+                else (100.0 if r["monto_act"] != 0 else 0.0)
+            ),
+            axis=1,
+        )
+        variacion_subgrupo = variacion_subgrupo.sort_values(
+            "monto_act", ascending=False
+        ).reset_index(drop=True)
+
+    # --- Variación por cuenta ---
+    if pc_a.empty and pc_p.empty:
+        variacion_cuenta = pd.DataFrame()
+    else:
+        pc_a_min = pc_a[
+            ["account_code", "account_name", "subgrupo", "monto"]
+        ].rename(columns={"monto": "monto_act"}) if not pc_a.empty else (
+            pd.DataFrame(columns=[
+                "account_code", "account_name", "subgrupo", "monto_act",
+            ])
+        )
+        pc_p_min = pc_p[
+            ["account_code", "account_name", "subgrupo", "monto"]
+        ].rename(columns={"monto": "monto_prev"}) if not pc_p.empty else (
+            pd.DataFrame(columns=[
+                "account_code", "account_name", "subgrupo", "monto_prev",
+            ])
+        )
+        variacion_cuenta = pc_a_min.merge(
+            pc_p_min,
+            on=["account_code", "account_name", "subgrupo"],
+            how="outer",
+        ).fillna(0)
+        variacion_cuenta["delta"] = (
+            variacion_cuenta["monto_act"] - variacion_cuenta["monto_prev"]
+        )
+        variacion_cuenta["pct_var"] = variacion_cuenta.apply(
+            lambda r: (
+                (r["delta"] / abs(r["monto_prev"]) * 100)
+                if r["monto_prev"] not in (0, 0.0)
+                else (100.0 if r["monto_act"] != 0 else 0.0)
+            ),
+            axis=1,
+        )
+
+        # Tipo de alerta
+        def _alerta(row):
+            if row["monto_prev"] == 0 and row["monto_act"] != 0:
+                return "🆕 Nuevo"
+            if row["monto_act"] == 0 and row["monto_prev"] != 0:
+                return "⏹️ Cesó"
+            if abs(row["pct_var"]) >= threshold_pct and abs(row["delta"]) > 0:
+                return (
+                    "🔺 Subió" if row["pct_var"] > 0 else "🔻 Bajó"
+                )
+            return ""
+
+        variacion_cuenta["alerta"] = variacion_cuenta.apply(_alerta, axis=1)
+        variacion_cuenta = variacion_cuenta.sort_values(
+            "delta", ascending=False
+        ).reset_index(drop=True)
+
+    # --- Lista de alertas (top movimientos) ---
+    alertas: list[dict] = []
+    if not variacion_cuenta.empty:
+        # Nuevos gastos (no existían antes y son significativos)
+        nuevos = variacion_cuenta[
+            (variacion_cuenta["monto_prev"] == 0)
+            & (variacion_cuenta["monto_act"] > 0)
+        ].nlargest(5, "monto_act")
+        for _, r in nuevos.iterrows():
+            alertas.append({
+                "tipo": "🆕 Gasto nuevo",
+                "cuenta": f"{r['account_code']} {r['account_name']}",
+                "subgrupo": r["subgrupo"],
+                "monto": float(r["monto_act"]),
+                "detalle": "No existía en el período anterior",
+            })
+        # Subidas grandes
+        subidas = variacion_cuenta[
+            (variacion_cuenta["pct_var"] >= threshold_pct)
+            & (variacion_cuenta["monto_prev"] > 0)
+            & (variacion_cuenta["delta"] > 0)
+        ].nlargest(5, "delta")
+        for _, r in subidas.iterrows():
+            alertas.append({
+                "tipo": "🔺 Subida importante",
+                "cuenta": f"{r['account_code']} {r['account_name']}",
+                "subgrupo": r["subgrupo"],
+                "monto": float(r["monto_act"]),
+                "detalle": (
+                    f"+{r['pct_var']:.0f}% vs período anterior "
+                    f"(antes: ${r['monto_prev']:,.0f} → ahora: "
+                    f"${r['monto_act']:,.0f})"
+                ),
+            })
+        # Bajadas grandes (ahorro)
+        bajadas = variacion_cuenta[
+            (variacion_cuenta["pct_var"] <= -threshold_pct)
+            & (variacion_cuenta["monto_act"] > 0)
+            & (variacion_cuenta["delta"] < 0)
+        ].nsmallest(3, "delta")
+        for _, r in bajadas.iterrows():
+            alertas.append({
+                "tipo": "🔻 Reducción importante",
+                "cuenta": f"{r['account_code']} {r['account_name']}",
+                "subgrupo": r["subgrupo"],
+                "monto": float(r["monto_act"]),
+                "detalle": (
+                    f"{r['pct_var']:.0f}% vs período anterior "
+                    f"(antes: ${r['monto_prev']:,.0f} → ahora: "
+                    f"${r['monto_act']:,.0f})"
+                ),
+            })
+
+    delta_total = total_a - total_p
+    if total_p:
+        pct_var_total = delta_total / abs(total_p) * 100
+    else:
+        pct_var_total = 100.0 if total_a else 0.0
+
+    return {
+        "variacion_subgrupo": variacion_subgrupo,
+        "variacion_cuenta": variacion_cuenta,
+        "alertas": alertas,
+        "total_act": total_a,
+        "total_prev": total_p,
+        "delta_total": delta_total,
+        "pct_var_total": pct_var_total,
     }
 
 
