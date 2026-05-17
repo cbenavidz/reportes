@@ -382,11 +382,22 @@ with t_prod:
     if crosstab.empty:
         st.info("Sin datos.")
     else:
+        # Rellenar NaN para poder filtrar por productos sin categoría
+        crosstab_view = crosstab.copy()
+        crosstab_view["product_categ_name"] = (
+            crosstab_view["product_categ_name"].fillna("(Sin categoría)")
+        )
+
         cflt1, cflt2, cflt3 = st.columns([2, 2, 1])
         with cflt1:
-            cats = ["(Todas)"] + sorted(
-                crosstab["product_categ_name"].dropna().unique().tolist()
+            cats_unique = sorted(
+                crosstab_view["product_categ_name"].unique().tolist()
             )
+            # Mover "(Sin categoría)" al final
+            if "(Sin categoría)" in cats_unique:
+                cats_unique.remove("(Sin categoría)")
+                cats_unique.append("(Sin categoría)")
+            cats = ["(Todas)"] + cats_unique
             cat_sel = st.selectbox("Categoría", options=cats, key="cv_cat_prod")
         with cflt2:
             q = st.text_input("Buscar (código o nombre)", key="cv_buscar_prod")
@@ -397,7 +408,7 @@ with t_prod:
                 key="cv_modo_prod",
             )
 
-        df = crosstab.copy()
+        df = crosstab_view.copy()
         if cat_sel and cat_sel != "(Todas)":
             df = df[df["product_categ_name"] == cat_sel]
         if q:
