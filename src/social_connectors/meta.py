@@ -210,9 +210,45 @@ def _fetch_metric_total_value(
     Llama insights de IG (v22+) con metric_type=total_value.
     Devuelve UN solo número (total del período) o None si falla.
 
-    Necesario para IG: en v25.0 las métricas de cuenta IG ya no
-    soportan time-series y devuelven total_value: {value: N}.
+    IMPORTANTE: Meta limita Instagram insights a 30 días máximo entre
+    since y until. Si el rango pedido es mayor, paginamos en chunks
+    de 30 días y SUMAMOS los resultados.
+
+    Esto es correcto para métricas acumulativas (reach, views, likes,
+    comments, shares, total_interactions). Para `follower_count` también
+    suma (nuevos seguidores del período).
     """
+    total_days = (date_to - date_from).days + 1
+    if total_days <= 30:
+        return _fetch_metric_total_value_chunk(
+            endpoint, metric, date_from, date_to, token
+        )
+
+    # Paginar en bloques de 30 días
+    chunk_size = 30
+    total: int = 0
+    found_any = False
+    current = date_from
+    while current <= date_to:
+        chunk_end = min(current + timedelta(days=chunk_size - 1), date_to)
+        val = _fetch_metric_total_value_chunk(
+            endpoint, metric, current, chunk_end, token
+        )
+        if val is not None:
+            total += val
+            found_any = True
+        current = chunk_end + timedelta(days=1)
+    return total if found_any else None
+
+
+def _fetch_metric_total_value_chunk(
+    endpoint: str,
+    metric: str,
+    date_from: date,
+    date_to: date,
+    token: str,
+) -> int | None:
+    """Helper: llamada cruda a /insights para un rango de máximo 30 días."""
     params = {
         "metric": metric,
         "period": "day",
