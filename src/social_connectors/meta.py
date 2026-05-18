@@ -877,12 +877,12 @@ def fetch_meta_instagram_monthly_evolution(
     months: int = 12,
 ) -> pd.DataFrame:
     """
-    Evolución mensual de IG basada en posts (/media endpoint).
-
-    NOTA v25.0: las métricas account-level de IG ya no soportan time
-    series, solo total_value por período. Por eso esta función se basa
-    en posts reales (que sí tienen timestamps).
+    Evolución mensual de IG basada en posts (/media endpoint) +
+    reconstrucción del histórico de seguidores desde el snapshot actual
+    restando los nuevos seguidores ganados cada mes.
     """
+    from calendar import monthrange as _monthrange
+
     cfg = get_secret_dict("meta") or {}
     ig_id = cfg.get("instagram_user_id")
     if not ig_id:
@@ -922,22 +922,80 @@ def fetch_meta_instagram_monthly_evolution(
                 "comentarios": int(m.get("comments_count", 0) or 0),
             })
 
-    if not rows:
-        return pd.DataFrame(columns=[
-            "mes", "seguidores_fin_mes", "n_posts", "likes", "comentarios",
-            "engagement",
-        ])
+    # Construir el DF mensual base
+    today_d = date.today()
+    if rows:
+        df = pd.DataFrame(rows)
+        df["fecha"] = pd.to_datetime(df["fecha"])
+        df["mes"] = df["fecha"].dt.to_period("M").dt.to_timestamp()
+        monthly = df.groupby("mes", as_index=False).agg({
+            "n_posts": "sum",
+            "likes": "sum",
+            "comentarios": "sum",
+        })
+    else:
+        monthly = pd.DataFrame(columns=["mes", "n_posts", "likes", "comentarios"])
 
-    df = pd.DataFrame(rows)
-    df["fecha"] = pd.to_datetime(df["fecha"])
-    df["mes"] = df["fecha"].dt.to_period("M").dt.to_timestamp()
-    monthly = df.groupby("mes", as_index=False).agg({
-        "n_posts": "sum",
-        "likes": "sum",
-        "comentarios": "sum",
+    # Asegurar que TODOS los meses del rango aparezcan (aunque sin posts)
+    cutoff = today_d - timedelta(days=months * 31)
+    months_idx = []
+    y, m = cutoff.year, cutoff.month
+    while True:
+        first = date(y, m, 1)
+        if first > today_d:
+            break
+        months_idx.append(pd.Timestamp(first))
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+    months_df = pd.DataFrame({"mes": months_idx})
+    monthly = months_df.merge(monthly, on="mes", how="left").fillna({
+        "n_posts": 0, "likes": 0, "comentarios": 0,
     })
+
     monthly["engagement"] = monthly["likes"] + monthly["comentarios"]
-    monthly["seguidores_fin_mes"] = seguidores_actuales  # Solo tenemos snapshot
+
+    # --- RECONSTRUIR HISTÓRICO DE SEGUIDORES ---
+    # Para cada mes calendario, pedir follower_count (nuevos seguidores del mes)
+    # Luego: seguidores_fin_mes_actual = snapshot - sum(nuevos seguidores meses futuros)
+    nuevos_por_mes: dict[pd.Timestamp, int] = {}
+    monthly_sorted = monthly.sort_values("mes").reset_index(drop=True)
+    for ts in monthly_sorted["mes"]:
+        mes_date = ts.date()
+        y_, m_ = mes_date.year, mes_date.month
+        first_of_month = date(y_, m_, 1)
+        last_of_month = date(y_, m_, _monthrange(y_, m_)[1])
+        # Limitar al rango con datos (no pedir futuro)
+        rng_start = first_of_month
+        rng_end = min(last_of_month, today_d)
+        if rng_start > today_d:
+            continue
+        try:
+            val = _fetch_metric_total_value_chunk(
+                f"/{ig_id}", "follower_count",
+                rng_start, rng_end, page_token,
+            )
+            if val is not None:
+                nuevos_por_mes[ts] = val
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Reconstrucción hacia atrás:
+    # seguidores_fin_mes = snapshot - sum(nuevos_seguidores_meses_posteriores)
+    saldo_acumulado = seguidores_actuales
+    seguidores_fin_mes_dict = {}
+    # Recorrer del MÁS RECIENTE al más antiguo
+    for ts in monthly_sorted["mes"].iloc[::-1]:
+        seguidores_fin_mes_dict[ts] = saldo_acumulado
+        # Para el mes anterior, restar los nuevos del mes actual
+        saldo_acumulado -= int(nuevos_por_mes.get(ts, 0))
+
+    monthly["seguidores_fin_mes"] = monthly["mes"].map(seguidores_fin_mes_dict)
+    monthly["nuevos_seguidores_mes"] = monthly["mes"].map(
+        lambda t: int(nuevos_por_mes.get(t, 0))
+    ).fillna(0)
+
     return monthly.sort_values("mes").tail(months).reset_index(drop=True)
 
 
