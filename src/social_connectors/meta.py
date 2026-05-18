@@ -1239,6 +1239,7 @@ def fetch_meta_instagram_data(
     # IMPORTANTE: en v25.0 IG insights devuelven UN SOLO total_value
     # por período (no time series). Hay que usar metric_type=total_value.
     # `impressions` fue removida; v25 usa `views` (vistas del perfil + contenido).
+    # Métricas agregadas de cuenta (suman TODAS las interacciones del período):
     period_totals: dict[str, int] = {}
     for metric, alias in [
         ("reach", "alcance_periodo"),
@@ -1247,6 +1248,12 @@ def fetch_meta_instagram_data(
         ("profile_views", "vistas_perfil_periodo"),
         ("website_clicks", "clicks_web_periodo"),
         ("follower_count", "nuevos_seguidores_periodo"),
+        # v25: métricas agregadas de interacciones de cuenta
+        ("likes", "likes_cuenta_periodo"),
+        ("comments", "comentarios_cuenta_periodo"),
+        ("shares", "compartidos_cuenta_periodo"),
+        ("saves", "guardados_cuenta_periodo"),
+        ("total_interactions", "interacciones_totales_periodo"),
     ]:
         val = _fetch_metric_total_value(
             f"/{ig_id}", metric, date_from, date_to, page_token
@@ -1277,12 +1284,15 @@ def fetch_meta_instagram_data(
             "n_posts": [0], "likes": [0], "comentarios": [0],
         })
 
-    df["compartidos"] = 0  # IG no expone shares totales en API pública
+    df["compartidos"] = 0  # se llena abajo con métrica agregada de cuenta
     df["engagement"] = df.get("likes", 0) + df.get("comentarios", 0)
     df["seguidores"] = period_totals.get("seguidores_actual", 0)
 
     # Inyectar totales del período en el ÚLTIMO día (para que sum() en
     # compute_period_kpis los recoja una sola vez como total).
+    # Las métricas agregadas de cuenta (likes/comments/shares/saves)
+    # son MÁS confiables que sumar por media — IG no expone like_count
+    # para todos los tipos de media.
     if not df.empty:
         df = df.sort_values("fecha").reset_index(drop=True)
         last_idx = df.index[-1]
@@ -1292,6 +1302,36 @@ def fetch_meta_instagram_data(
         df.at[last_idx, "clicks_web"] = period_totals.get("clicks_web_periodo", 0)
         df.at[last_idx, "cuentas_engagement"] = period_totals.get("cuentas_engagement_periodo", 0)
         df.at[last_idx, "nuevos_seguidores_total"] = period_totals.get("nuevos_seguidores_periodo", 0)
+
+        # Si las métricas agregadas de cuenta son > 0, usarlas como override
+        # (más completas que sumar por media). Caso típico: Reels no exponen
+        # like_count individual pero sí cuentan en `likes` a nivel cuenta.
+        likes_cuenta = period_totals.get("likes_cuenta_periodo", 0)
+        comments_cuenta = period_totals.get("comentarios_cuenta_periodo", 0)
+        shares_cuenta = period_totals.get("compartidos_cuenta_periodo", 0)
+        saved_cuenta = period_totals.get("guardados_cuenta_periodo", 0)
+
+        # Cambiar la columna actual SOLO si las métricas de cuenta son
+        # mayores que la suma por media (defensa contra valores cero por
+        # falta de permiso a esa métrica específica).
+        if likes_cuenta > df["likes"].sum():
+            # Pone todo el agregado en la última fila y resetea las otras
+            df["likes"] = 0
+            df.at[last_idx, "likes"] = likes_cuenta
+        if comments_cuenta > df["comentarios"].sum():
+            df["comentarios"] = 0
+            df.at[last_idx, "comentarios"] = comments_cuenta
+        if shares_cuenta > 0:
+            df["compartidos"] = 0
+            df.at[last_idx, "compartidos"] = shares_cuenta
+        df.at[last_idx, "guardados"] = saved_cuenta
+
+        # Recalcular engagement con los valores actualizados
+        df["engagement"] = (
+            df["likes"].fillna(0)
+            + df["comentarios"].fillna(0)
+            + df["compartidos"].fillna(0)
+        )
 
     return df.sort_values("fecha").reset_index(drop=True)
 
