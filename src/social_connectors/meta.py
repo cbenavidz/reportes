@@ -248,7 +248,20 @@ def _fetch_metric_total_value_chunk(
     date_to: date,
     token: str,
 ) -> int | None:
-    """Helper: llamada cruda a /insights para un rango de máximo 30 días."""
+    """Helper: llamada cruda a /insights para un rango de máximo 30 días.
+
+    Algunas métricas (follower_count) NO aceptan metric_type=total_value
+    y devuelven error 100. Para esas usamos time-series y SUMAMOS los
+    valores diarios.
+    """
+    # Métricas que requieren time-series (no aceptan total_value en v25)
+    TIME_SERIES_METRICS = {"follower_count"}
+
+    if metric in TIME_SERIES_METRICS:
+        return _fetch_metric_time_series_sum(
+            endpoint, metric, date_from, date_to, token
+        )
+
     params = {
         "metric": metric,
         "period": "day",
@@ -264,6 +277,38 @@ def _fetch_metric_total_value_chunk(
         if isinstance(tv, dict) and "value" in tv:
             return int(tv["value"] or 0)
     return None
+
+
+def _fetch_metric_time_series_sum(
+    endpoint: str,
+    metric: str,
+    date_from: date,
+    date_to: date,
+    token: str,
+) -> int | None:
+    """
+    Pide la métrica con time-series diaria (sin metric_type=total_value)
+    y SUMA los valores. Necesario para `follower_count` que solo soporta
+    series temporales.
+    """
+    params = {
+        "metric": metric,
+        "period": "day",
+        "since": str(date_from),
+        "until": str(date_to),
+    }
+    data = _try_get(f"{endpoint}/insights", params, token=token)
+    if not data:
+        return None
+    total = 0
+    found = False
+    for m in data.get("data", []):
+        for v in m.get("values", []):
+            val = v.get("value")
+            if isinstance(val, (int, float)):
+                total += int(val)
+                found = True
+    return total if found else None
 
 
 def _classify_facebook_post_type(post: dict) -> str:
