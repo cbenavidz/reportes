@@ -1275,27 +1275,59 @@ def fetch_meta_instagram_data(
     # IMPORTANTE: en v25.0 IG insights devuelven UN SOLO total_value
     # por período (no time series). Hay que usar metric_type=total_value.
     # `impressions` fue removida; v25 usa `views` (vistas del perfil + contenido).
-    # Métricas agregadas de cuenta (suman TODAS las interacciones del período):
+    # Meta limita las llamadas a 30 días → pedimos POR MES calendario para
+    # tener serie histórica correcta y no inyectar todo en un solo día.
+    from calendar import monthrange as _monthrange
+
+    metrics_to_fetch = [
+        ("reach", "alcance"),
+        ("views", "impresiones"),
+        ("accounts_engaged", "cuentas_engagement"),
+        ("profile_views", "vistas_perfil"),
+        ("website_clicks", "clicks_web"),
+        ("follower_count", "nuevos_seguidores_total"),
+        ("likes", "likes_cuenta"),
+        ("comments", "comentarios_cuenta"),
+        ("shares", "compartidos_cuenta"),
+        ("saves", "guardados"),
+        ("total_interactions", "interacciones_totales"),
+    ]
+
+    # Generar lista de meses calendario en el rango [date_from, date_to]
+    monthly_ranges: list[tuple[date, date]] = []
+    y, m = date_from.year, date_from.month
+    while True:
+        first_of_month = date(y, m, 1)
+        last_day_of_month = _monthrange(y, m)[1]
+        last_of_month = date(y, m, last_day_of_month)
+        chunk_start = max(first_of_month, date_from)
+        chunk_end = min(last_of_month, date_to)
+        if chunk_start > date_to:
+            break
+        monthly_ranges.append((chunk_start, chunk_end))
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+        if y > date_to.year + 1:
+            break
+
+    # Pedir métricas para CADA MES — almacenar tanto el total del período
+    # como el desglose por mes
     period_totals: dict[str, int] = {}
-    for metric, alias in [
-        ("reach", "alcance_periodo"),
-        ("views", "impresiones_periodo"),   # v25: reemplaza a impressions
-        ("accounts_engaged", "cuentas_engagement_periodo"),
-        ("profile_views", "vistas_perfil_periodo"),
-        ("website_clicks", "clicks_web_periodo"),
-        ("follower_count", "nuevos_seguidores_periodo"),
-        # v25: métricas agregadas de interacciones de cuenta
-        ("likes", "likes_cuenta_periodo"),
-        ("comments", "comentarios_cuenta_periodo"),
-        ("shares", "compartidos_cuenta_periodo"),
-        ("saves", "guardados_cuenta_periodo"),
-        ("total_interactions", "interacciones_totales_periodo"),
-    ]:
-        val = _fetch_metric_total_value(
-            f"/{ig_id}", metric, date_from, date_to, page_token
-        )
-        if val is not None:
-            period_totals[alias] = val
+    by_month: dict[date, dict[str, int]] = {}  # {mes_fin: {alias: value}}
+    for mr_start, mr_end in monthly_ranges:
+        month_key = mr_end  # el ÚLTIMO día del mes (o date_to si es el último mes)
+        by_month.setdefault(month_key, {})
+        for metric, alias in metrics_to_fetch:
+            val = _fetch_metric_total_value_chunk(
+                f"/{ig_id}", metric, mr_start, mr_end, page_token
+            )
+            if val is not None:
+                period_totals[alias + "_periodo"] = (
+                    period_totals.get(alias + "_periodo", 0) + val
+                )
+                by_month[month_key][alias] = val
 
     # Snapshot actual de seguidores IG
     ig_data = _try_get(
@@ -1324,43 +1356,56 @@ def fetch_meta_instagram_data(
     df["engagement"] = df.get("likes", 0) + df.get("comentarios", 0)
     df["seguidores"] = period_totals.get("seguidores_actual", 0)
 
-    # Inyectar totales del período en el ÚLTIMO día (para que sum() en
-    # compute_period_kpis los recoja una sola vez como total).
-    # Las métricas agregadas de cuenta (likes/comments/shares/saves)
-    # son MÁS confiables que sumar por media — IG no expone like_count
-    # para todos los tipos de media.
-    if not df.empty:
+    # Inyectar métricas POR MES: agregar una fila virtual por cada mes
+    # (último día del mes) con los totales mensuales del API. Esto evita
+    # que todo el alcance/impresiones aparezca en un solo día y permite
+    # que el agrupamiento mensual sea correcto.
+    if not df.empty and by_month:
         df = df.sort_values("fecha").reset_index(drop=True)
-        last_idx = df.index[-1]
-        df.at[last_idx, "alcance"] = period_totals.get("alcance_periodo", 0)
-        df.at[last_idx, "impresiones"] = period_totals.get("impresiones_periodo", 0)
-        df.at[last_idx, "vistas_perfil"] = period_totals.get("vistas_perfil_periodo", 0)
-        df.at[last_idx, "clicks_web"] = period_totals.get("clicks_web_periodo", 0)
-        df.at[last_idx, "cuentas_engagement"] = period_totals.get("cuentas_engagement_periodo", 0)
-        df.at[last_idx, "nuevos_seguidores_total"] = period_totals.get("nuevos_seguidores_periodo", 0)
 
-        # Si las métricas agregadas de cuenta son > 0, usarlas como override
-        # (más completas que sumar por media). Caso típico: Reels no exponen
-        # like_count individual pero sí cuentan en `likes` a nivel cuenta.
-        likes_cuenta = period_totals.get("likes_cuenta_periodo", 0)
-        comments_cuenta = period_totals.get("comentarios_cuenta_periodo", 0)
-        shares_cuenta = period_totals.get("compartidos_cuenta_periodo", 0)
-        saved_cuenta = period_totals.get("guardados_cuenta_periodo", 0)
+        # Verificar si la métrica agregada `likes` de cuenta es mayor que
+        # la suma por media — si sí, usar el agregado de cuenta como fuente
+        likes_total = sum(b.get("likes_cuenta", 0) for b in by_month.values())
+        comments_total = sum(b.get("comentarios_cuenta", 0) for b in by_month.values())
+        shares_total = sum(b.get("compartidos_cuenta", 0) for b in by_month.values())
+        use_account_likes = likes_total > df["likes"].sum()
+        use_account_comments = comments_total > df["comentarios"].sum()
+        use_account_shares = shares_total > 0
 
-        # Cambiar la columna actual SOLO si las métricas de cuenta son
-        # mayores que la suma por media (defensa contra valores cero por
-        # falta de permiso a esa métrica específica).
-        if likes_cuenta > df["likes"].sum():
-            # Pone todo el agregado en la última fila y resetea las otras
+        if use_account_likes:
             df["likes"] = 0
-            df.at[last_idx, "likes"] = likes_cuenta
-        if comments_cuenta > df["comentarios"].sum():
+        if use_account_comments:
             df["comentarios"] = 0
-            df.at[last_idx, "comentarios"] = comments_cuenta
-        if shares_cuenta > 0:
+        if use_account_shares:
             df["compartidos"] = 0
-            df.at[last_idx, "compartidos"] = shares_cuenta
-        df.at[last_idx, "guardados"] = saved_cuenta
+
+        # Construir filas mensuales y agregarlas al df
+        new_rows = []
+        for month_end_date, vals in by_month.items():
+            ts = pd.Timestamp(month_end_date)
+            new_row = {"fecha": ts, "n_posts": 0}
+            new_row["alcance"] = vals.get("alcance", 0)
+            new_row["impresiones"] = vals.get("impresiones", 0)
+            new_row["vistas_perfil"] = vals.get("vistas_perfil", 0)
+            new_row["clicks_web"] = vals.get("clicks_web", 0)
+            new_row["cuentas_engagement"] = vals.get("cuentas_engagement", 0)
+            new_row["nuevos_seguidores_total"] = vals.get("nuevos_seguidores_total", 0)
+            new_row["guardados"] = vals.get("guardados", 0)
+            new_row["interacciones_totales"] = vals.get("interacciones_totales", 0)
+            # Si usamos métricas de cuenta para likes/comments/shares, inyectar
+            if use_account_likes:
+                new_row["likes"] = vals.get("likes_cuenta", 0)
+            if use_account_comments:
+                new_row["comentarios"] = vals.get("comentarios_cuenta", 0)
+            if use_account_shares:
+                new_row["compartidos"] = vals.get("compartidos_cuenta", 0)
+            new_rows.append(new_row)
+
+        if new_rows:
+            df_metrics_monthly = pd.DataFrame(new_rows)
+            # Concatenar al df principal (las filas de métricas mensuales
+            # tienen fecha = último día del mes y NO duplican posts)
+            df = pd.concat([df, df_metrics_monthly], ignore_index=True)
 
         # Recalcular engagement con los valores actualizados
         df["engagement"] = (
