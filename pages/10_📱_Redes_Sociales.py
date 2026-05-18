@@ -1019,6 +1019,21 @@ def _platform_tab_meta(
         )
         return
 
+    # Diagnóstico (expandible) para ver qué columnas vienen del fetch
+    with st.expander("🔍 Diagnóstico de datos cargados", expanded=False):
+        st.write(f"**Filas:** {len(df):,} · **Columnas:** {list(df.columns)}")
+        # Mostrar suma por columna numérica
+        num_cols = df.select_dtypes(include="number").columns.tolist()
+        if num_cols:
+            sumas = df[num_cols].sum().to_dict()
+            sumas_show = {k: f"{v:,.0f}" for k, v in sumas.items()}
+            st.write("**Sumas por columna:**")
+            st.json(sumas_show)
+        if "fecha" in df.columns:
+            st.write(
+                f"**Rango fechas:** {df['fecha'].min()} → {df['fecha'].max()}"
+            )
+
     # 1. KPIs con comparativa
     _render_kpi_grid(df, df_prev, icon)
 

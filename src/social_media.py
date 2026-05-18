@@ -931,7 +931,16 @@ def compute_cross_platform_comparison(
             return "—"
         return "Empate"
     merged["mejor_plataforma"] = merged.apply(_ganador, axis=1)
-    return merged.sort_values(
-        ["fb_total_engagement", "ig_total_engagement"],
-        ascending=False,
-    ).reset_index(drop=True)
+
+    # Asegurar que las columnas para sort existan (puede que solo haya datos
+    # de una plataforma y la otra no tenga total_engagement)
+    for col in ("fb_total_engagement", "ig_total_engagement"):
+        if col not in merged.columns:
+            merged[col] = 0
+    sort_cols = [
+        c for c in ("fb_total_engagement", "ig_total_engagement")
+        if c in merged.columns
+    ]
+    if sort_cols:
+        merged = merged.sort_values(sort_cols, ascending=False)
+    return merged.reset_index(drop=True)
