@@ -33,11 +33,27 @@ from src.social_connectors import (
     is_meta_configured,
     is_tiktok_configured,
 )
+# Importar funciones extras directamente del módulo (los Stories no están
+# necesariamente exportados en __init__)
+try:
+    from src.social_connectors.meta import (
+        fetch_meta_facebook_stories,
+        fetch_meta_instagram_stories,
+    )
+except ImportError:
+    fetch_meta_facebook_stories = None  # type: ignore
+    fetch_meta_instagram_stories = None  # type: ignore
+
 from src.social_media import (
+    compute_cross_platform_comparison,
     compute_daily_aggregation,
+    compute_engagement_rate_by_type,
+    compute_monthly_evolution_by_type,
     compute_period_kpis,
     compute_post_breakdown_by_type,
     compute_recommendations,
+    compute_top_types_ranking,
+    compute_type_recommendations,
     parse_csv_auto,
 )
 
@@ -421,6 +437,187 @@ def _render_breakdown_by_type(top_df: pd.DataFrame, color: str, title: str):
     st.dataframe(
         show_breakdown,
         column_config=column_config,
+        use_container_width=True, hide_index=True,
+    )
+
+
+def _render_advanced_by_type(top_df: pd.DataFrame, color: str, plataforma: str):
+    """
+    Análisis avanzado por tipo de contenido:
+    - Top 3 más rentables (publicación / engagement / rate)
+    - Evolución mensual por tipo
+    - Recomendaciones automáticas
+    """
+    if top_df is None or top_df.empty or "tipo" not in top_df.columns:
+        return
+    breakdown = compute_engagement_rate_by_type(top_df)
+    if breakdown.empty:
+        return
+
+    st.markdown(f"##### 📊 Análisis avanzado por tipo — {plataforma}")
+
+    # --- Top 3 rankings ---
+    rankings = compute_top_types_ranking(breakdown, min_posts=2)
+    cR1, cR2, cR3 = st.columns(3)
+    with cR1:
+        st.markdown("**📊 Más publicado**")
+        for i, r in enumerate(rankings["mas_publicado"][:3]):
+            st.markdown(
+                f"{['🥇', '🥈', '🥉'][i]} **{r['tipo']}** — "
+                f"{int(r['n_posts'])} posts"
+            )
+        if not rankings["mas_publicado"]:
+            st.caption("Sin datos")
+    with cR2:
+        st.markdown("**🔥 Mejor engagement promedio**")
+        for i, r in enumerate(rankings["mejor_engagement"][:3]):
+            st.markdown(
+                f"{['🥇', '🥈', '🥉'][i]} **{r['tipo']}** — "
+                f"{r['engagement_promedio']:.0f} / post"
+            )
+        if not rankings["mejor_engagement"]:
+            st.caption("Sin datos")
+    with cR3:
+        st.markdown("**💯 Mejor engagement rate (%)**")
+        if rankings["mejor_rate"]:
+            for i, r in enumerate(rankings["mejor_rate"][:3]):
+                st.markdown(
+                    f"{['🥇', '🥈', '🥉'][i]} **{r['tipo']}** — "
+                    f"{r['engagement_rate']:.2f}%"
+                )
+        else:
+            st.caption(
+                "Necesita datos de alcance/impresiones. "
+                "Vuelve a recargar para que jale los insights."
+            )
+
+    # --- Tabla ampliada por tipo ---
+    st.markdown("**📋 Detalle por tipo con engagement rate**")
+    cols_show = [
+        c for c in [
+            "ranking", "tipo", "n_posts", "share_posts_pct",
+            "total_engagement", "engagement_promedio",
+            "share_engagement_pct", "engagement_rate",
+            "total_alcance", "total_impresiones", "total_video_views",
+        ] if c in breakdown.columns
+    ]
+    st.dataframe(
+        breakdown[cols_show],
+        column_config={
+            "ranking": st.column_config.NumberColumn("#", format="%d"),
+            "tipo": "Tipo",
+            "n_posts": st.column_config.NumberColumn("# Posts", format="%d"),
+            "share_posts_pct": st.column_config.NumberColumn(
+                "% del feed", format="%.1f%%"
+            ),
+            "total_engagement": st.column_config.NumberColumn(
+                "Engagement", format="%,d"
+            ),
+            "engagement_promedio": st.column_config.NumberColumn(
+                "Eng / post", format="%.0f"
+            ),
+            "share_engagement_pct": st.column_config.NumberColumn(
+                "% del eng", format="%.1f%%"
+            ),
+            "engagement_rate": st.column_config.NumberColumn(
+                "Eng rate", format="%.2f%%"
+            ),
+            "total_alcance": st.column_config.NumberColumn(
+                "Alcance", format="%,d"
+            ),
+            "total_impresiones": st.column_config.NumberColumn(
+                "Impresiones", format="%,d"
+            ),
+            "total_video_views": st.column_config.NumberColumn(
+                "Video views", format="%,d"
+            ),
+        },
+        use_container_width=True, hide_index=True,
+    )
+
+    # --- Evolución mensual por tipo ---
+    if "fecha" in top_df.columns:
+        st.markdown("**📈 Evolución mensual de engagement por tipo**")
+        evol = compute_monthly_evolution_by_type(top_df, metric="engagement")
+        if not evol.empty and len(evol.columns) > 1:
+            evol_long = evol.melt(
+                id_vars="mes", var_name="tipo", value_name="engagement",
+            )
+            evol_long["mes_label"] = pd.to_datetime(
+                evol_long["mes"]
+            ).dt.strftime("%Y-%m")
+            fig = px.line(
+                evol_long, x="mes_label", y="engagement",
+                color="tipo", markers=True,
+            )
+            fig.update_layout(
+                height=380, margin=dict(l=0, r=0, t=10, b=0),
+                yaxis=dict(tickformat=",.0f"),
+                legend=dict(orientation="h", yanchor="bottom", y=1.05, x=0),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.caption("Datos insuficientes para evolución mensual.")
+
+    # --- Recomendaciones ---
+    recs = compute_type_recommendations(breakdown)
+    if recs:
+        st.markdown("**💡 Recomendaciones automáticas**")
+        prio_emoji = {"alta": "🔴", "media": "🟡", "baja": "🟢"}
+        for r in recs:
+            with st.container(border=True):
+                cH1, cH2 = st.columns([4, 1])
+                with cH1:
+                    st.markdown(f"### {r['tipo']} — {r['titulo']}")
+                with cH2:
+                    p = r.get("prioridad", "baja")
+                    st.markdown(f"**{prio_emoji.get(p, '🟢')} {p.upper()}**")
+                st.markdown(f"**Diagnóstico:** {r['detalle']}")
+                st.markdown(f"**Acción:** {r['accion']}")
+
+
+def _render_cross_platform_by_type(fb_top: pd.DataFrame, ig_top: pd.DataFrame):
+    """Comparativo FB vs IG por tipo de contenido."""
+    fb_break = compute_engagement_rate_by_type(fb_top) if fb_top is not None else None
+    ig_break = compute_engagement_rate_by_type(ig_top) if ig_top is not None else None
+    if (fb_break is None or fb_break.empty) and (ig_break is None or ig_break.empty):
+        return
+    comp = compute_cross_platform_comparison(fb_break, ig_break)
+    if comp.empty:
+        return
+    st.markdown("### 🔁 Comparativo FB vs IG por tipo de contenido")
+    st.caption(
+        "Mismo tipo de contenido (Reel, Foto, Video) en ambas plataformas. "
+        "La columna 'Mejor plataforma' marca dónde rinde más cada tipo."
+    )
+    cols_show = [
+        c for c in [
+            "tipo",
+            "fb_n_posts", "fb_engagement_promedio", "fb_engagement_rate",
+            "ig_n_posts", "ig_engagement_promedio", "ig_engagement_rate",
+            "mejor_plataforma",
+        ] if c in comp.columns
+    ]
+    st.dataframe(
+        comp[cols_show],
+        column_config={
+            "tipo": "Tipo",
+            "fb_n_posts": st.column_config.NumberColumn("FB Posts", format="%d"),
+            "fb_engagement_promedio": st.column_config.NumberColumn(
+                "FB Eng/post", format="%.0f"
+            ),
+            "fb_engagement_rate": st.column_config.NumberColumn(
+                "FB Rate", format="%.2f%%"
+            ),
+            "ig_n_posts": st.column_config.NumberColumn("IG Posts", format="%d"),
+            "ig_engagement_promedio": st.column_config.NumberColumn(
+                "IG Eng/post", format="%.0f"
+            ),
+            "ig_engagement_rate": st.column_config.NumberColumn(
+                "IG Rate", format="%.2f%%"
+            ),
+            "mejor_plataforma": "Mejor plataforma",
+        },
         use_container_width=True, hide_index=True,
     )
 
@@ -846,6 +1043,10 @@ def _platform_tab_meta(
     if top is not None and not top.empty:
         _render_breakdown_by_type(top, color, title)
         st.markdown("---")
+        # 5b. Análisis avanzado: rankings, engagement rate, evolución, recomendaciones
+        with st.expander("🔬 Análisis avanzado por tipo (rankings + recomendaciones)", expanded=False):
+            _render_advanced_by_type(top, color, title)
+        st.markdown("---")
 
     # 6. Marketing API: pauta, CPC, CTR, top campañas (solo FB)
     if platform_key == "facebook":
@@ -1072,3 +1273,13 @@ with tab_cmp:
                 height=380, margin=dict(l=0, r=0, t=10, b=0), showlegend=False,
             )
             st.plotly_chart(fig, use_container_width=True)
+
+        # --- Comparativo cruzado FB vs IG por tipo de contenido ---
+        fb_top = st.session_state["social_data"].get("facebook_top")
+        ig_top = st.session_state["social_data"].get("instagram_top")
+        if (
+            (fb_top is not None and isinstance(fb_top, pd.DataFrame) and not fb_top.empty)
+            or (ig_top is not None and isinstance(ig_top, pd.DataFrame) and not ig_top.empty)
+        ):
+            st.markdown("---")
+            _render_cross_platform_by_type(fb_top, ig_top)

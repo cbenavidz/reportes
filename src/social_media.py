@@ -594,3 +594,339 @@ def compute_daily_aggregation(
     agg = sub.groupby("fecha_dia")[metric].sum().reset_index()
     agg = agg.rename(columns={"fecha_dia": "fecha"})
     return agg
+
+
+# ===========================================================================
+# Análisis ampliado por tipo de contenido (post / reel / story / etc.)
+# ===========================================================================
+
+
+def compute_engagement_rate_by_type(posts_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Desglose por tipo con métricas completas incluyendo engagement rate.
+
+    Engagement rate = engagement / max(alcance, impresiones, 1) × 100
+      - Si hay alcance_organico/total: lo usa
+      - Si no, usa impresiones_total
+      - Si no, cae a engagement/n_posts como aproximación
+
+    Devuelve DataFrame con columnas:
+        tipo, n_posts, share_posts_pct,
+        total_likes, total_comentarios, total_compartidos, total_engagement,
+        engagement_promedio, share_engagement_pct,
+        total_impresiones, total_alcance, total_video_views,
+        engagement_rate, ranking
+    """
+    if posts_df is None or posts_df.empty or "tipo" not in posts_df.columns:
+        return pd.DataFrame()
+
+    df = posts_df.copy()
+    # Garantizar columnas necesarias
+    for col in [
+        "likes", "comentarios", "compartidos", "engagement",
+        "impresiones_total", "impresiones_pagadas",
+        "alcance_pagado", "alcance_organico", "alcance_total",
+        "video_views", "saved",
+    ]:
+        if col not in df.columns:
+            df[col] = 0
+    if "engagement" not in df.columns or df["engagement"].sum() == 0:
+        df["engagement"] = (
+            df["likes"].fillna(0)
+            + df["comentarios"].fillna(0)
+            + df["compartidos"].fillna(0)
+        )
+
+    agg_dict: dict = {
+        "post_id": "count" if "post_id" in df.columns else (lambda s: len(s)),
+        "likes": "sum",
+        "comentarios": "sum",
+        "compartidos": "sum",
+        "engagement": "sum",
+        "impresiones_total": "sum",
+        "impresiones_pagadas": "sum",
+        "alcance_pagado": "sum",
+        "alcance_organico": "sum",
+        "alcance_total": "sum",
+        "video_views": "sum",
+        "saved": "sum",
+    }
+    if "post_id" not in df.columns:
+        df["post_id"] = range(len(df))
+    by_tipo = df.groupby("tipo").agg(agg_dict).reset_index()
+    by_tipo = by_tipo.rename(columns={
+        "post_id": "n_posts",
+        "likes": "total_likes",
+        "comentarios": "total_comentarios",
+        "compartidos": "total_compartidos",
+        "engagement": "total_engagement",
+        "impresiones_total": "total_impresiones",
+        "alcance_total": "total_alcance",
+        "video_views": "total_video_views",
+        "saved": "total_saved",
+    })
+
+    total_posts = by_tipo["n_posts"].sum() or 1
+    total_eng = by_tipo["total_engagement"].sum() or 1
+    by_tipo["share_posts_pct"] = by_tipo["n_posts"] / total_posts * 100
+    by_tipo["share_engagement_pct"] = (
+        by_tipo["total_engagement"] / total_eng * 100
+    )
+    by_tipo["engagement_promedio"] = (
+        by_tipo["total_engagement"] / by_tipo["n_posts"].replace(0, 1)
+    )
+
+    # Engagement rate: usar alcance > impresiones > engagement promedio
+    def _rate(row):
+        eng = row["total_engagement"]
+        if row.get("total_alcance", 0) > 0:
+            return eng / row["total_alcance"] * 100
+        if row.get("total_impresiones", 0) > 0:
+            return eng / row["total_impresiones"] * 100
+        # Sin denominador real: 0 (no podemos calcular rate verdadero)
+        return 0.0
+    by_tipo["engagement_rate"] = by_tipo.apply(_rate, axis=1)
+
+    by_tipo = by_tipo.sort_values(
+        "total_engagement", ascending=False
+    ).reset_index(drop=True)
+    by_tipo["ranking"] = range(1, len(by_tipo) + 1)
+    return by_tipo
+
+
+def compute_monthly_evolution_by_type(
+    posts_df: pd.DataFrame,
+    metric: str = "engagement",
+) -> pd.DataFrame:
+    """
+    Evolución mensual de una métrica por tipo de contenido.
+
+    Devuelve DataFrame ancho con columnas: mes, tipo1, tipo2, ...
+    donde cada celda es la suma de la métrica para ese mes y tipo.
+    """
+    if (
+        posts_df is None or posts_df.empty
+        or "tipo" not in posts_df.columns
+        or "fecha" not in posts_df.columns
+    ):
+        return pd.DataFrame()
+    df = posts_df.copy()
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    df = df.dropna(subset=["fecha"])
+    if df.empty:
+        return pd.DataFrame()
+    if metric not in df.columns:
+        if metric == "n_posts":
+            df["n_posts"] = 1
+        else:
+            return pd.DataFrame()
+
+    df["mes"] = df["fecha"].dt.to_period("M").dt.to_timestamp()
+    by_month = df.groupby(["mes", "tipo"], as_index=False)[metric].sum()
+    pivot = by_month.pivot(index="mes", columns="tipo", values=metric).fillna(0)
+    pivot = pivot.reset_index()
+    return pivot
+
+
+def compute_top_types_ranking(
+    breakdown: pd.DataFrame,
+    min_posts: int = 2,
+) -> dict:
+    """
+    Devuelve 3 rankings:
+      - mas_publicado: top 3 por # posts
+      - mejor_engagement: top 3 por engagement promedio
+      - mejor_rate: top 3 por engagement rate (solo tipos con denominador real)
+
+    Cada uno con (tipo, valor) en orden descendente.
+    """
+    if breakdown is None or breakdown.empty:
+        return {"mas_publicado": [], "mejor_engagement": [], "mejor_rate": []}
+
+    elegibles = breakdown[breakdown["n_posts"] >= min_posts]
+    if elegibles.empty:
+        elegibles = breakdown
+
+    mas_publicado = elegibles.nlargest(3, "n_posts")[
+        ["tipo", "n_posts"]
+    ].to_dict("records") if "n_posts" in elegibles.columns else []
+
+    mejor_engagement = elegibles.nlargest(3, "engagement_promedio")[
+        ["tipo", "engagement_promedio"]
+    ].to_dict("records") if "engagement_promedio" in elegibles.columns else []
+
+    rate_elegibles = elegibles[elegibles.get("engagement_rate", 0) > 0]
+    mejor_rate = rate_elegibles.nlargest(3, "engagement_rate")[
+        ["tipo", "engagement_rate"]
+    ].to_dict("records") if not rate_elegibles.empty else []
+
+    return {
+        "mas_publicado": mas_publicado,
+        "mejor_engagement": mejor_engagement,
+        "mejor_rate": mejor_rate,
+    }
+
+
+def compute_type_recommendations(
+    breakdown: pd.DataFrame,
+    min_posts_for_signal: int = 3,
+) -> list[dict]:
+    """
+    Genera recomendaciones accionables comparando volumen vs engagement
+    por tipo de contenido.
+
+    Cada recomendación: {tipo, prioridad, titulo, detalle, accion}.
+    """
+    recs: list[dict] = []
+    if breakdown is None or breakdown.empty:
+        return recs
+    if "engagement_promedio" not in breakdown.columns:
+        return recs
+
+    elegibles = breakdown[breakdown["n_posts"] >= min_posts_for_signal].copy()
+    if elegibles.empty:
+        return recs
+
+    eng_global = elegibles["engagement_promedio"].mean()
+    if eng_global <= 0:
+        return recs
+
+    # 1. Tipos con alto engagement pero bajo volumen → publicar más
+    candidatos_aumentar = elegibles[
+        (elegibles["engagement_promedio"] > eng_global * 1.3)
+        & (elegibles["share_posts_pct"] < 30)
+    ].sort_values("engagement_promedio", ascending=False)
+    for _, r in candidatos_aumentar.head(3).iterrows():
+        recs.append({
+            "tipo": "🚀 Publicar más",
+            "prioridad": "alta",
+            "titulo": (
+                f"{r['tipo']}: {r['engagement_promedio']:.0f} engagement/post "
+                f"(vs promedio {eng_global:.0f})"
+            ),
+            "detalle": (
+                f"Solo {r['n_posts']:.0f} posts ({r['share_posts_pct']:.0f}% "
+                f"del total) pero genera engagement por encima del promedio. "
+                f"Tipo infrautilizado."
+            ),
+            "accion": (
+                f"Incrementa publicaciones de tipo {r['tipo']} a 30-40% del mix."
+            ),
+        })
+
+    # 2. Tipos con alto volumen pero bajo engagement → reducir o mejorar
+    candidatos_reducir = elegibles[
+        (elegibles["engagement_promedio"] < eng_global * 0.7)
+        & (elegibles["share_posts_pct"] > 25)
+    ].sort_values("share_posts_pct", ascending=False)
+    for _, r in candidatos_reducir.head(2).iterrows():
+        recs.append({
+            "tipo": "📉 Reducir o mejorar",
+            "prioridad": "media",
+            "titulo": (
+                f"{r['tipo']}: {r['share_posts_pct']:.0f}% del feed pero "
+                f"solo {r['engagement_promedio']:.0f} engagement/post"
+            ),
+            "detalle": (
+                f"Publicas {r['n_posts']:.0f} {r['tipo']} pero rinden menos "
+                "que el promedio. Estás saturando el feed con contenido de "
+                "bajo desempeño."
+            ),
+            "accion": (
+                "Reduce frecuencia, o mejora calidad (hook visual, copy, "
+                "CTA claro) antes de seguir publicando este tipo."
+            ),
+        })
+
+    # 3. Tipo más rentable absoluto
+    if not elegibles.empty:
+        top = elegibles.nlargest(1, "engagement_promedio").iloc[0]
+        share_pct = top["share_engagement_pct"]
+        recs.append({
+            "tipo": "🥇 Tipo más rentable",
+            "prioridad": "baja",
+            "titulo": (
+                f"{top['tipo']}: genera {share_pct:.0f}% del engagement total"
+            ),
+            "detalle": (
+                f"Con {top['n_posts']:.0f} posts capturó "
+                f"{top['share_engagement_pct']:.0f}% del engagement. "
+                f"Promedio: {top['engagement_promedio']:.0f} engagement/post."
+            ),
+            "accion": (
+                "Mantén la calidad y frecuencia. Analiza qué hace bien y "
+                "replícalo en otros tipos."
+            ),
+        })
+
+    prio_order = {"alta": 0, "media": 1, "baja": 2}
+    recs.sort(key=lambda r: prio_order.get(r.get("prioridad", "baja"), 3))
+    return recs
+
+
+def compute_cross_platform_comparison(
+    fb_breakdown: pd.DataFrame,
+    ig_breakdown: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Tabla comparativa de mismos tipos entre Facebook e Instagram.
+
+    Hace match por tipo (case-insensitive). Solo conserva tipos presentes
+    en al menos una de las dos plataformas.
+    """
+    if fb_breakdown is None or fb_breakdown.empty:
+        fb = pd.DataFrame(columns=[
+            "tipo", "n_posts", "engagement_promedio", "engagement_rate",
+        ])
+    else:
+        fb = fb_breakdown[[
+            c for c in [
+                "tipo", "n_posts", "engagement_promedio",
+                "engagement_rate", "total_engagement",
+            ] if c in fb_breakdown.columns
+        ]].copy()
+    fb["tipo"] = fb["tipo"].astype(str).str.title()
+
+    if ig_breakdown is None or ig_breakdown.empty:
+        ig = pd.DataFrame(columns=[
+            "tipo", "n_posts", "engagement_promedio", "engagement_rate",
+        ])
+    else:
+        ig = ig_breakdown[[
+            c for c in [
+                "tipo", "n_posts", "engagement_promedio",
+                "engagement_rate", "total_engagement",
+            ] if c in ig_breakdown.columns
+        ]].copy()
+    ig["tipo"] = ig["tipo"].astype(str).str.title()
+
+    fb = fb.rename(columns={
+        "n_posts": "fb_n_posts",
+        "engagement_promedio": "fb_engagement_promedio",
+        "engagement_rate": "fb_engagement_rate",
+        "total_engagement": "fb_total_engagement",
+    })
+    ig = ig.rename(columns={
+        "n_posts": "ig_n_posts",
+        "engagement_promedio": "ig_engagement_promedio",
+        "engagement_rate": "ig_engagement_rate",
+        "total_engagement": "ig_total_engagement",
+    })
+    merged = fb.merge(ig, on="tipo", how="outer").fillna(0)
+
+    # Diferencial: cuál plataforma genera más engagement promedio por tipo
+    def _ganador(row):
+        fbv = row.get("fb_engagement_promedio", 0)
+        igv = row.get("ig_engagement_promedio", 0)
+        if fbv > igv * 1.2:
+            return "Facebook"
+        if igv > fbv * 1.2:
+            return "Instagram"
+        if fbv == 0 and igv == 0:
+            return "—"
+        return "Empate"
+    merged["mejor_plataforma"] = merged.apply(_ganador, axis=1)
+    return merged.sort_values(
+        ["fb_total_engagement", "ig_total_engagement"],
+        ascending=False,
+    ).reset_index(drop=True)

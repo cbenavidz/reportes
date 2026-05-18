@@ -312,8 +312,6 @@ def _fetch_facebook_posts(
     # IMPORTANTE: usar /published_posts (no /posts) para mejor cobertura.
     # comments.summary(total_count): pages_read_engagement bastá.
     # attachments: para clasificar tipo de post (foto/video/reel/álbum/etc.)
-    # NOTA: insights de post se piden APARTE (un campo embedded falla
-    # si alguna métrica no existe para algún post).
     fields = (
         "id,created_time,message,permalink_url,status_type,"
         "attachments{media_type,type,subattachments{media_type}},"
@@ -420,7 +418,111 @@ def _fetch_facebook_posts(
     df = pd.DataFrame(rows)
     df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
     df["engagement"] = df["likes"] + df["comentarios"] + df["compartidos"]
+
+    # ── Enriquecer con Post Insights (impresiones, alcance, video views) ──
+    post_ids = df["post_id"].dropna().astype(str).tolist()
+    if post_ids:
+        insights = _fetch_facebook_posts_insights(post_ids, token)
+        if insights:
+            df["impresiones_total"] = df["post_id"].map(
+                lambda pid: insights.get(str(pid), {}).get("post_impressions", 0)
+            ).fillna(0)
+            df["impresiones_pagadas"] = df["post_id"].map(
+                lambda pid: insights.get(str(pid), {}).get("post_impressions_paid", 0)
+            ).fillna(0)
+            df["alcance_total"] = df["post_id"].map(
+                lambda pid: insights.get(str(pid), {}).get("post_impressions_unique", 0)
+            ).fillna(0)
+            df["alcance_pagado"] = df["post_id"].map(
+                lambda pid: insights.get(str(pid), {}).get("post_impressions_paid_unique", 0)
+            ).fillna(0)
+            df["alcance_organico"] = (
+                df["alcance_total"] - df["alcance_pagado"]
+            ).clip(lower=0)
+            df["video_views"] = df["post_id"].map(
+                lambda pid: insights.get(str(pid), {}).get("post_video_views", 0)
+            ).fillna(0)
+            df["es_pagado"] = df["impresiones_pagadas"] > 0
+
     return df.sort_values("engagement", ascending=False).reset_index(drop=True)
+
+
+def _fetch_facebook_posts_insights(
+    post_ids: list[str],
+    token: str,
+    batch_size: int = 50,
+) -> dict:
+    """
+    Trae insights para una lista de post_ids vía batch requests.
+
+    Métricas: post_impressions, post_impressions_paid, post_impressions_unique,
+    post_impressions_paid_unique, post_video_views.
+
+    Devuelve dict: {post_id: {metric_name: value}}
+    """
+    import json
+    import requests
+    if not post_ids:
+        return {}
+    metrics = (
+        "post_impressions,post_impressions_paid,"
+        "post_impressions_unique,post_impressions_paid_unique,"
+        "post_video_views"
+    )
+    out: dict[str, dict] = {}
+    # Procesar en lotes para evitar URLs demasiado largas
+    for i in range(0, len(post_ids), batch_size):
+        chunk = post_ids[i:i + batch_size]
+        batch = [
+            {
+                "method": "GET",
+                "relative_url": f"{pid}/insights?metric={metrics}",
+            }
+            for pid in chunk
+        ]
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/",
+                data={
+                    "access_token": token,
+                    "batch": json.dumps(batch),
+                },
+                timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Batch insights failed: %s", exc)
+            continue
+        if resp.status_code != 200:
+            logger.warning(
+                "Batch insights HTTP %s: %s",
+                resp.status_code, resp.text[:200],
+            )
+            continue
+        try:
+            batch_result = resp.json()
+        except Exception:  # noqa: BLE001
+            continue
+        # Cada item del batch es {"code":200, "body":"json_str"}
+        for pid, item in zip(chunk, batch_result):
+            if not isinstance(item, dict):
+                continue
+            if item.get("code") != 200:
+                continue
+            try:
+                body = json.loads(item.get("body", "{}"))
+            except Exception:  # noqa: BLE001
+                continue
+            metrics_map: dict[str, float] = {}
+            for d in body.get("data", []):
+                name = d.get("name")
+                values = d.get("values", [])
+                if name and values:
+                    v = values[0].get("value", 0)
+                    if isinstance(v, (int, float)):
+                        metrics_map[name] = v
+            if metrics_map:
+                out[str(pid)] = metrics_map
+    return out
 
 
 def _fetch_facebook_posts_aggregated(
@@ -875,7 +977,112 @@ def fetch_meta_instagram_top_posts(
         return pd.DataFrame()
     df = pd.DataFrame(rows)
     df["fecha"] = pd.to_datetime(df["fecha"])
+
+    # Enriquecer con insights (reach, plays, saved, impressions)
+    media_ids = df["post_id"].dropna().astype(str).tolist()
+    if media_ids:
+        ig_insights = _fetch_instagram_media_insights(
+            media_ids, page_token, df_types=dict(zip(df["post_id"].astype(str), df["tipo"])),
+        )
+        if ig_insights:
+            df["alcance_total"] = df["post_id"].map(
+                lambda pid: ig_insights.get(str(pid), {}).get("reach", 0)
+            ).fillna(0)
+            df["impresiones_total"] = df["post_id"].map(
+                lambda pid: ig_insights.get(str(pid), {}).get("impressions", 0)
+            ).fillna(0)
+            df["saved"] = df["post_id"].map(
+                lambda pid: ig_insights.get(str(pid), {}).get("saved", 0)
+            ).fillna(0)
+            df["video_views"] = df["post_id"].map(
+                lambda pid: (
+                    ig_insights.get(str(pid), {}).get("plays", 0)
+                    or ig_insights.get(str(pid), {}).get("video_views", 0)
+                )
+            ).fillna(0)
+
     return df.sort_values("engagement", ascending=False).head(n).reset_index(drop=True)
+
+
+def _fetch_instagram_media_insights(
+    media_ids: list[str],
+    token: str,
+    df_types: dict | None = None,
+    batch_size: int = 50,
+) -> dict:
+    """
+    Trae insights de IG media (posts, reels, carruseles) vía batch.
+
+    Métricas dependen del tipo:
+      - IMAGE/CAROUSEL: reach, impressions, saved
+      - VIDEO/REEL: reach, plays, saved
+      - STORY: reach, impressions, replies, taps_forward, taps_back, exits
+
+    Devuelve dict: {media_id: {metric: value}}.
+    """
+    import json
+    import requests
+    if not media_ids:
+        return {}
+
+    df_types = df_types or {}
+
+    def _metrics_for(mid: str) -> str:
+        t = (df_types.get(mid) or "").lower()
+        if "reel" in t or "video" in t:
+            return "reach,plays,saved,total_interactions"
+        if "story" in t:
+            return "reach,impressions,replies,taps_forward,taps_back,exits"
+        # Default: imagen/carrusel
+        return "reach,impressions,saved,total_interactions"
+
+    out: dict[str, dict] = {}
+    for i in range(0, len(media_ids), batch_size):
+        chunk = media_ids[i:i + batch_size]
+        batch = [
+            {
+                "method": "GET",
+                "relative_url": f"{mid}/insights?metric={_metrics_for(mid)}",
+            }
+            for mid in chunk
+        ]
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/",
+                data={"access_token": token, "batch": json.dumps(batch)},
+                timeout=30,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Batch IG insights failed: %s", exc)
+            continue
+        if resp.status_code != 200:
+            logger.warning(
+                "Batch IG insights HTTP %s: %s",
+                resp.status_code, resp.text[:200],
+            )
+            continue
+        try:
+            batch_result = resp.json()
+        except Exception:  # noqa: BLE001
+            continue
+        for mid, item in zip(chunk, batch_result):
+            if not isinstance(item, dict) or item.get("code") != 200:
+                continue
+            try:
+                body = json.loads(item.get("body", "{}"))
+            except Exception:  # noqa: BLE001
+                continue
+            metrics_map: dict[str, float] = {}
+            for d in body.get("data", []):
+                name = d.get("name")
+                values = d.get("values", [])
+                if name and values:
+                    v = values[0].get("value", 0)
+                    if isinstance(v, (int, float)):
+                        metrics_map[name] = v
+            if metrics_map:
+                out[str(mid)] = metrics_map
+    return out
 
 
 def fetch_meta_facebook_data(
@@ -1130,3 +1337,208 @@ def _fetch_instagram_media_aggregated(
         "comentarios": "sum",
         "impresiones": "sum",
     })
+
+
+# ===========================================================================
+# Stories (Facebook e Instagram)
+# ===========================================================================
+
+
+def fetch_meta_facebook_stories(
+    date_from: date,
+    date_to: date,
+) -> pd.DataFrame:
+    """
+    Trae Stories de Facebook Page con sus métricas básicas.
+
+    NOTA: Facebook ha restringido mucho la API de Stories. El endpoint
+    /{page_id}/stories puede devolver vacío o requerir permisos especiales.
+    Si no funciona devuelve un DataFrame vacío sin error.
+    """
+    cfg = get_secret_dict("meta") or {}
+    page_id = cfg.get("facebook_page_id")
+    if not page_id:
+        return pd.DataFrame()
+    page_token = _get_page_access_token() or cfg.get("access_token")
+
+    since_unix = int(datetime.combine(date_from, datetime.min.time()).timestamp())
+    until_unix = int(datetime.combine(
+        date_to + timedelta(days=1), datetime.min.time()
+    ).timestamp())
+
+    fields = "id,creation_time,status,url,media_type"
+    params = {
+        "fields": fields,
+        "since": since_unix,
+        "until": until_unix,
+        "limit": 100,
+    }
+    data = _try_get(f"/{page_id}/stories", params, token=page_token)
+    if not data or not data.get("data"):
+        return pd.DataFrame(columns=[
+            "fecha", "story_id", "tipo", "url", "alcance",
+            "impresiones", "respuestas",
+        ])
+
+    rows = []
+    for s in data.get("data", []):
+        ts_full = s.get("creation_time", "")
+        ts = ts_full[:10]
+        if not ts:
+            continue
+        rows.append({
+            "fecha": ts,
+            "story_id": s.get("id"),
+            "tipo": "Story",
+            "url": s.get("url", ""),
+            "media_type": s.get("media_type", ""),
+        })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+
+    # Insights por story
+    story_ids = df["story_id"].dropna().astype(str).tolist()
+    if story_ids:
+        story_insights = _fetch_facebook_story_insights(story_ids, page_token)
+        if story_insights:
+            df["alcance"] = df["story_id"].map(
+                lambda sid: story_insights.get(str(sid), {}).get("post_impressions_unique", 0)
+            ).fillna(0)
+            df["impresiones"] = df["story_id"].map(
+                lambda sid: story_insights.get(str(sid), {}).get("post_impressions", 0)
+            ).fillna(0)
+    return df
+
+
+def _fetch_facebook_story_insights(
+    story_ids: list[str],
+    token: str,
+    batch_size: int = 50,
+) -> dict:
+    """Batch insights de stories de Facebook."""
+    import json
+    import requests
+    if not story_ids:
+        return {}
+    out: dict[str, dict] = {}
+    metrics = "post_impressions,post_impressions_unique"
+    for i in range(0, len(story_ids), batch_size):
+        chunk = story_ids[i:i + batch_size]
+        batch = [
+            {"method": "GET", "relative_url": f"{sid}/insights?metric={metrics}"}
+            for sid in chunk
+        ]
+        try:
+            resp = requests.post(
+                f"{BASE_URL}/",
+                data={"access_token": token, "batch": json.dumps(batch)},
+                timeout=30,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        if resp.status_code != 200:
+            continue
+        try:
+            batch_result = resp.json()
+        except Exception:  # noqa: BLE001
+            continue
+        for sid, item in zip(chunk, batch_result):
+            if not isinstance(item, dict) or item.get("code") != 200:
+                continue
+            try:
+                body = json.loads(item.get("body", "{}"))
+            except Exception:  # noqa: BLE001
+                continue
+            mm: dict[str, float] = {}
+            for d in body.get("data", []):
+                name = d.get("name")
+                values = d.get("values", [])
+                if name and values:
+                    v = values[0].get("value", 0)
+                    if isinstance(v, (int, float)):
+                        mm[name] = v
+            if mm:
+                out[str(sid)] = mm
+    return out
+
+
+def fetch_meta_instagram_stories(
+    date_from: date,
+    date_to: date,
+) -> pd.DataFrame:
+    """
+    Trae Stories de Instagram con sus métricas.
+
+    IMPORTANTE: Las stories de Instagram solo existen 24h. Después de eso
+    NO se pueden obtener vía API. Para histórico hay que descargarlas
+    diariamente o usar el campo `stories` del IG user (que también solo
+    da las activas).
+
+    Si se quiere histórico, debe correrse esta función como cron diario.
+    """
+    cfg = get_secret_dict("meta") or {}
+    ig_id = cfg.get("instagram_user_id")
+    if not ig_id:
+        return pd.DataFrame()
+    page_token = _get_page_access_token() or cfg.get("access_token")
+
+    # /{ig_id}/stories devuelve las stories ACTIVAS (últimas 24h)
+    fields = "id,timestamp,media_type,media_url,permalink"
+    params = {"fields": fields, "limit": 100}
+    data = _try_get(f"/{ig_id}/stories", params, token=page_token)
+    if not data or not data.get("data"):
+        return pd.DataFrame(columns=[
+            "fecha", "story_id", "tipo", "url", "alcance",
+            "impresiones", "respuestas", "exits", "taps_forward",
+        ])
+
+    rows = []
+    for s in data.get("data", []):
+        ts_full = s.get("timestamp", "")
+        ts = ts_full[:10]
+        if not ts:
+            continue
+        sd = datetime.strptime(ts, "%Y-%m-%d").date()
+        if sd < date_from or sd > date_to:
+            continue
+        rows.append({
+            "fecha": ts,
+            "story_id": s.get("id"),
+            "tipo": "Story",
+            "url": s.get("permalink", ""),
+            "media_type": s.get("media_type", ""),
+        })
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+
+    # Insights
+    story_ids = df["story_id"].dropna().astype(str).tolist()
+    if story_ids:
+        si = _fetch_instagram_media_insights(
+            story_ids, page_token,
+            df_types={sid: "Story" for sid in story_ids},
+        )
+        if si:
+            df["alcance"] = df["story_id"].map(
+                lambda sid: si.get(str(sid), {}).get("reach", 0)
+            ).fillna(0)
+            df["impresiones"] = df["story_id"].map(
+                lambda sid: si.get(str(sid), {}).get("impressions", 0)
+            ).fillna(0)
+            df["respuestas"] = df["story_id"].map(
+                lambda sid: si.get(str(sid), {}).get("replies", 0)
+            ).fillna(0)
+            df["exits"] = df["story_id"].map(
+                lambda sid: si.get(str(sid), {}).get("exits", 0)
+            ).fillna(0)
+            df["taps_forward"] = df["story_id"].map(
+                lambda sid: si.get(str(sid), {}).get("taps_forward", 0)
+            ).fillna(0)
+            df["taps_back"] = df["story_id"].map(
+                lambda sid: si.get(str(sid), {}).get("taps_back", 0)
+            ).fillna(0)
+    return df
