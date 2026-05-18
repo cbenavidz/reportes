@@ -1238,9 +1238,11 @@ def fetch_meta_instagram_data(
     # --- Insights del perfil IG ---
     # IMPORTANTE: en v25.0 IG insights devuelven UN SOLO total_value
     # por período (no time series). Hay que usar metric_type=total_value.
+    # `impressions` fue removida; v25 usa `views` (vistas del perfil + contenido).
     period_totals: dict[str, int] = {}
     for metric, alias in [
         ("reach", "alcance_periodo"),
+        ("views", "impresiones_periodo"),   # v25: reemplaza a impressions
         ("accounts_engaged", "cuentas_engagement_periodo"),
         ("profile_views", "vistas_perfil_periodo"),
         ("website_clicks", "clicks_web_periodo"),
@@ -1285,6 +1287,7 @@ def fetch_meta_instagram_data(
         df = df.sort_values("fecha").reset_index(drop=True)
         last_idx = df.index[-1]
         df.at[last_idx, "alcance"] = period_totals.get("alcance_periodo", 0)
+        df.at[last_idx, "impresiones"] = period_totals.get("impresiones_periodo", 0)
         df.at[last_idx, "vistas_perfil"] = period_totals.get("vistas_perfil_periodo", 0)
         df.at[last_idx, "clicks_web"] = period_totals.get("clicks_web_periodo", 0)
         df.at[last_idx, "cuentas_engagement"] = period_totals.get("cuentas_engagement_periodo", 0)

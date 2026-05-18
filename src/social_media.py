@@ -269,8 +269,13 @@ def compute_period_kpis(
         "compartidos": float(sub.get("compartidos", pd.Series([0])).sum()),
         "clics": float(sub.get("clics", pd.Series([0])).sum()),
     }
-    base = out["alcance"] or out["impresiones"] or 1
-    out["engagement_rate"] = (out["engagement"] / base * 100) if base else 0.0
+    # Engagement rate solo válido si tenemos alcance o impresiones REALES.
+    # Sin base, devolver 0 (no inflar con division por 1).
+    base = out["alcance"] or out["impresiones"]
+    if base > 0:
+        out["engagement_rate"] = out["engagement"] / base * 100
+    else:
+        out["engagement_rate"] = 0.0
     return out
 
 
