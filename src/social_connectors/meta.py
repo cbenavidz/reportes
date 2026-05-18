@@ -358,6 +358,7 @@ def _fetch_facebook_posts(
         ])
     # Reformat para reusar el loop existente
     data = {"data": all_data}
+    rows: list[dict] = []
     for p in data.get("data", []):
         created_full = p.get("created_time", "")
         created = created_full[:10]
