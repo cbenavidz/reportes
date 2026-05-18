@@ -118,11 +118,28 @@ companies_df = load_companies()
 render_company_context(companies_df, filters["company_ids"])
 
 
-# ── Helpers ──
+# ── Helpers de cálculo (deben estar antes del filtro de categoría) ──
 def _money(v) -> str:
     if v is None or pd.isna(v):
         return "—"
     return f"${v:,.0f}"
+
+
+def _delta_pct(act: float, prev: float) -> str:
+    if prev == 0:
+        return "+100%" if act else "—"
+    return f"{(act - prev) / abs(prev) * 100:+.1f}%"
+
+
+def _filter_sales_by_category(sl: pd.DataFrame, cat: str | None) -> pd.DataFrame:
+    """Filtra ventas por categoría. None o '(Todas)' devuelve todo."""
+    if sl is None or sl.empty or not cat or cat == "(Todas)":
+        return sl if sl is not None else pd.DataFrame()
+    s = sl.copy()
+    if "product_categ_name" not in s.columns:
+        return s
+    s["product_categ_name"] = s["product_categ_name"].fillna("(Sin categoría)")
+    return s[s["product_categ_name"] == cat]
 
 
 # ── Carga base ──
@@ -140,14 +157,48 @@ with st.spinner("Cargando plan de cuentas, ventas y compras..."):
         company_ids=filters["company_ids"],
     )
     stock_df = load_stock_quants(company_ids=filters["company_ids"])
-    # Balance al corte del período actual y anterior (para KPIs)
+    # Balance al INICIO y al CIERRE del período actual (para promedio)
     balances_corte = load_account_balances_aggregated(
         date_to=fecha_hasta.isoformat(),
         company_ids=filters["company_ids"],
     )
+    fecha_antes = (fecha_desde - timedelta(days=1)).isoformat()
+    balances_inicio = load_account_balances_aggregated(
+        date_to=fecha_antes,
+        company_ids=filters["company_ids"],
+    )
+    # Para comparativo con período anterior
     balances_corte_prev = load_account_balances_aggregated(
         date_to=fecha_hasta_prev.isoformat(),
         company_ids=filters["company_ids"],
+    )
+    fecha_antes_prev = (fecha_desde_prev - timedelta(days=1)).isoformat()
+    balances_inicio_prev = load_account_balances_aggregated(
+        date_to=fecha_antes_prev,
+        company_ids=filters["company_ids"],
+    )
+    # Balances para KPIs móviles 90d / 180d / 365d (todos al cierre = hoy)
+    balances_hoy = load_account_balances_aggregated(
+        date_to=today.isoformat(),
+        company_ids=filters["company_ids"],
+    )
+    bal_inicio_90 = load_account_balances_aggregated(
+        date_to=(today - timedelta(days=91)).isoformat(),
+        company_ids=filters["company_ids"],
+    )
+    bal_inicio_180 = load_account_balances_aggregated(
+        date_to=(today - timedelta(days=181)).isoformat(),
+        company_ids=filters["company_ids"],
+    )
+    bal_inicio_365 = load_account_balances_aggregated(
+        date_to=(today - timedelta(days=366)).isoformat(),
+        company_ids=filters["company_ids"],
+    )
+    # Ventas extendidas (365 días desde hoy) para los KPIs móviles
+    sales_365 = load_invoice_lines(
+        company_ids=filters["company_ids"],
+        date_from=(today - timedelta(days=365)).isoformat(),
+        date_to=today.isoformat(),
     )
 
 if chart_df is None or chart_df.empty:
@@ -166,62 +217,268 @@ summary_prev = compute_purchases_vs_sales_summary(
     purchases_lines, sales_lines, stock_df, fecha_desde_prev, fecha_hasta_prev,
 )
 rot14_act = compute_rotacion_cuenta_14(
-    balances_corte, chart_df, summary_act["total_ventas"],
+    balances_inicio, balances_corte, chart_df,
+    summary_act["total_ventas"], summary_act["costo_ventas"],
     fecha_desde, fecha_hasta,
 )
 rot14_prev = compute_rotacion_cuenta_14(
-    balances_corte_prev, chart_df, summary_prev["total_ventas"],
+    balances_inicio_prev, balances_corte_prev, chart_df,
+    summary_prev["total_ventas"], summary_prev["costo_ventas"],
     fecha_desde_prev, fecha_hasta_prev,
 )
 
+# Crosstab por producto y categoría (lo necesitamos antes de los KPIs
+# para poder obtener el valor de stock por categoría cuando hay filtro)
+crosstab = compute_product_crosstab(
+    purchases_lines, sales_lines, stock_df, fecha_desde, fecha_hasta,
+)
+cat_tab = compute_category_crosstab(crosstab)
 
-# ── KPIs cabecera ──
-def _delta_pct(act: float, prev: float) -> str:
-    if prev == 0:
-        return "+100%" if act else "—"
-    return f"{(act - prev) / abs(prev) * 100:+.1f}%"
+
+# ── Filtro de categoría ──
+st.markdown("### 🏷️ Filtro por categoría de producto")
+if sales_lines is not None and not sales_lines.empty and "product_categ_name" in sales_lines.columns:
+    cats_disp = ["(Todas)"] + sorted(
+        sales_lines["product_categ_name"].fillna("(Sin categoría)").unique().tolist()
+    )
+else:
+    cats_disp = ["(Todas)"]
+cat_filter = st.selectbox(
+    "Categoría",
+    options=cats_disp,
+    key="ri_cat_filter",
+    help=(
+        "Si seleccionas una categoría, las ventas se filtran a esa categoría "
+        "y el denominador se cambia al **valor de stock de esa categoría** "
+        "(stock.quant × costo). Esto sustituye al saldo de cuenta 14, que no "
+        "se puede desagregar por categoría desde la contabilidad."
+    ),
+)
+es_filtrado = cat_filter and cat_filter != "(Todas)"
+
+# Aplicar filtro a ventas
+sales_filt = _filter_sales_by_category(sales_lines, cat_filter)
+
+# Cuando hay filtro de categoría, recalculamos los totales filtrados
+if es_filtrado:
+    from src.purchases_analyzer import _apply_default_exclusions, _normalize_sales_signed
+    sf = _apply_default_exclusions(_normalize_sales_signed(sales_filt))
+    if not sf.empty and "invoice_date" in sf.columns:
+        sf["_d"] = pd.to_datetime(sf["invoice_date"], errors="coerce").dt.date
+        sf_per = sf[(sf["_d"] >= fecha_desde) & (sf["_d"] <= fecha_hasta)]
+        ventas_filt_act = float(sf_per["price_subtotal_signed"].sum())
+        costo_filt_act = float(sf_per.get("line_cost", 0).sum())
+        sf_prv = sf[(sf["_d"] >= fecha_desde_prev) & (sf["_d"] <= fecha_hasta_prev)]
+        ventas_filt_prv = float(sf_prv["price_subtotal_signed"].sum())
+        costo_filt_prv = float(sf_prv.get("line_cost", 0).sum())
+    else:
+        ventas_filt_act = ventas_filt_prv = costo_filt_act = costo_filt_prv = 0.0
+
+    # Valor de stock de la categoría seleccionada (proxy desde stock.quant)
+    if cat_tab is not None and not cat_tab.empty:
+        cat_row = cat_tab[cat_tab["product_categ_name"] == cat_filter]
+        if cat_row.empty:
+            cat_tab_norm = cat_tab.copy()
+            cat_tab_norm["product_categ_name"] = cat_tab_norm[
+                "product_categ_name"
+            ].fillna("(Sin categoría)")
+            cat_row = cat_tab_norm[cat_tab_norm["product_categ_name"] == cat_filter]
+        saldo_filt = float(cat_row["stock_valor"].sum()) if not cat_row.empty else 0.0
+    else:
+        saldo_filt = 0.0
+    # Para período anterior NO tenemos stock histórico → usamos el actual
+    saldo_filt_act = saldo_filt
+    saldo_filt_prv = saldo_filt
+else:
+    ventas_filt_act = summary_act["total_ventas"]
+    costo_filt_act = summary_act["costo_ventas"]
+    ventas_filt_prv = summary_prev["total_ventas"]
+    costo_filt_prv = summary_prev["costo_ventas"]
+    saldo_filt_act = rot14_act["saldo_promedio"]
+    saldo_filt_prv = rot14_prev["saldo_promedio"]
 
 
+# ── Helper para rotación móvil ──
+def _rotacion_rango(
+    sales_df: pd.DataFrame,
+    date_from_: date,
+    date_to_: date,
+    bal_inicio: pd.DataFrame,
+    bal_final: pd.DataFrame,
+    cat: str | None,
+    cat_tab_local: pd.DataFrame,
+) -> dict:
+    """Calcula rotación para un rango específico, aplicando filtro de categoría."""
+    from src.purchases_analyzer import _apply_default_exclusions, _normalize_sales_signed
+    sf = _filter_sales_by_category(sales_df, cat)
+    sf = _apply_default_exclusions(_normalize_sales_signed(sf))
+    if sf is not None and not sf.empty and "invoice_date" in sf.columns:
+        sf["_d"] = pd.to_datetime(sf["invoice_date"], errors="coerce").dt.date
+        sf_per = sf[(sf["_d"] >= date_from_) & (sf["_d"] <= date_to_)]
+        ventas_r = float(sf_per["price_subtotal_signed"].sum())
+        costo_r = float(sf_per.get("line_cost", 0).sum())
+    else:
+        ventas_r = costo_r = 0.0
+
+    # Denominador: cuenta 14 (sin filtro) o stock_valor categoría (con filtro)
+    if cat and cat != "(Todas)":
+        if cat_tab_local is not None and not cat_tab_local.empty:
+            ct = cat_tab_local.copy()
+            ct["product_categ_name"] = ct["product_categ_name"].fillna("(Sin categoría)")
+            row = ct[ct["product_categ_name"] == cat]
+            saldo_prom = float(row["stock_valor"].sum()) if not row.empty else 0.0
+        else:
+            saldo_prom = 0.0
+    else:
+        r = compute_rotacion_cuenta_14(
+            bal_inicio, bal_final, chart_df, ventas_r, costo_r,
+            date_from_, date_to_,
+        )
+        saldo_prom = r["saldo_promedio"]
+
+    rot_v = (ventas_r / saldo_prom) if saldo_prom else 0.0
+    rot_c = (costo_r / saldo_prom) if saldo_prom else 0.0
+    period_d = max((date_to_ - date_from_).days + 1, 1)
+    rot_v_anu = rot_v * (365 / period_d) if period_d else 0.0
+    dias_v = (365 / rot_v_anu) if rot_v_anu > 0 else 0.0
+    return {
+        "ventas": ventas_r, "costo": costo_r, "saldo_prom": saldo_prom,
+        "rot_v": rot_v, "rot_c": rot_c,
+        "rot_v_anu": rot_v_anu, "dias_v": dias_v,
+        "period_d": period_d,
+    }
+
+
+# Calcular rotación a 90d, 180d, 365d
+rot_90 = _rotacion_rango(
+    sales_365, today - timedelta(days=90), today,
+    bal_inicio_90, balances_hoy, cat_filter, cat_tab,
+)
+rot_180 = _rotacion_rango(
+    sales_365, today - timedelta(days=180), today,
+    bal_inicio_180, balances_hoy, cat_filter, cat_tab,
+)
+rot_365 = _rotacion_rango(
+    sales_365, today - timedelta(days=365), today,
+    bal_inicio_365, balances_hoy, cat_filter, cat_tab,
+)
+
+# Rotación del período (usando valores filtrados si hay filtro)
+rot_v_act = (ventas_filt_act / saldo_filt_act) if saldo_filt_act > 0 else 0.0
+rot_c_act = (costo_filt_act / saldo_filt_act) if saldo_filt_act > 0 else 0.0
+rot_v_prv = (ventas_filt_prv / saldo_filt_prv) if saldo_filt_prv > 0 else 0.0
+rot_c_prv = (costo_filt_prv / saldo_filt_prv) if saldo_filt_prv > 0 else 0.0
+
+label_denominador = (
+    f"stock valor de **{cat_filter}**"
+    if es_filtrado
+    else f"inventario promedio cuenta 14"
+)
+
+st.markdown(f"#### 📊 Rotación del período (cruda, sin anualizar) — {cat_filter}")
+st.caption(
+    f"Denominador: {label_denominador}. "
+    f"Ejemplo: si vendiste $120M con denominador de $100M, rotación = **1.20x**."
+)
 k1, k2, k3, k4 = st.columns(4)
 with k1:
     st.metric(
-        "🔄 Rotación anual",
-        f"{rot14_act['rotacion_anual']:.2f}x"
-        if rot14_act["rotacion_anual"] else "—",
-        delta=_delta_pct(
-            rot14_act["rotacion_anual"], rot14_prev["rotacion_anual"]
+        "🔄 Rot. Ventas / Inv.",
+        f"{rot_v_act:.2f}x" if rot_v_act else "—",
+        delta=_delta_pct(rot_v_act, rot_v_prv),
+        help=(
+            f"Ventas ({_money(ventas_filt_act)}) / "
+            f"Denominador ({_money(saldo_filt_act)})."
         ),
     )
 with k2:
     st.metric(
-        "📅 Días de inventario",
-        f"{rot14_act['dias_inventario']:.0f}"
-        if rot14_act["rotacion_anual"] > 0 else "—",
-        delta=_delta_pct(
-            rot14_act["dias_inventario"], rot14_prev["dias_inventario"]
+        "🏛️ Rot. Costo / Inv. (NIIF)",
+        f"{rot_c_act:.2f}x" if rot_c_act else "—",
+        delta=_delta_pct(rot_c_act, rot_c_prv),
+        help=(
+            f"Costo ventas ({_money(costo_filt_act)}) / "
+            f"Denominador ({_money(saldo_filt_act)})."
         ),
-        delta_color="inverse",
     )
 with k3:
     st.metric(
-        "📒 Saldo cuenta 14",
-        _money(rot14_act["saldo_inventario"]),
-        delta=_delta_pct(
-            rot14_act["saldo_inventario"], rot14_prev["saldo_inventario"]
+        "📒 Denominador",
+        _money(saldo_filt_act),
+        help=(
+            f"Saldo final cuenta 14: {_money(rot14_act['saldo_final'])} · "
+            f"Inicial: {_money(rot14_act['saldo_inicial'])} · "
+            f"Promedio: {_money(rot14_act['saldo_promedio'])}"
+        ) if not es_filtrado else (
+            f"Valor de stock de la categoría '{cat_filter}' "
+            f"(snapshot actual de stock.quant)."
         ),
     )
 with k4:
     st.metric(
-        "💰 Ventas período",
-        _money(summary_act["total_ventas"]),
-        delta=_delta_pct(
-            summary_act["total_ventas"], summary_prev["total_ventas"]
-        ),
+        "💰 Ventas del período",
+        _money(ventas_filt_act),
+        delta=_delta_pct(ventas_filt_act, ventas_filt_prv),
     )
 
 if st.button("🔄 Recargar datos (limpia caché)", key="ri_reload"):
     st.cache_data.clear()
     st.rerun()
+
+st.markdown("---")
+
+# ── KPIs móviles: 90d, 180d, 365d (anclados a HOY) ──
+st.markdown(f"### 📐 Rotación móvil — anclada a hoy ({today})")
+st.caption(
+    "Mismo cálculo (ventas / denominador) aplicado a ventanas de 90, 180 "
+    "y 365 días que terminan hoy. Permite ver si el inventario está "
+    "rotando mejor o peor en el corto, medio y largo plazo."
+)
+cm1, cm2, cm3 = st.columns(3)
+for col, label, r in [
+    (cm1, "90 días", rot_90),
+    (cm2, "180 días", rot_180),
+    (cm3, "365 días", rot_365),
+]:
+    with col:
+        with st.container(border=True):
+            st.markdown(f"#### Últimos {label}")
+            st.metric(
+                "🔄 Rot. (Ventas/Inv)",
+                f"{r['rot_v']:.2f}x" if r["rot_v"] else "—",
+                delta=(
+                    f"{r['rot_v_anu']:.2f}x anualizada"
+                    if r["rot_v_anu"] else None
+                ),
+                delta_color="off",
+            )
+            sub1, sub2 = st.columns(2)
+            with sub1:
+                st.metric("Rot. NIIF", f"{r['rot_c']:.2f}x" if r["rot_c"] else "—")
+            with sub2:
+                st.metric(
+                    "Días inv.",
+                    f"{r['dias_v']:.0f}" if r["dias_v"] > 0 else "—",
+                )
+            st.caption(
+                f"Ventas: {_money(r['ventas'])} · "
+                f"Costo: {_money(r['costo'])} · "
+                f"Denominador: {_money(r['saldo_prom'])}"
+            )
+
+# Análisis de tendencia entre las 3 ventanas
+trend_msg = []
+if rot_90["rot_v"] and rot_180["rot_v"] and rot_365["rot_v"]:
+    if rot_90["rot_v"] > rot_180["rot_v"] > rot_365["rot_v"]:
+        trend_msg.append("📈 **Mejorando:** rotación creciente en corto, medio y largo plazo.")
+    elif rot_90["rot_v"] < rot_180["rot_v"] < rot_365["rot_v"]:
+        trend_msg.append("📉 **Deteriorándose:** rotación decreciente — revisar surtido y ventas.")
+    elif rot_90["rot_v"] > rot_365["rot_v"] * 1.1:
+        trend_msg.append("📈 Últimos 90d rotan más que el promedio anual.")
+    elif rot_90["rot_v"] < rot_365["rot_v"] * 0.9:
+        trend_msg.append("📉 Últimos 90d rotan menos que el promedio anual.")
+if trend_msg:
+    st.info(" · ".join(trend_msg))
 
 st.markdown("---")
 
@@ -269,24 +526,33 @@ with st.spinner("Construyendo serie mensual..."):
     monthly = saldo_mes.merge(ventas_mes, on="mes", how="outer").fillna(
         {"ventas_mes": 0, "saldo_inv_cierre": 0}
     )
-    # Rotación mensual anualizada: ventas_mes × 12 / saldo_cierre
-    monthly["rotacion_anual_mes"] = monthly.apply(
-        lambda r: (r["ventas_mes"] * 12 / r["saldo_inv_cierre"])
-        if r["saldo_inv_cierre"] > 0 else None,
+    monthly = monthly.sort_values("mes").reset_index(drop=True)
+
+    # Saldo PROMEDIO del mes = (saldo cierre mes anterior + saldo cierre mes actual) / 2
+    monthly["saldo_inv_apertura"] = monthly["saldo_inv_cierre"].shift(1)
+    # Para el primer mes usamos solo el saldo de cierre
+    monthly["saldo_inv_apertura"] = monthly["saldo_inv_apertura"].fillna(
+        monthly["saldo_inv_cierre"]
+    )
+    monthly["saldo_inv_prom"] = (
+        monthly["saldo_inv_apertura"] + monthly["saldo_inv_cierre"]
+    ) / 2.0
+
+    # Rotación del MES (cruda, sin anualizar): ventas_mes / saldo_promedio
+    # Ejemplo: ventas 120M, saldo prom 100M → 1.2x veces en el mes
+    monthly["rotacion_mes"] = monthly.apply(
+        lambda r: (r["ventas_mes"] / r["saldo_inv_prom"])
+        if r["saldo_inv_prom"] > 0 else None,
         axis=1,
     )
-    monthly["dias_inv_mes"] = monthly["rotacion_anual_mes"].apply(
-        lambda x: 365 / x if x and x > 0 else None
+    # Días de inventario implícitos en ese mes (30 días / rotación)
+    monthly["dias_inv_mes"] = monthly["rotacion_mes"].apply(
+        lambda x: 30 / x if x and x > 0 else None
     )
-    monthly = monthly.sort_values("mes").reset_index(drop=True)
+    # Versión anualizada (para benchmarks contra industria)
+    monthly["rotacion_anual_mes"] = monthly["rotacion_mes"] * 12
+
     monthly["mes_label"] = pd.to_datetime(monthly["mes"]).dt.strftime("%Y-%m")
-
-
-# ── Crosstabs por producto y categoría ──
-crosstab = compute_product_crosstab(
-    purchases_lines, sales_lines, stock_df, fecha_desde, fecha_hasta,
-)
-cat_tab = compute_category_crosstab(crosstab)
 
 
 # ── Sub-pestañas ──
@@ -303,8 +569,9 @@ t_evol, t_cat, t_prod, t_rec, t_diag = st.tabs([
 with t_evol:
     st.markdown("### Evolución mensual de la rotación")
     st.caption(
-        "Cada barra representa un mes. La rotación se anualiza multiplicando "
-        "las ventas del mes por 12 sobre el saldo de cuenta 14 al cierre del mes."
+        "**Rotación del mes = Ventas del mes / Saldo promedio del mes.** "
+        "Sin anualizar. Ejemplo: si vendiste $120M con saldo promedio "
+        "de $100M, la rotación del mes es **1.20x**."
     )
 
     if monthly.empty:
@@ -318,14 +585,20 @@ with t_evol:
             yaxis="y",
         ))
         fig1.add_trace(go.Scatter(
-            x=monthly["mes_label"], y=monthly["saldo_inv_cierre"],
-            name="Saldo cuenta 14 (cierre)",
+            x=monthly["mes_label"], y=monthly["saldo_inv_prom"],
+            name="Saldo cuenta 14 (promedio)",
             line=dict(color="#a855f7", width=3),
             mode="lines+markers", yaxis="y2",
         ))
+        fig1.add_trace(go.Scatter(
+            x=monthly["mes_label"], y=monthly["saldo_inv_cierre"],
+            name="Saldo cuenta 14 (cierre)",
+            line=dict(color="#c084fc", width=2, dash="dot"),
+            mode="lines", yaxis="y2",
+        ))
         fig1.update_layout(
             height=420, margin=dict(l=0, r=0, t=30, b=0),
-            title="Ventas vs Saldo de inventario",
+            title="Ventas mensuales vs Saldo de inventario",
             yaxis=dict(title="Ventas $", tickformat=",.0f"),
             yaxis2=dict(
                 title="Saldo inv. $", overlaying="y", side="right",
@@ -335,31 +608,29 @@ with t_evol:
         )
         st.plotly_chart(fig1, use_container_width=True)
 
-        # Gráfico 2: rotación anualizada por mes
-        rot_chart = monthly.dropna(subset=["rotacion_anual_mes"]).copy()
+        # Gráfico 2: rotación cruda del mes
+        rot_chart = monthly.dropna(subset=["rotacion_mes"]).copy()
         if not rot_chart.empty:
             fig2 = go.Figure()
             fig2.add_trace(go.Bar(
-                x=rot_chart["mes_label"], y=rot_chart["rotacion_anual_mes"],
-                name="Rotación anualizada (mes)",
+                x=rot_chart["mes_label"], y=rot_chart["rotacion_mes"],
+                name="Rotación del mes",
                 marker_color="#0ea5e9",
-                text=rot_chart["rotacion_anual_mes"],
-                texttemplate="%{text:.1f}x",
+                text=rot_chart["rotacion_mes"],
+                texttemplate="%{text:.2f}x",
                 textposition="outside",
             ))
             fig2.add_trace(go.Scatter(
                 x=rot_chart["mes_label"], y=rot_chart["dias_inv_mes"],
-                name="Días de inventario",
+                name="Días de inventario (30 / rot)",
                 line=dict(color="#ef4444", width=2, dash="dot"),
                 mode="lines+markers", yaxis="y2",
             ))
             fig2.update_layout(
                 height=400, margin=dict(l=0, r=0, t=30, b=0),
-                title="Rotación anualizada y días de inventario por mes",
-                yaxis=dict(title="Rotación (veces/año)"),
-                yaxis2=dict(
-                    title="Días", overlaying="y", side="right",
-                ),
+                title="Rotación cruda del mes y días de inventario",
+                yaxis=dict(title="Rotación (veces en el mes)"),
+                yaxis2=dict(title="Días", overlaying="y", side="right"),
                 legend=dict(orientation="h", yanchor="bottom", y=1.05, x=0),
             )
             st.plotly_chart(fig2, use_container_width=True)
@@ -367,8 +638,9 @@ with t_evol:
         # Tabla mensual
         with st.expander("📋 Tabla detallada por mes", expanded=False):
             tabla = monthly[[
-                "mes_label", "ventas_mes", "saldo_inv_cierre",
-                "rotacion_anual_mes", "dias_inv_mes",
+                "mes_label", "ventas_mes",
+                "saldo_inv_apertura", "saldo_inv_cierre", "saldo_inv_prom",
+                "rotacion_mes", "dias_inv_mes", "rotacion_anual_mes",
             ]].rename(columns={"mes_label": "Mes"})
             st.dataframe(
                 tabla,
@@ -376,14 +648,23 @@ with t_evol:
                     "ventas_mes": st.column_config.NumberColumn(
                         "Ventas del mes", format="$%,.0f"
                     ),
-                    "saldo_inv_cierre": st.column_config.NumberColumn(
-                        "Saldo inv. cierre", format="$%,.0f"
+                    "saldo_inv_apertura": st.column_config.NumberColumn(
+                        "Saldo apertura", format="$%,.0f"
                     ),
-                    "rotacion_anual_mes": st.column_config.NumberColumn(
-                        "Rotación anual", format="%.2fx"
+                    "saldo_inv_cierre": st.column_config.NumberColumn(
+                        "Saldo cierre", format="$%,.0f"
+                    ),
+                    "saldo_inv_prom": st.column_config.NumberColumn(
+                        "Saldo promedio", format="$%,.0f"
+                    ),
+                    "rotacion_mes": st.column_config.NumberColumn(
+                        "Rot. del mes", format="%.2fx"
                     ),
                     "dias_inv_mes": st.column_config.NumberColumn(
                         "Días inv.", format="%.0f"
+                    ),
+                    "rotacion_anual_mes": st.column_config.NumberColumn(
+                        "Rot. anualizada", format="%.2fx"
                     ),
                 },
                 use_container_width=True, hide_index=True,

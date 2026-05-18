@@ -522,107 +522,129 @@ def compute_monthly_evolution(
 # ---------------------------------------------------------------------------
 
 
-def compute_rotacion_cuenta_14(
+def _saldo_cuenta_14_from_balances(
     balances_aggregated: pd.DataFrame,
-    chart: pd.DataFrame,
-    total_ventas: float,
-    date_from: date,
-    date_to: date,
-) -> dict:
+    chart_e: pd.DataFrame,
+) -> tuple[float, pd.DataFrame]:
     """
-    Rotación de inventario simplificada usando datos del balance contable.
-
-    Numerador: monto de ventas del período (no costo de ventas — el usuario
-    pidió esta simplificación para mayor facilidad).
-    Denominador: saldo (deudor − acreedor) de las cuentas que empiezan con
-    "14" (Inventarios en PUC colombiano) al corte del período.
-
-    Devuelve dict:
-      - saldo_inventario: saldo neto de cuentas grupo 14 al corte
-      - rotacion_periodo: ventas / saldo_inventario (cantidad de veces en
-        el período seleccionado)
-      - rotacion_anual: anualizada (multiplicada por 365/period_days)
-      - dias_inventario: 365 / rotacion_anual
-      - period_days: días del período analizado
-      - cuentas_detalle: DataFrame con cada cuenta 14xx y su saldo
+    Helper: dado un balance agregado y un chart enriquecido, devuelve
+    (saldo_total_cuenta_14, df_detalle_por_cuenta).
     """
-    period_days = max((date_to - date_from).days + 1, 1)
-
     if balances_aggregated is None or balances_aggregated.empty:
-        return {
-            "saldo_inventario": 0.0,
-            "rotacion_periodo": 0.0,
-            "rotacion_anual": 0.0,
-            "dias_inventario": 0.0,
-            "period_days": period_days,
-            "cuentas_detalle": pd.DataFrame(),
-        }
+        return 0.0, pd.DataFrame()
+    if chart_e is None or chart_e.empty:
+        return 0.0, pd.DataFrame()
 
-    if chart is None or chart.empty:
-        return {
-            "saldo_inventario": 0.0,
-            "rotacion_periodo": 0.0,
-            "rotacion_anual": 0.0,
-            "dias_inventario": 0.0,
-            "period_days": period_days,
-            "cuentas_detalle": pd.DataFrame(),
-        }
-
-    # Enriquecer el chart con clasificación PUC y código normalizado
-    chart_e = enrich_chart_with_puc(chart)
     keep_cols = [c for c in [
         "id", "code", "name", "puc_subgroup", "subgrupo", "account_type",
     ] if c in chart_e.columns]
     keep = chart_e[keep_cols].rename(columns={
         "id": "account_id", "code": "account_code", "name": "account_name",
     })
-
     df = balances_aggregated.merge(keep, on="account_id", how="left").copy()
-    # Cuentas de inventario: code empieza con "14" (PUC colombiano)
     df["account_code"] = df["account_code"].astype(str)
     inv = df[df["account_code"].str.startswith("14")].copy()
+    if inv.empty and "puc_subgroup" in df.columns:
+        inv = df[df["puc_subgroup"].astype(str) == "14"].copy()
+    if inv.empty and "account_type" in df.columns:
+        inv = df[
+            df["account_type"].astype(str).str.contains(
+                "stock|inventory", case=False, na=False,
+            )
+        ].copy()
     if inv.empty:
-        # Fallback: account_type contiene "stock" o subgrupo PUC "14"
-        if "puc_subgroup" in df.columns:
-            inv = df[df["puc_subgroup"].astype(str) == "14"].copy()
-        if inv.empty and "account_type" in df.columns:
-            inv = df[
-                df["account_type"].astype(str).str.contains(
-                    "stock|inventory", case=False, na=False,
-                )
-            ].copy()
-
-    if inv.empty:
-        return {
-            "saldo_inventario": 0.0,
-            "rotacion_periodo": 0.0,
-            "rotacion_anual": 0.0,
-            "dias_inventario": 0.0,
-            "period_days": period_days,
-            "cuentas_detalle": pd.DataFrame(),
-        }
-
+        return 0.0, pd.DataFrame()
     inv["saldo"] = inv.get("debit", 0).fillna(0) - inv.get("credit", 0).fillna(0)
-    saldo_inv = float(inv["saldo"].sum())
-
-    rotacion_periodo = (
-        float(total_ventas) / saldo_inv if saldo_inv else 0.0
-    )
-    rotacion_anual = rotacion_periodo * (365.0 / period_days) if period_days else 0.0
-    dias_inv = (365.0 / rotacion_anual) if rotacion_anual > 0 else 0.0
-
-    cuentas_detalle = inv[[
+    saldo = float(inv["saldo"].sum())
+    detalle = inv[[
         c for c in ["account_code", "account_name", "saldo"]
         if c in inv.columns
     ]].sort_values("saldo", ascending=False).reset_index(drop=True)
+    return saldo, detalle
+
+
+def compute_rotacion_cuenta_14(
+    balances_inicial: pd.DataFrame,
+    balances_final: pd.DataFrame,
+    chart: pd.DataFrame,
+    total_ventas: float,
+    total_costo_ventas: float,
+    date_from: date,
+    date_to: date,
+) -> dict:
+    """
+    Rotación de inventario con inventario PROMEDIO y dos métodos.
+
+    Denominador: (Saldo cuenta 14 al inicio + Saldo cuenta 14 al cierre) / 2
+                 Si solo hay uno disponible, se usa ese.
+
+    Métodos calculados:
+      - Método 1 (Ventas / Inv. promedio):
+          Más generoso. Es la simplificación inicial que pediste.
+      - Método 2 (Costo de ventas / Inv. promedio) — NIIF clásico:
+          La fórmula contable estándar usada en informes financieros.
+
+    Devuelve dict con:
+      - saldo_inicial, saldo_final, saldo_promedio
+      - rotacion_ventas_periodo, rotacion_ventas_anual, dias_ventas
+      - rotacion_costo_periodo, rotacion_costo_anual, dias_costo
+      - period_days
+      - cuentas_detalle: cuentas 14 al CIERRE con saldo
+    """
+    period_days = max((date_to - date_from).days + 1, 1)
+
+    if chart is None or chart.empty:
+        return {
+            "saldo_inicial": 0.0, "saldo_final": 0.0, "saldo_promedio": 0.0,
+            "rotacion_ventas_periodo": 0.0, "rotacion_ventas_anual": 0.0,
+            "dias_ventas": 0.0,
+            "rotacion_costo_periodo": 0.0, "rotacion_costo_anual": 0.0,
+            "dias_costo": 0.0,
+            "period_days": period_days, "cuentas_detalle": pd.DataFrame(),
+        }
+
+    chart_e = enrich_chart_with_puc(chart)
+    saldo_ini, _ = _saldo_cuenta_14_from_balances(balances_inicial, chart_e)
+    saldo_fin, detalle = _saldo_cuenta_14_from_balances(balances_final, chart_e)
+
+    # Inventario promedio: si ambos disponibles, promedio; si solo uno, ese.
+    if saldo_ini > 0 and saldo_fin > 0:
+        saldo_prom = (saldo_ini + saldo_fin) / 2.0
+    elif saldo_fin > 0:
+        saldo_prom = saldo_fin
+    elif saldo_ini > 0:
+        saldo_prom = saldo_ini
+    else:
+        saldo_prom = 0.0
+
+    # Método 1: Ventas / Inv. promedio
+    rot_v_per = (float(total_ventas) / saldo_prom) if saldo_prom else 0.0
+    rot_v_anu = rot_v_per * (365.0 / period_days) if period_days else 0.0
+    dias_v = (365.0 / rot_v_anu) if rot_v_anu > 0 else 0.0
+
+    # Método 2 (NIIF): Costo de ventas / Inv. promedio
+    rot_c_per = (float(total_costo_ventas) / saldo_prom) if saldo_prom else 0.0
+    rot_c_anu = rot_c_per * (365.0 / period_days) if period_days else 0.0
+    dias_c = (365.0 / rot_c_anu) if rot_c_anu > 0 else 0.0
 
     return {
-        "saldo_inventario": saldo_inv,
-        "rotacion_periodo": rotacion_periodo,
-        "rotacion_anual": rotacion_anual,
-        "dias_inventario": dias_inv,
+        "saldo_inicial": saldo_ini,
+        "saldo_final": saldo_fin,
+        "saldo_promedio": saldo_prom,
+        # Retrocompatibilidad: la antigua propiedad
+        "saldo_inventario": saldo_fin,
+        "rotacion_ventas_periodo": rot_v_per,
+        "rotacion_ventas_anual": rot_v_anu,
+        "dias_ventas": dias_v,
+        "rotacion_costo_periodo": rot_c_per,
+        "rotacion_costo_anual": rot_c_anu,
+        "dias_costo": dias_c,
+        # Retrocompatibilidad con la API anterior
+        "rotacion_periodo": rot_v_per,
+        "rotacion_anual": rot_v_anu,
+        "dias_inventario": dias_v,
         "period_days": period_days,
-        "cuentas_detalle": cuentas_detalle,
+        "cuentas_detalle": detalle,
     }
 
 
