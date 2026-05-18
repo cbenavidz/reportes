@@ -117,12 +117,13 @@ companies_df = load_companies()
 render_company_context(companies_df, filters["company_ids"])
 
 with st.spinner("Cargando compras, ventas y stock..."):
-    # Ventas: cubren período actual + previo (para tendencias)
+    # Ventas: rango exacto = período previo → período actual (no más)
     sales_lines = load_invoice_lines(
-        months_back=max(int(periodo_dias / 30) * 2 + 4, 12),
         company_ids=filters["company_ids"],
+        date_from=fecha_desde_prev.isoformat(),
+        date_to=fecha_hasta.isoformat(),
     )
-    # Compras del período + previo
+    # Compras del período + previo (mismo rango exacto)
     purchases_lines = load_purchase_invoice_lines(
         date_from=fecha_desde_prev.isoformat(),
         date_to=fecha_hasta.isoformat(),

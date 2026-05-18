@@ -363,28 +363,32 @@ INVOICE_LINES_CACHE_VERSION = 13  # v13: backfill code desde display_name + impo
 def load_invoice_lines(
     months_back: int = 12,
     company_ids: tuple[int, ...] | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
     _cache_v: int = INVOICE_LINES_CACHE_VERSION,
 ) -> "pd.DataFrame":
     """
     Descarga líneas de factura (account.move.line con producto) para el
     informe de ventas por producto / categoría.
 
-    ⚠️  Anclado a la fecha de FACTURACIÓN (account.move.line.date, que en
-    Odoo coincide con invoice_date del move padre). NO usa date_order
-    (ese campo vive en sale.order y no aplica aquí).
+    Si `date_from` y `date_to` (strings YYYY-MM-DD) se pasan, se usa ese
+    rango exacto. Si no, se calcula desde `months_back` hacia atrás.
 
-    Cache 15 min como el resto del pipeline. El parámetro `_cache_v`
-    sirve de cache-buster: cuando se incremente `INVOICE_LINES_CACHE_VERSION`
-    el cache se invalida automáticamente sin necesidad de reboot manual.
+    Cache 15 min como el resto del pipeline.
     """
     from datetime import date as _date, timedelta
     client = get_odoo_client()
-    cutoff = _date.today()
-    date_from = cutoff - timedelta(days=30 * months_back)
+    if date_from and date_to:
+        df_date = pd.to_datetime(date_from).date()
+        dt_date = pd.to_datetime(date_to).date()
+    else:
+        cutoff = _date.today()
+        df_date = cutoff - timedelta(days=30 * months_back)
+        dt_date = cutoff
     return extract_invoice_lines(
         client,
-        date_from=date_from,
-        date_to=cutoff,
+        date_from=df_date,
+        date_to=dt_date,
         company_ids=list(company_ids) if company_ids else None,
         include_refunds=True,
     )
@@ -420,6 +424,104 @@ def load_purchase_invoice_lines(
         company_ids=list(company_ids) if company_ids else None,
         include_refunds=True,
     )
+
+
+@st.cache_data(ttl=900, show_spinner="Cargando serie mensual de inventario...")
+def load_inventory_balance_monthly_series(
+    date_from: str,
+    date_to: str,
+    inventory_account_ids: tuple[int, ...],
+    company_ids: tuple[int, ...] | None = None,
+    _cache_v: int = 1,
+) -> "pd.DataFrame":
+    """
+    Serie mensual del saldo agregado de cuentas de inventario.
+
+    En lugar de hacer N llamadas a `load_account_balances_aggregated` (una
+    por cada mes en el rango), hace 2 llamadas:
+      1) read_group para el saldo INICIAL (todo lo anterior a date_from).
+      2) search_read de movimientos en el rango → pandas cumsum por mes.
+
+    Devuelve DataFrame con columnas:
+      - mes (timestamp del primer día del mes)
+      - saldo_cierre (saldo neto de cuentas de inventario al cierre del mes)
+    """
+    if not inventory_account_ids:
+        return pd.DataFrame(columns=["mes", "saldo_cierre"])
+
+    client = get_odoo_client()
+
+    # 1) Saldo inicial: todo lo anterior a date_from
+    domain_ini = [
+        ("parent_state", "=", "posted"),
+        ("account_id", "in", list(inventory_account_ids)),
+        ("date", "<", date_from),
+    ]
+    if company_ids:
+        domain_ini.append(("company_id", "in", list(company_ids)))
+    try:
+        res_ini = client.execute_kw(
+            "account.move.line", "read_group",
+            [domain_ini, ["debit:sum", "credit:sum"], []],
+            {"lazy": False},
+        )
+        saldo_inicial = float(
+            (res_ini[0].get("debit", 0) or 0)
+            - (res_ini[0].get("credit", 0) or 0)
+        ) if res_ini else 0.0
+    except Exception:  # noqa: BLE001
+        saldo_inicial = 0.0
+
+    # 2) Movimientos en el rango (line a line, agrupar en pandas)
+    domain_mov = [
+        ("parent_state", "=", "posted"),
+        ("account_id", "in", list(inventory_account_ids)),
+        ("date", ">=", date_from),
+        ("date", "<=", date_to),
+    ]
+    if company_ids:
+        domain_mov.append(("company_id", "in", list(company_ids)))
+
+    try:
+        records = client.search_read(
+            "account.move.line",
+            domain=domain_mov,
+            fields=["date", "debit", "credit"],
+            order="date asc",
+        )
+    except Exception:  # noqa: BLE001
+        records = []
+
+    # Construir serie mensual completa (incluyendo meses sin movimiento)
+    months_idx = pd.date_range(
+        start=pd.to_datetime(date_from).to_period("M").to_timestamp(),
+        end=pd.to_datetime(date_to).to_period("M").to_timestamp(),
+        freq="MS",
+    )
+    if not records:
+        # Sin movimientos: saldo constante = saldo_inicial en todos los meses
+        return pd.DataFrame({
+            "mes": months_idx,
+            "saldo_cierre": [saldo_inicial] * len(months_idx),
+        })
+
+    df = pd.DataFrame(records)
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["debit"] = pd.to_numeric(df["debit"], errors="coerce").fillna(0)
+    df["credit"] = pd.to_numeric(df["credit"], errors="coerce").fillna(0)
+    df["mes"] = df["date"].dt.to_period("M").dt.to_timestamp()
+
+    mens = df.groupby("mes", as_index=False).agg(
+        debit_sum=("debit", "sum"),
+        credit_sum=("credit", "sum"),
+    )
+    mens["movimiento_neto"] = mens["debit_sum"] - mens["credit_sum"]
+
+    # Reindexar a todos los meses del rango y rellenar con 0 los faltantes
+    mens = mens.set_index("mes").reindex(months_idx).fillna(0)
+    mens["saldo_cierre"] = saldo_inicial + mens["movimiento_neto"].cumsum()
+    mens = mens.reset_index().rename(columns={"index": "mes"})
+    return mens[["mes", "saldo_cierre"]]
 
 
 @st.cache_data(ttl=900, show_spinner="Cargando stock por producto...")

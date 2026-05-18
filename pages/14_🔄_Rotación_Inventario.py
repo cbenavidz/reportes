@@ -16,7 +16,6 @@ Incluye:
 from __future__ import annotations
 
 from datetime import date, timedelta
-from calendar import monthrange
 
 import pandas as pd
 import plotly.express as px
@@ -28,6 +27,7 @@ from src.data_loader import (
     load_account_balances_aggregated,
     load_chart_of_accounts,
     load_companies,
+    load_inventory_balance_monthly_series,
     load_invoice_lines,
     load_purchase_invoice_lines,
     load_stock_quants,
@@ -125,68 +125,14 @@ def _money(v) -> str:
     return f"${v:,.0f}"
 
 
-def _eom_dates_in_range(d_from: date, d_to: date) -> list[date]:
-    """Devuelve fechas de fin de cada mes en el rango [d_from, d_to]."""
-    out: list[date] = []
-    y, m = d_from.year, d_from.month
-    while True:
-        last_day = monthrange(y, m)[1]
-        eom = date(y, m, last_day)
-        if eom < d_from:
-            pass
-        elif eom > d_to:
-            # Si el último mes no completó, usar fecha_hasta como cierre
-            if not out or out[-1] < d_to:
-                out.append(d_to)
-            break
-        else:
-            out.append(eom)
-        m += 1
-        if m > 12:
-            m = 1
-            y += 1
-        if y > d_to.year + 1:
-            break
-    return out
-
-
-def _saldo_cuenta_14(
-    balances_aggregated: pd.DataFrame,
-    chart_e: pd.DataFrame,
-) -> float:
-    """Suma el saldo neto (debit-credit) de cuentas que empiezan con 14."""
-    if balances_aggregated is None or balances_aggregated.empty:
-        return 0.0
-    if chart_e is None or chart_e.empty:
-        return 0.0
-    keep = chart_e[[c for c in [
-        "id", "code", "puc_subgroup", "account_type",
-    ] if c in chart_e.columns]].rename(columns={
-        "id": "account_id", "code": "account_code",
-    })
-    df = balances_aggregated.merge(keep, on="account_id", how="left")
-    df["account_code"] = df["account_code"].astype(str)
-    inv = df[df["account_code"].str.startswith("14")]
-    if inv.empty and "puc_subgroup" in df.columns:
-        inv = df[df["puc_subgroup"].astype(str) == "14"]
-    if inv.empty and "account_type" in df.columns:
-        inv = df[df["account_type"].astype(str).str.contains(
-            "stock|inventory", case=False, na=False,
-        )]
-    if inv.empty:
-        return 0.0
-    return float(
-        inv.get("debit", 0).fillna(0).sum()
-        - inv.get("credit", 0).fillna(0).sum()
-    )
-
-
 # ── Carga base ──
 with st.spinner("Cargando plan de cuentas, ventas y compras..."):
     chart_df = load_chart_of_accounts(company_ids=filters["company_ids"])
+    # Ventas: rango exacto (período previo → actual) — no más
     sales_lines = load_invoice_lines(
-        months_back=max(int(periodo_dias / 30) * 2 + 4, 12),
         company_ids=filters["company_ids"],
+        date_from=fecha_desde_prev.isoformat(),
+        date_to=fecha_hasta.isoformat(),
     )
     purchases_lines = load_purchase_invoice_lines(
         date_from=fecha_desde_prev.isoformat(),
@@ -283,9 +229,31 @@ st.markdown("---")
 # ── Serie mensual: saldo cuenta 14 + ventas del mes ──
 with st.spinner("Construyendo serie mensual..."):
     chart_e = enrich_chart_with_puc(chart_df)
-    eom_list = _eom_dates_in_range(fecha_desde, fecha_hasta)
 
-    # Ventas del período mensualizadas
+    # Identificar IDs de cuentas 14 (Inventarios) UNA sola vez
+    chart_e_copy = chart_e.copy()
+    chart_e_copy["code_str"] = chart_e_copy.get("code", "").astype(str)
+    inv_mask = chart_e_copy["code_str"].str.startswith("14")
+    if not inv_mask.any() and "puc_subgroup" in chart_e_copy.columns:
+        inv_mask = chart_e_copy["puc_subgroup"].astype(str) == "14"
+    if not inv_mask.any() and "account_type" in chart_e_copy.columns:
+        inv_mask = chart_e_copy["account_type"].astype(str).str.contains(
+            "stock|inventory", case=False, na=False,
+        )
+    inv_account_ids: tuple[int, ...] = tuple(
+        int(i) for i in chart_e_copy.loc[inv_mask, "id"].dropna().unique()
+    ) if "id" in chart_e_copy.columns else ()
+
+    # Saldos mensuales en 1 sola consulta (read_group + cumsum)
+    saldo_mes_df = load_inventory_balance_monthly_series(
+        date_from=fecha_desde.isoformat(),
+        date_to=fecha_hasta.isoformat(),
+        inventory_account_ids=inv_account_ids,
+        company_ids=filters["company_ids"],
+    )
+    saldo_mes = saldo_mes_df.rename(columns={"saldo_cierre": "saldo_inv_cierre"})
+
+    # Ventas del período mensualizadas (cálculo en memoria, ya tenemos las líneas)
     ventas_mes = pd.DataFrame()
     if sales_lines is not None and not sales_lines.empty:
         from src.purchases_analyzer import _apply_default_exclusions, _normalize_sales_signed
@@ -297,24 +265,9 @@ with st.spinner("Construyendo serie mensual..."):
             ventas_mes = sl_per.groupby("mes", as_index=False)["price_subtotal_signed"].sum()
             ventas_mes = ventas_mes.rename(columns={"price_subtotal_signed": "ventas_mes"})
 
-    # Saldo cuenta 14 al cierre de cada mes
-    rows_inv = []
-    for eom in eom_list:
-        bal = load_account_balances_aggregated(
-            date_to=eom.isoformat(),
-            company_ids=filters["company_ids"],
-        )
-        saldo = _saldo_cuenta_14(bal, chart_e)
-        rows_inv.append({
-            "mes": pd.Timestamp(eom).to_period("M").to_timestamp(),
-            "saldo_inv_cierre": saldo,
-            "fecha_corte": eom,
-        })
-    saldo_mes = pd.DataFrame(rows_inv)
-
-    # Combinar ventas + saldo
-    monthly = saldo_mes.merge(ventas_mes, on="mes", how="left").fillna(
-        {"ventas_mes": 0}
+    # Combinar ventas + saldo (outer join para incluir meses con uno u otro)
+    monthly = saldo_mes.merge(ventas_mes, on="mes", how="outer").fillna(
+        {"ventas_mes": 0, "saldo_inv_cierre": 0}
     )
     # Rotación mensual anualizada: ventas_mes × 12 / saldo_cierre
     monthly["rotacion_anual_mes"] = monthly.apply(
@@ -325,6 +278,7 @@ with st.spinner("Construyendo serie mensual..."):
     monthly["dias_inv_mes"] = monthly["rotacion_anual_mes"].apply(
         lambda x: 365 / x if x and x > 0 else None
     )
+    monthly = monthly.sort_values("mes").reset_index(drop=True)
     monthly["mes_label"] = pd.to_datetime(monthly["mes"]).dt.strftime("%Y-%m")
 
 
