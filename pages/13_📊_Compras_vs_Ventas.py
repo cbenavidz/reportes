@@ -22,6 +22,8 @@ import streamlit as st
 
 from src.auth import logout_button, require_auth
 from src.data_loader import (
+    load_account_balances_aggregated,
+    load_chart_of_accounts,
     load_companies,
     load_invoice_lines,
     load_purchase_invoice_lines,
@@ -32,6 +34,7 @@ from src.purchases_analyzer import (
     compute_monthly_evolution,
     compute_product_crosstab,
     compute_purchases_vs_sales_summary,
+    compute_rotacion_cuenta_14,
     find_dead_stock,
     find_purchased_not_sold,
     find_to_purchase,
@@ -127,6 +130,12 @@ with st.spinner("Cargando compras, ventas y stock..."):
     )
     # Stock actual
     stock_df = load_stock_quants(company_ids=filters["company_ids"])
+    # Plan de cuentas y saldo al corte (para rotación basada en cuenta 14)
+    chart_df = load_chart_of_accounts(company_ids=filters["company_ids"])
+    balances_corte = load_account_balances_aggregated(
+        date_to=fecha_hasta.isoformat(),
+        company_ids=filters["company_ids"],
+    )
 
 if (
     (sales_lines is None or sales_lines.empty)
@@ -144,6 +153,11 @@ summary = compute_purchases_vs_sales_summary(
 )
 summary_prev = compute_purchases_vs_sales_summary(
     purchases_lines, sales_lines, stock_df, fecha_desde_prev, fecha_hasta_prev,
+)
+# Rotación calculada con saldo cuenta 14 (PUC) y monto de ventas
+rot14 = compute_rotacion_cuenta_14(
+    balances_corte, chart_df, summary["total_ventas"],
+    fecha_desde, fecha_hasta,
 )
 
 
@@ -182,13 +196,18 @@ with k3:
     )
 with k4:
     st.metric(
-        "🔄 Rotación anual",
-        f"{summary['rotacion_general']:.2f}x",
+        "🔄 Rotación inv. (anual)",
+        f"{rot14['rotacion_anual']:.2f}x",
         delta=(
-            f"{summary['dias_inventario_general']:.0f} días inv."
-            if summary["rotacion_general"] else "sin stock valorado"
+            f"{rot14['dias_inventario']:.0f} días inv."
+            if rot14["rotacion_anual"] > 0
+            else "sin saldo en cuenta 14"
         ),
         delta_color="off",
+        help=(
+            "Rotación = Ventas del período / Saldo cuenta 14 (Inventarios). "
+            "Anualizada según los días del período seleccionado."
+        ),
     )
 
 k5, k6, k7, k8 = st.columns(4)
@@ -199,7 +218,11 @@ with k6:
 with k7:
     st.metric("# productos en stock", f"{summary['n_productos_stock']:,}")
 with k8:
-    st.metric("💎 Stock valorado", _money(summary["stock_value"]))
+    st.metric(
+        "📒 Saldo cuenta 14",
+        _money(rot14["saldo_inventario"]),
+        help="Saldo contable de las cuentas que empiezan con 14 (Inventarios PUC) al corte del período.",
+    )
 
 # Botón para limpiar cache y recargar datos
 col_rl, _ = st.columns([1, 4])
@@ -295,8 +318,14 @@ with st.spinner("Cruzando compras, ventas y stock por producto..."):
     )
 
 
+st.info(
+    "🔄 Para análisis profundo de **rotación de inventario** "
+    "(evolución mensual, por categoría/producto y recomendaciones) "
+    "visita la página dedicada **🔄 Rotación de Inventario** en el menú lateral."
+)
+
 # ── Sub-pestañas ──
-t_res, t_cat, t_prod, t_sin, t_muerto, t_comprar, t_trend, t_rot = st.tabs([
+t_res, t_cat, t_prod, t_sin, t_muerto, t_comprar, t_trend = st.tabs([
     "📊 Resumen",
     "🏷️ Por categoría",
     "📦 Por producto",
@@ -304,7 +333,6 @@ t_res, t_cat, t_prod, t_sin, t_muerto, t_comprar, t_trend, t_rot = st.tabs([
     "💀 Stock muerto",
     "🛒 Comprar más",
     "🚀 Tendencia ↑",
-    "🔄 Rotación",
 ])
 
 
@@ -762,89 +790,3 @@ with t_trend:
         )
 
 
-# ─── Tab Rotación ───
-with t_rot:
-    st.markdown("### 🔄 KPIs de rotación de inventario")
-    st.caption(
-        "Rotación = (ventas en cantidad) / (stock promedio) anualizada. "
-        "Días de inventario = 365 / rotación. Cobertura = stock / velocidad."
-    )
-
-    kr1, kr2, kr3 = st.columns(3)
-    with kr1:
-        st.metric(
-            "🔄 Rotación general (anual)",
-            f"{summary['rotacion_general']:.2f}x",
-        )
-    with kr2:
-        st.metric(
-            "📅 Días de inventario",
-            (
-                f"{summary['dias_inventario_general']:.0f}"
-                if summary["rotacion_general"] else "—"
-            ),
-        )
-    with kr3:
-        st.metric("💎 Stock valorado", _money(summary["stock_value"]))
-
-    st.markdown("### Rotación por categoría")
-    if cat_tab.empty:
-        st.info("Sin datos por categoría.")
-    else:
-        cat_show = cat_tab[cat_tab["stock_valor"] > 0].copy()
-        if cat_show.empty:
-            st.info("No hay categorías con stock valorado.")
-        else:
-            # Gráfico de rotación
-            fig_r = px.bar(
-                cat_show.sort_values("rotacion_anual"),
-                x="rotacion_anual", y="product_categ_name",
-                orientation="h",
-                color="rotacion_anual",
-                color_continuous_scale="RdYlGn",
-                text="rotacion_anual",
-            )
-            fig_r.update_traces(
-                texttemplate="%{text:.2f}x", textposition="outside",
-            )
-            fig_r.update_layout(
-                height=max(360, len(cat_show) * 30),
-                margin=dict(l=0, r=0, t=10, b=0),
-                yaxis=dict(title=""),
-                xaxis=dict(title="Rotación anual (veces)"),
-                coloraxis_showscale=False,
-            )
-            st.plotly_chart(fig_r, use_container_width=True)
-
-            st.markdown("### Días de inventario por categoría")
-            st.dataframe(
-                cat_show[[
-                    "product_categ_name", "n_productos", "stock_qty",
-                    "stock_valor", "costo_ventas", "rotacion_anual",
-                    "dias_inventario",
-                ]],
-                column_config={
-                    "product_categ_name": st.column_config.TextColumn(
-                        "Categoría", width="large"
-                    ),
-                    "n_productos": st.column_config.NumberColumn(
-                        "# Prods", format="%d"
-                    ),
-                    "stock_qty": st.column_config.NumberColumn(
-                        "Stock qty", format="%,.1f"
-                    ),
-                    "stock_valor": st.column_config.NumberColumn(
-                        "Stock $", format="$%,.0f"
-                    ),
-                    "costo_ventas": st.column_config.NumberColumn(
-                        "Costo ventas", format="$%,.0f"
-                    ),
-                    "rotacion_anual": st.column_config.NumberColumn(
-                        "Rot. anual", format="%.2fx"
-                    ),
-                    "dias_inventario": st.column_config.NumberColumn(
-                        "Días inv.", format="%.0f"
-                    ),
-                },
-                use_container_width=True, hide_index=True, height=420,
-            )

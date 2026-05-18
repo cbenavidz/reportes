@@ -27,6 +27,7 @@ import numpy as np
 import pandas as pd
 
 from .sales_analyzer import _build_exclusion_mask
+from .financial_statements import enrich_chart_with_puc
 
 
 # ---------------------------------------------------------------------------
@@ -514,3 +515,355 @@ def compute_monthly_evolution(
         out["ventas"] = 0
     out["gap"] = out["compras"] - out["ventas"]
     return out
+
+
+# ---------------------------------------------------------------------------
+# 6. Rotación de inventario desde la cuenta 14 del balance contable
+# ---------------------------------------------------------------------------
+
+
+def compute_rotacion_cuenta_14(
+    balances_aggregated: pd.DataFrame,
+    chart: pd.DataFrame,
+    total_ventas: float,
+    date_from: date,
+    date_to: date,
+) -> dict:
+    """
+    Rotación de inventario simplificada usando datos del balance contable.
+
+    Numerador: monto de ventas del período (no costo de ventas — el usuario
+    pidió esta simplificación para mayor facilidad).
+    Denominador: saldo (deudor − acreedor) de las cuentas que empiezan con
+    "14" (Inventarios en PUC colombiano) al corte del período.
+
+    Devuelve dict:
+      - saldo_inventario: saldo neto de cuentas grupo 14 al corte
+      - rotacion_periodo: ventas / saldo_inventario (cantidad de veces en
+        el período seleccionado)
+      - rotacion_anual: anualizada (multiplicada por 365/period_days)
+      - dias_inventario: 365 / rotacion_anual
+      - period_days: días del período analizado
+      - cuentas_detalle: DataFrame con cada cuenta 14xx y su saldo
+    """
+    period_days = max((date_to - date_from).days + 1, 1)
+
+    if balances_aggregated is None or balances_aggregated.empty:
+        return {
+            "saldo_inventario": 0.0,
+            "rotacion_periodo": 0.0,
+            "rotacion_anual": 0.0,
+            "dias_inventario": 0.0,
+            "period_days": period_days,
+            "cuentas_detalle": pd.DataFrame(),
+        }
+
+    if chart is None or chart.empty:
+        return {
+            "saldo_inventario": 0.0,
+            "rotacion_periodo": 0.0,
+            "rotacion_anual": 0.0,
+            "dias_inventario": 0.0,
+            "period_days": period_days,
+            "cuentas_detalle": pd.DataFrame(),
+        }
+
+    # Enriquecer el chart con clasificación PUC y código normalizado
+    chart_e = enrich_chart_with_puc(chart)
+    keep_cols = [c for c in [
+        "id", "code", "name", "puc_subgroup", "subgrupo", "account_type",
+    ] if c in chart_e.columns]
+    keep = chart_e[keep_cols].rename(columns={
+        "id": "account_id", "code": "account_code", "name": "account_name",
+    })
+
+    df = balances_aggregated.merge(keep, on="account_id", how="left").copy()
+    # Cuentas de inventario: code empieza con "14" (PUC colombiano)
+    df["account_code"] = df["account_code"].astype(str)
+    inv = df[df["account_code"].str.startswith("14")].copy()
+    if inv.empty:
+        # Fallback: account_type contiene "stock" o subgrupo PUC "14"
+        if "puc_subgroup" in df.columns:
+            inv = df[df["puc_subgroup"].astype(str) == "14"].copy()
+        if inv.empty and "account_type" in df.columns:
+            inv = df[
+                df["account_type"].astype(str).str.contains(
+                    "stock|inventory", case=False, na=False,
+                )
+            ].copy()
+
+    if inv.empty:
+        return {
+            "saldo_inventario": 0.0,
+            "rotacion_periodo": 0.0,
+            "rotacion_anual": 0.0,
+            "dias_inventario": 0.0,
+            "period_days": period_days,
+            "cuentas_detalle": pd.DataFrame(),
+        }
+
+    inv["saldo"] = inv.get("debit", 0).fillna(0) - inv.get("credit", 0).fillna(0)
+    saldo_inv = float(inv["saldo"].sum())
+
+    rotacion_periodo = (
+        float(total_ventas) / saldo_inv if saldo_inv else 0.0
+    )
+    rotacion_anual = rotacion_periodo * (365.0 / period_days) if period_days else 0.0
+    dias_inv = (365.0 / rotacion_anual) if rotacion_anual > 0 else 0.0
+
+    cuentas_detalle = inv[[
+        c for c in ["account_code", "account_name", "saldo"]
+        if c in inv.columns
+    ]].sort_values("saldo", ascending=False).reset_index(drop=True)
+
+    return {
+        "saldo_inventario": saldo_inv,
+        "rotacion_periodo": rotacion_periodo,
+        "rotacion_anual": rotacion_anual,
+        "dias_inventario": dias_inv,
+        "period_days": period_days,
+        "cuentas_detalle": cuentas_detalle,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 7. Recomendaciones automáticas de inventario
+# ---------------------------------------------------------------------------
+
+
+def compute_inventory_recommendations(
+    rot14_act: dict,
+    rot14_prev: dict,
+    cat_tab: pd.DataFrame,
+    crosstab: pd.DataFrame,
+    monthly_series: pd.DataFrame,
+    summary_act: dict,
+    summary_prev: dict,
+) -> list[dict]:
+    """
+    Genera lista de recomendaciones accionables sobre inventario.
+
+    Cada recomendación: {tipo, prioridad, titulo, detalle, accion}.
+    Prioridad: 'alta', 'media', 'baja'.
+    """
+    recs: list[dict] = []
+
+    rot_act = float(rot14_act.get("rotacion_anual", 0) or 0)
+    dias_act = float(rot14_act.get("dias_inventario", 0) or 0)
+    saldo_act = float(rot14_act.get("saldo_inventario", 0) or 0)
+    saldo_prev = float(rot14_prev.get("saldo_inventario", 0) or 0)
+    ventas_act = float(summary_act.get("total_ventas", 0) or 0)
+    ventas_prev = float(summary_prev.get("total_ventas", 0) or 0)
+
+    # --- 1. Velocidad general ---
+    if rot_act > 0:
+        if dias_act > 90:
+            recs.append({
+                "tipo": "🐢 Rotación lenta",
+                "prioridad": "alta",
+                "titulo": f"Inventario rota {rot_act:.1f}x al año "
+                         f"({dias_act:.0f} días)",
+                "detalle": (
+                    f"Tienes ${saldo_act:,.0f} en cuenta 14 que tarda "
+                    f"{dias_act:.0f} días en convertirse en venta. "
+                    "Capital atrapado en mercancía."
+                ),
+                "accion": (
+                    "Revisa stock muerto en la pestaña 'Por producto'. "
+                    "Considera liquidación o promoción de referencias lentas. "
+                    "Negocia con proveedores mejores condiciones de plazo."
+                ),
+            })
+        elif dias_act < 20:
+            recs.append({
+                "tipo": "⚡ Rotación muy alta",
+                "prioridad": "media",
+                "titulo": f"Inventario rota {rot_act:.1f}x al año "
+                         f"({dias_act:.0f} días)",
+                "detalle": (
+                    "La rotación es muy alta, lo cual es bueno, pero también "
+                    "indica riesgo de quiebres de stock. Si el cliente no "
+                    "encuentra el producto, se va a la competencia."
+                ),
+                "accion": (
+                    "Revisa la pestaña 'Comprar más' para identificar "
+                    "referencias con cobertura baja. Aumenta el stock de "
+                    "seguridad en los productos top."
+                ),
+            })
+        else:
+            recs.append({
+                "tipo": "✅ Rotación saludable",
+                "prioridad": "baja",
+                "titulo": f"Inventario rota {rot_act:.1f}x al año "
+                         f"({dias_act:.0f} días)",
+                "detalle": (
+                    "La rotación está en un rango sano (20-90 días). "
+                    "Mantén el monitoreo mensual."
+                ),
+                "accion": "Sin acción urgente.",
+            })
+
+    # --- 2. Inventario creciendo más rápido que ventas ---
+    if saldo_prev > 0 and ventas_prev > 0:
+        crecimiento_inv = (saldo_act - saldo_prev) / saldo_prev * 100
+        crecimiento_ventas = (ventas_act - ventas_prev) / ventas_prev * 100
+        if crecimiento_inv > crecimiento_ventas + 10:
+            recs.append({
+                "tipo": "📈 Inventario crece más que ventas",
+                "prioridad": "alta",
+                "titulo": (
+                    f"Inventario +{crecimiento_inv:.1f}% vs ventas "
+                    f"+{crecimiento_ventas:.1f}%"
+                ),
+                "detalle": (
+                    "Estás acumulando mercancía a un ritmo mayor que tus "
+                    "ventas. Esto deteriora la rotación y consume liquidez."
+                ),
+                "accion": (
+                    "Detén o reduce las compras durante 1-2 meses hasta "
+                    "alinear stock con velocidad de venta. Revisa pedidos "
+                    "pendientes a proveedores."
+                ),
+            })
+        elif crecimiento_inv < crecimiento_ventas - 15 and crecimiento_ventas > 0:
+            recs.append({
+                "tipo": "⚠️ Inventario crece menos que ventas",
+                "prioridad": "media",
+                "titulo": (
+                    f"Ventas +{crecimiento_ventas:.1f}% pero inventario "
+                    f"{crecimiento_inv:+.1f}%"
+                ),
+                "detalle": (
+                    "Las ventas crecen más que el inventario — buen signo de "
+                    "eficiencia, pero atento a posibles desabastos si la "
+                    "demanda sigue acelerando."
+                ),
+                "accion": (
+                    "Refuerza compras de los productos con tendencia "
+                    "creciente (ver pestaña 'Tendencia ↑' en Compras vs Ventas)."
+                ),
+            })
+
+    # --- 3. Tendencia mensual de rotación ---
+    if monthly_series is not None and len(monthly_series) >= 4:
+        ms = monthly_series.dropna(
+            subset=["rotacion_anual_mes"]
+        ).sort_values("mes")
+        if len(ms) >= 4:
+            recientes = ms.tail(3)["rotacion_anual_mes"].mean()
+            anteriores = ms.head(max(len(ms) - 3, 1))["rotacion_anual_mes"].mean()
+            if anteriores > 0:
+                delta_rot = (recientes - anteriores) / anteriores * 100
+                if delta_rot < -15:
+                    recs.append({
+                        "tipo": "📉 Rotación deteriorándose",
+                        "prioridad": "alta",
+                        "titulo": (
+                            f"Últimos 3 meses: {recientes:.1f}x vs "
+                            f"meses previos: {anteriores:.1f}x "
+                            f"({delta_rot:+.0f}%)"
+                        ),
+                        "detalle": (
+                            "La rotación promedio de los últimos 3 meses bajó "
+                            "respecto al histórico. Algo está cambiando: "
+                            "demanda más lenta, compras infladas o ambas."
+                        ),
+                        "accion": (
+                            "Revisa los meses anómalos en la pestaña "
+                            "'Evolución mensual'. Identifica si fue caída de "
+                            "ventas o aumento de stock."
+                        ),
+                    })
+                elif delta_rot > 15:
+                    recs.append({
+                        "tipo": "📈 Rotación mejorando",
+                        "prioridad": "baja",
+                        "titulo": (
+                            f"Últimos 3 meses: {recientes:.1f}x vs "
+                            f"meses previos: {anteriores:.1f}x "
+                            f"({delta_rot:+.0f}%)"
+                        ),
+                        "detalle": "La rotación viene mejorando — buena gestión.",
+                        "accion": "Mantén el ritmo y documenta qué funcionó.",
+                    })
+
+    # --- 4. Top categorías más lentas ---
+    if cat_tab is not None and not cat_tab.empty:
+        cat_validas = cat_tab[
+            (cat_tab["stock_valor"] > 0) & (cat_tab["dias_inventario"].notna())
+        ].copy()
+        if not cat_validas.empty:
+            top_lentas = cat_validas.nlargest(3, "dias_inventario")
+            for _, r in top_lentas.iterrows():
+                if r["dias_inventario"] > 60:
+                    recs.append({
+                        "tipo": "🐢 Categoría lenta",
+                        "prioridad": "media",
+                        "titulo": (
+                            f"{r['product_categ_name']}: "
+                            f"{r['dias_inventario']:.0f} días de inventario"
+                        ),
+                        "detalle": (
+                            f"Stock valorado en ${r['stock_valor']:,.0f} y "
+                            f"rotación de {r['rotacion_anual']:.1f}x. "
+                            f"Margen: {r['margen_pct']:.1f}%."
+                        ),
+                        "accion": (
+                            "Revisa surtido de esta categoría. Considera "
+                            "promoción o reducción de stock."
+                        ),
+                    })
+
+            top_rapidas = cat_validas.nsmallest(3, "dias_inventario")
+            for _, r in top_rapidas.iterrows():
+                if r["dias_inventario"] < 15:
+                    recs.append({
+                        "tipo": "🚀 Categoría rápida",
+                        "prioridad": "media",
+                        "titulo": (
+                            f"{r['product_categ_name']}: "
+                            f"{r['dias_inventario']:.0f} días de cobertura"
+                        ),
+                        "detalle": (
+                            f"Rotación {r['rotacion_anual']:.1f}x al año — "
+                            "alta. Riesgo de quiebres."
+                        ),
+                        "accion": (
+                            "Asegura stock de seguridad. Negocia entregas "
+                            "más frecuentes con el proveedor."
+                        ),
+                    })
+
+    # --- 5. Stock muerto y referencias sin venta ---
+    if crosstab is not None and not crosstab.empty:
+        sin_venta_con_stock = crosstab[
+            (crosstab["stock_qty"] > 0)
+            & (crosstab["qty_vendida"] <= 0)
+        ]
+        if not sin_venta_con_stock.empty:
+            valor_muerto = float(sin_venta_con_stock["stock_valor"].sum())
+            if valor_muerto > 0:
+                recs.append({
+                    "tipo": "💀 Stock sin venta",
+                    "prioridad": "alta" if valor_muerto > saldo_act * 0.1 else "media",
+                    "titulo": (
+                        f"{len(sin_venta_con_stock):,} referencias con stock "
+                        "y sin ventas en el período"
+                    ),
+                    "detalle": (
+                        f"Capital inmovilizado: ${valor_muerto:,.0f} "
+                        f"({(valor_muerto / saldo_act * 100) if saldo_act else 0:.1f}% "
+                        "del inventario)."
+                    ),
+                    "accion": (
+                        "Revisa la pestaña 'Stock muerto' en Compras vs "
+                        "Ventas. Plan: descuento progresivo, bundle con "
+                        "productos rápidos, o devolución a proveedor."
+                    ),
+                })
+
+    # Ordenar por prioridad
+    prio_order = {"alta": 0, "media": 1, "baja": 2}
+    recs.sort(key=lambda r: prio_order.get(r.get("prioridad", "baja"), 3))
+    return recs
