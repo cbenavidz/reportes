@@ -1159,6 +1159,11 @@ def extract_account_movements(
         "debit", "credit", "balance",
         "company_id", "currency_id",
         "parent_state", "journal_id",
+        # move_type heredado del asiento padre: necesario para diferenciar
+        # facturas de venta (out_invoice/out_refund) de compra (in_invoice/
+        # in_refund) y asientos manuales (entry). Crítico para medios
+        # magnéticos: el formato 1001 debe excluir facturas de venta.
+        "move_type",
     ]
     # Filtrar a campos disponibles (defensivo contra versiones de Odoo)
     try:

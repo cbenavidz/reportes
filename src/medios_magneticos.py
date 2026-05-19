@@ -473,6 +473,19 @@ def build_formato_1001(
     # Enriquecer con clasificación PUC robusta (igual que Estados Financieros)
     df = _enrich_moves_with_puc(df, chart)
 
+    # CRÍTICO: el Formato 1001 reporta pagos A PROVEEDORES (compras).
+    # NO debe incluir líneas de facturas de venta (out_invoice/out_refund)
+    # aunque toquen cuentas 5xxx/6xxx (ej. costo de ventas asociado a una
+    # FEV con partner_id del cliente).
+    if "move_type" in df.columns:
+        # Tipos que SÍ van al 1001: compras, NC de proveedor, asientos manuales
+        TIPOS_VALIDOS_1001 = {
+            "in_invoice", "in_refund",  # facturas de proveedor
+            "entry",                      # asientos manuales (nómina, ajustes)
+            False, None, "",             # sin tipo (asientos de diario sin doc)
+        }
+        df = df[df["move_type"].isin(TIPOS_VALIDOS_1001) | df["move_type"].isna()]
+
     # Inferir documentos desde refs/descripciones para partners sin doc
     # en su ficha (ej: empleados con cédula en "Nomina de XXXXXXXXXX-01")
     docs_inferidos = _inferir_documentos_desde_refs(df)
@@ -616,6 +629,14 @@ def diagnosticar_formato_1001(
     if df.empty:
         return {}
     df = _enrich_moves_with_puc(df, chart)
+
+    # Excluir facturas de venta del diagnóstico 1001 (consistente con
+    # el build_formato_1001)
+    if "move_type" in df.columns:
+        TIPOS_VALIDOS_1001 = {
+            "in_invoice", "in_refund", "entry", False, None, "",
+        }
+        df = df[df["move_type"].isin(TIPOS_VALIDOS_1001) | df["move_type"].isna()]
 
     # Inferir cédulas desde refs (nóminas y similares)
     docs_inferidos = _inferir_documentos_desde_refs(df)
@@ -964,8 +985,19 @@ def build_formato_1007(
         return pd.DataFrame()
     df = _enrich_moves_with_puc(df, chart)
 
-    mask = df["puc_group"] == "4"
-    sub = df[mask & (df["partner_id"].notna())].copy()
+    # El 1007 reporta INGRESOS — debe venir de facturas de venta o asientos
+    # manuales. Excluir facturas de compra (in_invoice/in_refund) que
+    # podrían tocar cuentas 4xxx (ej. descuentos de proveedor a 4170).
+    if "move_type" in df.columns:
+        TIPOS_VALIDOS_1007 = {
+            "out_invoice", "out_refund", "entry", False, None, "",
+        }
+        df_filt = df[df["move_type"].isin(TIPOS_VALIDOS_1007) | df["move_type"].isna()]
+    else:
+        df_filt = df
+
+    mask = df_filt["puc_group"] == "4"
+    sub = df_filt[mask & (df_filt["partner_id"].notna())].copy()
     if sub.empty:
         return pd.DataFrame()
     sub["ingreso"] = sub["credit"].fillna(0) - sub["debit"].fillna(0)

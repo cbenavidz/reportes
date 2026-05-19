@@ -544,7 +544,7 @@ def load_stock_quants(
 # Loaders para Estados Financieros
 # ---------------------------------------------------------------------------
 
-ACCOUNT_MOVEMENTS_CACHE_VERSION = 2  # Cargar solo período seleccionado, no histórico completo
+ACCOUNT_MOVEMENTS_CACHE_VERSION = 3  # v3: incluir move_type para filtrar facturas venta vs compra
 
 
 @st.cache_data(ttl=900, show_spinner="Descargando plan de cuentas...")
