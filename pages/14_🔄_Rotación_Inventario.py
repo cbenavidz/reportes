@@ -142,21 +142,47 @@ def _filter_sales_by_category(sl: pd.DataFrame, cat: str | None) -> pd.DataFrame
     return s[s["product_categ_name"] == cat]
 
 
+# Toggle de KPIs móviles (anclados a HOY) — cargan 4 balances + 1 sales extra
+show_mobile = st.checkbox(
+    "📐 Mostrar KPIs móviles 90/180/365 días (anclados a hoy)",
+    value=False,
+    help=(
+        "Estos KPIs requieren 4 cargas adicionales de saldo cuenta 14 + "
+        "1 carga de ventas de los últimos 365 días. Desactiva para acelerar "
+        "el reporte si solo te interesa el período seleccionado."
+    ),
+)
+
 # ── Carga base ──
 with st.spinner("Cargando plan de cuentas, ventas y compras..."):
     chart_df = load_chart_of_accounts(company_ids=filters["company_ids"])
-    # Ventas: rango exacto (período previo → actual) — no más
+
+    # Ventas: si el toggle de móviles está ON, cargar 365d (cubre todo);
+    # si está OFF, solo el rango del período + previo.
+    if show_mobile:
+        sales_date_from = min(
+            fecha_desde_prev, today - timedelta(days=365)
+        ).isoformat()
+        sales_date_to = max(fecha_hasta, today).isoformat()
+    else:
+        sales_date_from = fecha_desde_prev.isoformat()
+        sales_date_to = fecha_hasta.isoformat()
+
     sales_lines = load_invoice_lines(
         company_ids=filters["company_ids"],
-        date_from=fecha_desde_prev.isoformat(),
-        date_to=fecha_hasta.isoformat(),
+        date_from=sales_date_from,
+        date_to=sales_date_to,
     )
+    # sales_365 es alias del mismo DF (si toggle ON cubre 365d; si OFF, lo que haya)
+    sales_365 = sales_lines
+
     purchases_lines = load_purchase_invoice_lines(
         date_from=fecha_desde_prev.isoformat(),
         date_to=fecha_hasta.isoformat(),
         company_ids=filters["company_ids"],
     )
     stock_df = load_stock_quants(company_ids=filters["company_ids"])
+
     # Balance al INICIO y al CIERRE del período actual (para promedio)
     balances_corte = load_account_balances_aggregated(
         date_to=fecha_hasta.isoformat(),
@@ -177,29 +203,36 @@ with st.spinner("Cargando plan de cuentas, ventas y compras..."):
         date_to=fecha_antes_prev,
         company_ids=filters["company_ids"],
     )
-    # Balances para KPIs móviles 90d / 180d / 365d (todos al cierre = hoy)
-    balances_hoy = load_account_balances_aggregated(
-        date_to=today.isoformat(),
-        company_ids=filters["company_ids"],
-    )
-    bal_inicio_90 = load_account_balances_aggregated(
-        date_to=(today - timedelta(days=91)).isoformat(),
-        company_ids=filters["company_ids"],
-    )
-    bal_inicio_180 = load_account_balances_aggregated(
-        date_to=(today - timedelta(days=181)).isoformat(),
-        company_ids=filters["company_ids"],
-    )
-    bal_inicio_365 = load_account_balances_aggregated(
-        date_to=(today - timedelta(days=366)).isoformat(),
-        company_ids=filters["company_ids"],
-    )
-    # Ventas extendidas (365 días desde hoy) para los KPIs móviles
-    sales_365 = load_invoice_lines(
-        company_ids=filters["company_ids"],
-        date_from=(today - timedelta(days=365)).isoformat(),
-        date_to=today.isoformat(),
-    )
+
+    # Balances para KPIs móviles — SOLO si el usuario los pidió
+    if show_mobile:
+        # Reusar balances_corte como balances_hoy si la fecha coincide
+        if fecha_hasta == today:
+            balances_hoy = balances_corte
+        else:
+            balances_hoy = load_account_balances_aggregated(
+                date_to=today.isoformat(),
+                company_ids=filters["company_ids"],
+            )
+        bal_inicio_90 = load_account_balances_aggregated(
+            date_to=(today - timedelta(days=91)).isoformat(),
+            company_ids=filters["company_ids"],
+        )
+        bal_inicio_180 = load_account_balances_aggregated(
+            date_to=(today - timedelta(days=181)).isoformat(),
+            company_ids=filters["company_ids"],
+        )
+        bal_inicio_365 = load_account_balances_aggregated(
+            date_to=(today - timedelta(days=366)).isoformat(),
+            company_ids=filters["company_ids"],
+        )
+    else:
+        # Placeholders vacíos — no se usarán si show_mobile=False
+        import pandas as _pd
+        balances_hoy = balances_corte
+        bal_inicio_90 = _pd.DataFrame()
+        bal_inicio_180 = _pd.DataFrame()
+        bal_inicio_365 = _pd.DataFrame()
 
 if chart_df is None or chart_df.empty:
     st.error(
@@ -349,19 +382,28 @@ def _rotacion_rango(
     }
 
 
-# Calcular rotación a 90d, 180d, 365d
-rot_90 = _rotacion_rango(
-    sales_365, today - timedelta(days=90), today,
-    bal_inicio_90, balances_hoy, cat_filter, cat_tab,
-)
-rot_180 = _rotacion_rango(
-    sales_365, today - timedelta(days=180), today,
-    bal_inicio_180, balances_hoy, cat_filter, cat_tab,
-)
-rot_365 = _rotacion_rango(
-    sales_365, today - timedelta(days=365), today,
-    bal_inicio_365, balances_hoy, cat_filter, cat_tab,
-)
+# Calcular rotación a 90d, 180d, 365d — solo si el toggle está ON
+if show_mobile:
+    rot_90 = _rotacion_rango(
+        sales_365, today - timedelta(days=90), today,
+        bal_inicio_90, balances_hoy, cat_filter, cat_tab,
+    )
+    rot_180 = _rotacion_rango(
+        sales_365, today - timedelta(days=180), today,
+        bal_inicio_180, balances_hoy, cat_filter, cat_tab,
+    )
+    rot_365 = _rotacion_rango(
+        sales_365, today - timedelta(days=365), today,
+        bal_inicio_365, balances_hoy, cat_filter, cat_tab,
+    )
+else:
+    _empty_rot = {
+        "ventas": 0, "costo": 0, "saldo_prom": 0,
+        "rot_v": 0, "rot_c": 0, "rot_v_anu": 0, "dias_v": 0, "period_d": 0,
+    }
+    rot_90 = _empty_rot
+    rot_180 = _empty_rot
+    rot_365 = _empty_rot
 
 # Rotación del período (usando valores filtrados si hay filtro)
 rot_v_act = (ventas_filt_act / saldo_filt_act) if saldo_filt_act > 0 else 0.0
@@ -427,48 +469,52 @@ if st.button("🔄 Recargar datos (limpia caché)", key="ri_reload"):
 
 st.markdown("---")
 
-# ── KPIs móviles: 90d, 180d, 365d (anclados a HOY) ──
-st.markdown(f"### 📐 Rotación móvil — anclada a hoy ({today})")
-st.caption(
-    "Mismo cálculo (ventas / denominador) aplicado a ventanas de 90, 180 "
-    "y 365 días que terminan hoy. Permite ver si el inventario está "
-    "rotando mejor o peor en el corto, medio y largo plazo."
-)
-cm1, cm2, cm3 = st.columns(3)
-for col, label, r in [
-    (cm1, "90 días", rot_90),
-    (cm2, "180 días", rot_180),
-    (cm3, "365 días", rot_365),
-]:
-    with col:
-        with st.container(border=True):
-            st.markdown(f"#### Últimos {label}")
-            st.metric(
-                "🔄 Rot. (Ventas/Inv)",
-                f"{r['rot_v']:.2f}x" if r["rot_v"] else "—",
-                delta=(
-                    f"{r['rot_v_anu']:.2f}x anualizada"
-                    if r["rot_v_anu"] else None
-                ),
-                delta_color="off",
-            )
-            sub1, sub2 = st.columns(2)
-            with sub1:
-                st.metric("Rot. NIIF", f"{r['rot_c']:.2f}x" if r["rot_c"] else "—")
-            with sub2:
+# ── KPIs móviles: 90d, 180d, 365d (anclados a HOY) — SOLO si toggle ON ──
+if show_mobile:
+    st.markdown(f"### 📐 Rotación móvil — anclada a hoy ({today})")
+    st.caption(
+        "Mismo cálculo (ventas / denominador) aplicado a ventanas de 90, 180 "
+        "y 365 días que terminan hoy. Permite ver si el inventario está "
+        "rotando mejor o peor en el corto, medio y largo plazo."
+    )
+    cm1, cm2, cm3 = st.columns(3)
+    for col, label, r in [
+        (cm1, "90 días", rot_90),
+        (cm2, "180 días", rot_180),
+        (cm3, "365 días", rot_365),
+    ]:
+        with col:
+            with st.container(border=True):
+                st.markdown(f"#### Últimos {label}")
                 st.metric(
-                    "Días inv.",
-                    f"{r['dias_v']:.0f}" if r["dias_v"] > 0 else "—",
+                    "🔄 Rot. (Ventas/Inv)",
+                    f"{r['rot_v']:.2f}x" if r["rot_v"] else "—",
+                    delta=(
+                        f"{r['rot_v_anu']:.2f}x anualizada"
+                        if r["rot_v_anu"] else None
+                    ),
+                    delta_color="off",
                 )
-            st.caption(
-                f"Ventas: {_money(r['ventas'])} · "
-                f"Costo: {_money(r['costo'])} · "
-                f"Denominador: {_money(r['saldo_prom'])}"
-            )
+                sub1, sub2 = st.columns(2)
+                with sub1:
+                    st.metric(
+                        "Rot. NIIF",
+                        f"{r['rot_c']:.2f}x" if r["rot_c"] else "—",
+                    )
+                with sub2:
+                    st.metric(
+                        "Días inv.",
+                        f"{r['dias_v']:.0f}" if r["dias_v"] > 0 else "—",
+                    )
+                st.caption(
+                    f"Ventas: {_money(r['ventas'])} · "
+                    f"Costo: {_money(r['costo'])} · "
+                    f"Denominador: {_money(r['saldo_prom'])}"
+                )
 
-# Análisis de tendencia entre las 3 ventanas
+# Análisis de tendencia entre las 3 ventanas (solo si toggle ON)
 trend_msg = []
-if rot_90["rot_v"] and rot_180["rot_v"] and rot_365["rot_v"]:
+if show_mobile and rot_90["rot_v"] and rot_180["rot_v"] and rot_365["rot_v"]:
     if rot_90["rot_v"] > rot_180["rot_v"] > rot_365["rot_v"]:
         trend_msg.append("📈 **Mejorando:** rotación creciente en corto, medio y largo plazo.")
     elif rot_90["rot_v"] < rot_180["rot_v"] < rot_365["rot_v"]:
