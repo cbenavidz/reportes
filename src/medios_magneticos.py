@@ -521,7 +521,13 @@ def build_formato_1001(
             pagos_con_ret[col] = 0
         pagos_con_ret[col] = pagos_con_ret[col].fillna(0)
 
-    # Agrupar pagos + retenciones por (tercero, concepto)
+    # Agrupar pagos + retenciones por (tercero, concepto).
+    # Agregamos también el listado de cuentas contables usadas para
+    # validación cruzada (qué códigos PUC componen ese pago).
+    def _cuentas_unicas(s):
+        vals = sorted({str(v).strip() for v in s.dropna() if str(v).strip()})
+        return ", ".join(vals)
+
     grp = pagos_con_ret.groupby(
         ["partner_id", "concepto"], as_index=False,
     ).agg(
@@ -529,6 +535,9 @@ def build_formato_1001(
         ret_fuente_renta=("ret_fuente_renta", "sum"),
         ret_iva=("ret_iva", "sum"),
         ret_ica=("ret_ica", "sum"),
+        cuentas_contables=("account_code", _cuentas_unicas),
+        nombres_cuentas=("account_name", _cuentas_unicas) if "account_name" in pagos_con_ret.columns else ("account_code", lambda s: ""),
+        n_lineas=("monto", "size"),
     )
 
     # Join con info de tercero
@@ -561,6 +570,10 @@ def build_formato_1001(
                 "ret_fuente_renta": round(float(r["ret_fuente_renta"]), 0),
                 "ret_iva": round(float(r["ret_iva"]), 0),
                 "ret_ica": round(float(r["ret_ica"]), 0),
+                # Columnas de validación: cuentas contables que componen el pago
+                "cuentas_contables": r.get("cuentas_contables", ""),
+                "nombres_cuentas": r.get("nombres_cuentas", ""),
+                "n_lineas": int(r.get("n_lineas", 0)),
             }
             out_rows.append(row)
         out = pd.DataFrame(out_rows)
