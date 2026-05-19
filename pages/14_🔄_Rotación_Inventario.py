@@ -789,16 +789,29 @@ with t_cat:
     # ── Tabla NUEVA: rotación multi-ventana por categoría ──
     st.markdown("### 📊 Rotación por categoría — ventanas múltiples")
     st.caption(
-        "Rotación anualizada por categoría calculada en 4 ventanas que "
-        "terminan hoy: 30 días (mes anterior), 90, 180 y 365 días. "
-        "Permite ver si una categoría está acelerando o desacelerando."
+        "**Rotación cruda del período:** Ventas de la ventana / Stock valor. "
+        "Cuántas veces se vendió el inventario en esa ventana de tiempo. "
+        "Ejemplo: rot. 30d = 0.5x significa que en el último mes vendió "
+        "la mitad de su inventario."
     )
+    col_t1, col_t2 = st.columns([1, 4])
+    with col_t1:
+        anualizar_rot = st.checkbox(
+            "Anualizar",
+            value=False,
+            help=(
+                "Si está ON: multiplica las ventanas cortas para hacerlas "
+                "comparables (30d × 12, 90d × 4.06, etc.) → 'rotación anual "
+                "implícita'. Si está OFF: rotación cruda del período."
+            ),
+            key="ri_anualizar_multi",
+        )
 
     multi_rot = compute_rotacion_categoria_multi_ventana(
         sales_lines if sales_lines is not None else sales_365,
         stock_df,
         today=today,
-        anualizar=True,
+        anualizar=anualizar_rot,
     )
     if multi_rot is None or multi_rot.empty:
         st.info(
@@ -821,6 +834,7 @@ with t_cat:
                 "rotacion_30d", "rotacion_90d",
                 "rotacion_180d", "rotacion_365d",
             ]
+            sufijo = "anual" if anualizar_rot else "del período"
             st.dataframe(
                 mr[cols_order],
                 column_config={
@@ -831,16 +845,28 @@ with t_cat:
                         "Stock $", format="$%,.0f",
                     ),
                     "rotacion_30d": st.column_config.NumberColumn(
-                        "Rot. 30d (anual)", format="%.2fx",
-                        help="Ventas últimos 30 días × 12 / Stock",
+                        f"Rot. 30d ({sufijo})", format="%.2fx",
+                        help=(
+                            "Ventas últimos 30 días / Stock × 12"
+                            if anualizar_rot
+                            else "Ventas últimos 30 días / Stock"
+                        ),
                     ),
                     "rotacion_90d": st.column_config.NumberColumn(
-                        "Rot. 90d (anual)", format="%.2fx",
-                        help="Ventas últimos 90 días × 4.06 / Stock",
+                        f"Rot. 90d ({sufijo})", format="%.2fx",
+                        help=(
+                            "Ventas últimos 90 días / Stock × 4.06"
+                            if anualizar_rot
+                            else "Ventas últimos 90 días / Stock"
+                        ),
                     ),
                     "rotacion_180d": st.column_config.NumberColumn(
-                        "Rot. 180d (anual)", format="%.2fx",
-                        help="Ventas últimos 180 días × 2.03 / Stock",
+                        f"Rot. 180d ({sufijo})", format="%.2fx",
+                        help=(
+                            "Ventas últimos 180 días / Stock × 2.03"
+                            if anualizar_rot
+                            else "Ventas últimos 180 días / Stock"
+                        ),
                     ),
                     "rotacion_365d": st.column_config.NumberColumn(
                         "Rot. 1 año", format="%.2fx",
@@ -849,11 +875,19 @@ with t_cat:
                 },
                 use_container_width=True, hide_index=True, height=420,
             )
-            st.caption(
-                "💡 **Cómo leer:** si la rotación 30d es muy superior a la 365d, "
-                "la categoría está acelerando. Si es muy inferior, está "
-                "desacelerando. Compáralas para detectar tendencias."
-            )
+            if anualizar_rot:
+                st.caption(
+                    "💡 **Modo anualizado:** todas las columnas comparables "
+                    "entre sí. Si 30d > 365d → categoría acelerando. "
+                    "Si 30d < 365d → desacelerando."
+                )
+            else:
+                st.caption(
+                    "💡 **Modo cruda:** cada columna es la cantidad de veces "
+                    "que se vendió el inventario en esa ventana. Los números "
+                    "crecen naturalmente porque hay más tiempo. Activa el "
+                    "toggle 'Anualizar' para comparar entre ventanas."
+                )
 
     st.markdown("---")
     st.markdown("### Rotación por categoría (período seleccionado)")
