@@ -226,32 +226,71 @@ TIPO_DOC_DIAN: dict[str, str] = {
 }
 
 
+def _get_partner_document(partner: dict) -> str:
+    """
+    Obtiene el documento del partner probando múltiples campos en orden
+    de prioridad (importante para Odoo con localización Colombia):
+      1. vat (estándar Odoo)
+      2. l10n_co_document_number (localización CO)
+      3. identification_document (otro módulo CO)
+      4. ref (campo de referencia interna, algunos lo usan para cédula)
+    """
+    for field in ("vat", "l10n_co_document_number",
+                  "identification_document", "ref"):
+        value = partner.get(field)
+        if value and str(value).strip() and str(value).strip().lower() != "false":
+            return str(value).strip()
+    return ""
+
+
 def _infer_tipo_doc(partner: dict) -> str:
-    """Infiere el tipo de documento DIAN desde info del partner."""
+    """
+    Infiere el tipo de documento DIAN desde info del partner.
+
+    Si hay `l10n_latam_identification_type_id` (localización CO), usa
+    ese mapping directamente. Si no, heurística por is_company/longitud.
+    """
+    # Intentar leer el tipo de localización CO
+    id_type = partner.get("l10n_latam_identification_type_id")
+    if isinstance(id_type, (list, tuple)) and len(id_type) > 1:
+        name = str(id_type[1]).lower()
+        if "nit" in name:
+            return "31"
+        if "cedula de ciudadan" in name or "cédula de ciudadan" in name:
+            return "13"
+        if "tarjeta de identidad" in name:
+            return "12"
+        if "cedula de extranjer" in name or "cédula de extranjer" in name:
+            return "22"
+        if "pasaporte" in name:
+            return "41"
+
     is_company = partner.get("is_company", False)
-    vat = (partner.get("vat") or "").strip()
+    doc = _get_partner_document(partner)
     if is_company:
         return "31"  # NIT
-    if vat:
-        # Si tiene VAT pero no es empresa, probablemente cédula
-        if len(vat.replace("-", "").replace(".", "")) >= 10:
-            return "13"  # CC
+    if doc:
         return "13"
     return "13"  # Default
 
 
-def _clean_vat(vat: str) -> tuple[str, str]:
+def _clean_vat(vat_or_doc: str, partner_dv: Optional[str] = None) -> tuple[str, str]:
     """
     Limpia un NIT/cédula. Devuelve (número_sin_dv, dv).
     Si tiene formato '900123456-7' separa el DV.
+    Si se pasa `partner_dv` separadamente (de l10n_co_dv), lo usa.
     """
-    if not vat:
+    if not vat_or_doc:
         return "", ""
-    v = str(vat).replace(".", "").replace(" ", "").strip()
+    v = str(vat_or_doc).replace(".", "").replace(" ", "").strip()
+    if v.lower() == "false":
+        return "", ""
+    # Si ya viene con guión (NIT colombiano)
     if "-" in v:
         parts = v.split("-")
-        return parts[0], parts[1] if len(parts) > 1 else ""
-    return v, ""
+        return parts[0], parts[1] if len(parts) > 1 else (partner_dv or "")
+    # Si no tiene guión pero tenemos DV externo, usarlo
+    return v, str(partner_dv or "").strip()
 
 
 def _split_nombre(partner_name: str) -> tuple[str, str, str, str]:
@@ -283,7 +322,9 @@ def _row_tercero(partner: dict) -> dict:
       direccion, departamento, municipio, pais
     """
     tipo_doc = _infer_tipo_doc(partner)
-    numero_doc, dv = _clean_vat(partner.get("vat", ""))
+    doc = _get_partner_document(partner)
+    dv_externo = partner.get("l10n_co_dv") or ""
+    numero_doc, dv = _clean_vat(doc, partner_dv=str(dv_externo))
     name = partner.get("name", "")
     is_company = partner.get("is_company", False)
 
@@ -493,12 +534,14 @@ def diagnosticar_formato_1001(
                 p = partners_idx.loc[int(pid)].to_dict() if pid in partners_idx.index else {}
             except Exception:  # noqa: BLE001
                 p = {}
-            vat = (p.get("vat") or "").strip()
+            # Usar _get_partner_document que revisa varios campos (vat,
+            # l10n_co_document_number, identification_document, ref)
+            doc = _get_partner_document(p)
             partners_info[int(pid)] = {
                 "name": p.get("name", "(sin nombre)"),
-                "vat": vat,
+                "documento": doc,
             }
-            if not vat:
+            if not doc:
                 partners_sin_nit_ids.add(int(pid))
 
         # A.1) Resumen: total pagos por partner sin NIT

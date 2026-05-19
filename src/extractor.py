@@ -52,6 +52,16 @@ PARTNER_FIELDS = [
     "name",
     "vat",
     "ref",
+    # Localización Colombia (l10n_co): si la base tiene los módulos
+    # l10n_co_* instalados, el documento real puede estar en estos
+    # campos en lugar de `vat`. _resolve_partner_fields los omite si
+    # no están disponibles.
+    "l10n_co_document_number",
+    "l10n_latam_identification_type_id",
+    "l10n_co_dv",   # dígito de verificación
+    # Algunas instalaciones usan `identification_document` (otro módulo CO)
+    "identification_document",
+    "is_company",
     "email",
     "phone",
     "mobile",
