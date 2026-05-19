@@ -532,14 +532,23 @@ def diagnosticar_formato_1001(
         for pid in pagos["partner_id"].dropna().unique():
             try:
                 p = partners_idx.loc[int(pid)].to_dict() if pid in partners_idx.index else {}
+                encontrado = pid in partners_idx.index
             except Exception:  # noqa: BLE001
                 p = {}
+                encontrado = False
             # Usar _get_partner_document que revisa varios campos (vat,
             # l10n_co_document_number, identification_document, ref)
             doc = _get_partner_document(p)
             partners_info[int(pid)] = {
                 "name": p.get("name", "(sin nombre)"),
                 "documento": doc,
+                "vat": (p.get("vat") or "").strip() if str(p.get("vat", "")).lower() != "false" else "",
+                "l10n_co_doc": (p.get("l10n_co_document_number") or "") if str(p.get("l10n_co_document_number", "")).lower() != "false" else "",
+                "ref": (p.get("ref") or "") if str(p.get("ref", "")).lower() != "false" else "",
+                "ident_doc": (p.get("identification_document") or "") if str(p.get("identification_document", "")).lower() != "false" else "",
+                "encontrado_en_db": encontrado,
+                "is_company": p.get("is_company", False),
+                "active": p.get("active", True),
             }
             if not doc:
                 partners_sin_nit_ids.add(int(pid))
@@ -551,12 +560,28 @@ def diagnosticar_formato_1001(
                 monto_pagos=("monto", "sum"),
                 n_asientos=("move_id", "nunique") if "move_id" in pagos_sin_nit.columns else ("monto", "count"),
             )
-            resumen["nombre"] = resumen["partner_id"].map(
-                lambda p: partners_info.get(int(p), {}).get("name", "")
-            )
-            diag["sin_nit"] = resumen[[
+            # Agregar columnas de diagnóstico para ver qué tiene el partner
+            for col_key, dict_key in [
+                ("nombre", "name"),
+                ("vat", "vat"),
+                ("l10n_co_doc", "l10n_co_doc"),
+                ("ref", "ref"),
+                ("ident_doc", "ident_doc"),
+                ("encontrado_en_db", "encontrado_en_db"),
+                ("is_company", "is_company"),
+                ("active", "active"),
+            ]:
+                resumen[col_key] = resumen["partner_id"].map(
+                    lambda p, k=dict_key: partners_info.get(int(p), {}).get(k, "")
+                )
+            cols_order = [
                 "partner_id", "nombre", "monto_pagos", "n_asientos",
-            ]].sort_values("monto_pagos", ascending=False).reset_index(drop=True)
+                "vat", "l10n_co_doc", "ref", "ident_doc",
+                "encontrado_en_db", "is_company", "active",
+            ]
+            diag["sin_nit"] = resumen[
+                [c for c in cols_order if c in resumen.columns]
+            ].sort_values("monto_pagos", ascending=False).reset_index(drop=True)
 
             # A.2) Detalle de cada asiento donde aparecen
             detalle_cols = [c for c in [

@@ -382,7 +382,10 @@ if "mm_formatos" in st.session_state:
                     "identificación de tercero. Hay que actualizar el NIT "
                     "en Odoo (Contactos → editar → campo 'NIT/Cédula')."
                 )
-                st.markdown("**Resumen por tercero:**")
+                st.markdown(
+                    "**Resumen por tercero** (con info de diagnóstico — "
+                    "muestra qué campos están vacíos en el partner):"
+                )
                 st.dataframe(
                     sin_nit,
                     column_config={
@@ -396,8 +399,28 @@ if "mm_formatos" in st.session_state:
                         "n_asientos": st.column_config.NumberColumn(
                             "# Asientos", format="%d",
                         ),
+                        "vat": "vat",
+                        "l10n_co_doc": "l10n_co_doc",
+                        "ref": "ref",
+                        "ident_doc": "ident_doc",
+                        "encontrado_en_db": st.column_config.CheckboxColumn(
+                            "En res.partner?",
+                        ),
+                        "is_company": st.column_config.CheckboxColumn(
+                            "Empresa?",
+                        ),
+                        "active": st.column_config.CheckboxColumn(
+                            "Activo?",
+                        ),
                     },
-                    use_container_width=True, hide_index=True, height=300,
+                    use_container_width=True, hide_index=True, height=400,
+                )
+                st.caption(
+                    "💡 Si `encontrado_en_db = False` → el partner_id de la "
+                    "línea no existe en res.partner (caso raro). "
+                    "Si `encontrado_en_db = True` pero todos los campos de "
+                    "documento están vacíos → el partner existe pero no "
+                    "tiene NIT registrado en ningún campo conocido."
                 )
 
                 # Detalle por asiento contable
