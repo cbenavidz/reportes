@@ -818,7 +818,7 @@ def build_formato_1003(
     if rets.empty:
         return pd.DataFrame()
     rets["monto_ret"] = rets["debit"].fillna(0) - rets["credit"].fillna(0)
-    grp = rets.groupby("partner_id", as_index=False)["monto_ret"].sum()
+    grp = _group_partner_with_cuentas(rets, "monto_ret")
 
     if partners is not None and not partners.empty:
         partner_info = partners.set_index("id")
@@ -903,7 +903,7 @@ def build_formato_1005(
         return pd.DataFrame()
     # IVA descontable: el descuento se acredita (credit) cuando es a favor
     sub["iva_descontable"] = sub["debit"].fillna(0) - sub["credit"].fillna(0)
-    grp = sub.groupby("partner_id", as_index=False)["iva_descontable"].sum()
+    grp = _group_partner_with_cuentas(sub, "iva_descontable")
     grp = grp[grp["iva_descontable"].abs() >= 1]
     return _enrich_with_partner(grp, partners, "iva_descontable", "iva_descontable")
 
@@ -935,7 +935,7 @@ def build_formato_1006(
         return pd.DataFrame()
     # IVA generado: crédito a 2408 cuando se factura
     sub["iva_generado"] = sub["credit"].fillna(0) - sub["debit"].fillna(0)
-    grp = sub.groupby("partner_id", as_index=False)["iva_generado"].sum()
+    grp = _group_partner_with_cuentas(sub, "iva_generado")
     grp = grp[grp["iva_generado"] > 0]
     return _enrich_with_partner(grp, partners, "iva_generado", "iva_generado")
 
@@ -972,7 +972,7 @@ def build_formato_1007(
     sub["concepto"] = sub["account_code"].apply(
         lambda c: _get_concepto(c, CONCEPTOS_1007_POR_PUC)
     )
-    grp = sub.groupby(["partner_id", "concepto"], as_index=False)["ingreso"].sum()
+    grp = _group_partner_with_cuentas(sub, "ingreso", extra_group_cols=["concepto"])
     grp = grp[grp["ingreso"] > 0]
     return _enrich_with_partner(grp, partners, "ingreso", "ingreso_bruto")
 
@@ -1008,7 +1008,7 @@ def build_formato_1008(
     if sub.empty:
         return pd.DataFrame()
     sub["saldo"] = sub["debit"].fillna(0) - sub["credit"].fillna(0)
-    grp = sub.groupby("partner_id", as_index=False)["saldo"].sum()
+    grp = _group_partner_with_cuentas(sub, "saldo")
     grp = grp[grp["saldo"] > 0]  # solo deudoras
     return _enrich_with_partner(grp, partners, "saldo", "saldo_cuenta_cobrar")
 
@@ -1045,7 +1045,7 @@ def build_formato_1009(
     sub["concepto"] = sub["account_code"].apply(
         lambda c: _get_concepto(c, CONCEPTOS_1009_POR_PUC)
     )
-    grp = sub.groupby(["partner_id", "concepto"], as_index=False)["saldo"].sum()
+    grp = _group_partner_with_cuentas(sub, "saldo", extra_group_cols=["concepto"])
     grp = grp[grp["saldo"] > 0]  # solo acreedoras
     return _enrich_with_partner(grp, partners, "saldo", "saldo_cuenta_pagar")
 
@@ -1203,13 +1203,66 @@ def _enrich_with_partner(
             p = {}
         t = _row_tercero(p)
         row = {**t}
-        # Conservar columnas adicionales del df original (ej. concepto)
+        # Conservar columnas adicionales del df original (ej. concepto, cuentas)
         for c in df.columns:
             if c not in ("partner_id", valor_col):
                 row[c] = r[c]
         row[nombre_final] = round(float(r[valor_col]), 0)
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def _cuentas_unicas_agg(s: pd.Series) -> str:
+    """Helper: agrega códigos/nombres únicos separados por coma."""
+    vals = sorted({str(v).strip() for v in s.dropna() if str(v).strip()})
+    return ", ".join(vals)
+
+
+def _group_partner_with_cuentas(
+    sub: pd.DataFrame,
+    valor_col: str,
+    extra_group_cols: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Helper: agrupa por partner_id (+ extra_group_cols opcionales),
+    suma `valor_col`, y agrega columnas con cuentas únicas para validación.
+
+    Devuelve DataFrame con:
+      - partner_id (+ extra_group_cols)
+      - valor_col (sumado)
+      - cuentas_contables (códigos PUC únicos, separados por coma)
+      - nombres_cuentas (nombres de cuentas únicos)
+      - n_lineas (cantidad de líneas que componen el grupo)
+    """
+    if sub is None or sub.empty:
+        return pd.DataFrame()
+    group_cols = ["partner_id"] + (extra_group_cols or [])
+    has_code = "account_code" in sub.columns
+    has_name = "account_name" in sub.columns
+
+    agg = {valor_col: "sum"}
+    grp = sub.groupby(group_cols, as_index=False).agg(agg)
+    # Cuentas
+    if has_code:
+        cuentas = sub.groupby(group_cols, as_index=False).agg(
+            cuentas_contables=("account_code", _cuentas_unicas_agg),
+        )
+        grp = grp.merge(cuentas, on=group_cols, how="left")
+    else:
+        grp["cuentas_contables"] = ""
+    if has_name:
+        nombres = sub.groupby(group_cols, as_index=False).agg(
+            nombres_cuentas=("account_name", _cuentas_unicas_agg),
+        )
+        grp = grp.merge(nombres, on=group_cols, how="left")
+    else:
+        grp["nombres_cuentas"] = ""
+    # n_lineas
+    n_lin = sub.groupby(group_cols, as_index=False).size().rename(
+        columns={"size": "n_lineas"}
+    )
+    grp = grp.merge(n_lin, on=group_cols, how="left")
+    return grp
 
 
 # ===========================================================================
@@ -1252,9 +1305,9 @@ def build_formato_1015(
         return pd.DataFrame()
     sub["saldo_pasivo"] = sub["credit"].fillna(0) - sub["debit"].fillna(0)
     sub["grupo_pasivo"] = sub["account_code"].str[:2]
-    grp = sub.groupby(
-        ["partner_id", "grupo_pasivo"], as_index=False,
-    )["saldo_pasivo"].sum()
+    grp = _group_partner_with_cuentas(
+        sub, "saldo_pasivo", extra_group_cols=["grupo_pasivo"],
+    )
     grp = grp[grp["saldo_pasivo"] > 0]
     if grp.empty:
         return pd.DataFrame()
@@ -1363,7 +1416,7 @@ def build_formato_1647(
     if sub.empty:
         return pd.DataFrame()
     sub["ingreso_terceros"] = sub["credit"].fillna(0) - sub["debit"].fillna(0)
-    grp = sub.groupby("partner_id", as_index=False)["ingreso_terceros"].sum()
+    grp = _group_partner_with_cuentas(sub, "ingreso_terceros")
     grp = grp[grp["ingreso_terceros"] > 0]
     if grp.empty:
         return pd.DataFrame()
@@ -1464,9 +1517,9 @@ def build_formato_2276(
         return "Otros laborales"
 
     sub["tipo_pago"] = sub["account_code"].apply(_tipo_laboral)
-    grp = sub.groupby(
-        ["partner_id", "tipo_pago"], as_index=False,
-    )["monto_laboral"].sum()
+    grp = _group_partner_with_cuentas(
+        sub, "monto_laboral", extra_group_cols=["tipo_pago"],
+    )
     grp = grp[grp["monto_laboral"] > 0]
     if grp.empty:
         return pd.DataFrame()
@@ -1478,10 +1531,70 @@ def build_formato_2276(
 # ===========================================================================
 
 
+def build_validacion_por_cuenta(
+    moves: pd.DataFrame,
+    chart: pd.DataFrame,
+    partners: pd.DataFrame,
+    year: int,
+) -> pd.DataFrame:
+    """
+    Construye una hoja de validación cruzada: para CADA cuenta contable
+    que participa en algún formato DIAN, suma el saldo del año y lo
+    desglosa por tercero. Sirve para cuadrar contra el libro mayor.
+
+    Devuelve DataFrame con columnas:
+      - account_code, account_name
+      - partner_id, partner_name
+      - debit_total, credit_total, saldo_neto
+      - n_lineas
+    """
+    if moves is None or moves.empty:
+        return pd.DataFrame()
+    df = moves.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df[df["date"].dt.year == year]
+    if df.empty:
+        return pd.DataFrame()
+    df = _enrich_moves_with_puc(df, chart)
+
+    sub = df[df["partner_id"].notna()].copy()
+    if sub.empty:
+        return pd.DataFrame()
+    sub["debit"] = sub["debit"].fillna(0)
+    sub["credit"] = sub["credit"].fillna(0)
+    sub["saldo_neto"] = sub["debit"] - sub["credit"]
+
+    grp = sub.groupby(
+        ["account_code", "account_name", "partner_id"],
+        as_index=False,
+    ).agg(
+        debit_total=("debit", "sum"),
+        credit_total=("credit", "sum"),
+        saldo_neto=("saldo_neto", "sum"),
+        n_lineas=("debit", "size"),
+    )
+    # Enriquecer con nombre del partner
+    if partners is not None and not partners.empty:
+        partner_names = partners.set_index("id")["name"].to_dict()
+        grp["partner_name"] = grp["partner_id"].map(partner_names)
+    else:
+        grp["partner_name"] = ""
+    # Reordenar columnas
+    cols = [
+        "account_code", "account_name",
+        "partner_id", "partner_name",
+        "debit_total", "credit_total", "saldo_neto", "n_lineas",
+    ]
+    return grp[[c for c in cols if c in grp.columns]].sort_values(
+        ["account_code", "saldo_neto"], ascending=[True, False],
+    ).reset_index(drop=True)
+
+
 def generar_excel_medios_magneticos(
     formatos: dict[str, pd.DataFrame],
     output_path: str,
     year: int,
+    validacion: pd.DataFrame | None = None,
 ) -> None:
     """
     Escribe todos los formatos en un Excel multi-hoja.
@@ -1490,6 +1603,8 @@ def generar_excel_medios_magneticos(
         formatos: dict {nombre_formato: DataFrame}
         output_path: ruta del archivo de salida
         year: año fiscal reportado
+        validacion: DataFrame opcional con cruce cuenta × tercero
+            (lo genera build_validacion_por_cuenta).
     """
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         # Hoja de resumen
@@ -1510,3 +1625,9 @@ def generar_excel_medios_magneticos(
                 )
             else:
                 df.to_excel(writer, sheet_name=nombre[:31], index=False)
+
+        # Hoja de validación al final
+        if validacion is not None and not validacion.empty:
+            validacion.to_excel(
+                writer, sheet_name="ZZ_Validacion_cuenta", index=False,
+            )

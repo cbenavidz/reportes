@@ -45,6 +45,7 @@ from src.medios_magneticos import (
     build_formato_1647,
     build_formato_2275,
     build_formato_2276,
+    build_validacion_por_cuenta,
     diagnosticar_formato_1001,
     generar_excel_medios_magneticos,
 )
@@ -313,9 +314,25 @@ if "mm_formatos" in st.session_state:
     ])
     st.dataframe(resumen, hide_index=True, use_container_width=True)
 
-    # Descarga del Excel
+    # Validación cruzada cuenta × tercero (para auditar contra el mayor)
+    validacion = None
+    if (
+        "mm_moves_year" in st.session_state
+        and "mm_chart_df" in st.session_state
+        and "mm_partners_df" in st.session_state
+    ):
+        validacion = build_validacion_por_cuenta(
+            st.session_state["mm_moves_year"],
+            st.session_state["mm_chart_df"],
+            st.session_state["mm_partners_df"],
+            year_fiscal,
+        )
+
+    # Descarga del Excel (con hoja de validación adicional)
     excel_buffer = io.BytesIO()
-    generar_excel_medios_magneticos(formatos, excel_buffer, year_fiscal)
+    generar_excel_medios_magneticos(
+        formatos, excel_buffer, year_fiscal, validacion=validacion,
+    )
     excel_buffer.seek(0)
     st.download_button(
         label=f"⬇️ Descargar Excel medios magnéticos {year_fiscal}",
