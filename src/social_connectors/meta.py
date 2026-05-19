@@ -311,6 +311,58 @@ def _fetch_metric_time_series_sum(
     return total if found else None
 
 
+def _fetch_metrics_bulk_chunk(
+    endpoint: str,
+    metrics: list[str],
+    date_from: date,
+    date_to: date,
+    token: str,
+) -> dict[str, int]:
+    """
+    Pide MÚLTIPLES métricas en UNA sola llamada (separadas por coma) para
+    un rango ≤30 días. Devuelve dict {metric_name: value}.
+
+    Mucho más eficiente que llamar por cada métrica individual.
+    Las métricas que requieren time-series (follower_count) se piden
+    aparte porque mezclan mal en una sola query con total_value.
+    """
+    if not metrics:
+        return {}
+
+    TIME_SERIES_METRICS = {"follower_count"}
+    total_value_metrics = [m for m in metrics if m not in TIME_SERIES_METRICS]
+    time_series_metrics = [m for m in metrics if m in TIME_SERIES_METRICS]
+
+    out: dict[str, int] = {}
+
+    # 1) Todas las métricas total_value en UNA sola llamada
+    if total_value_metrics:
+        params = {
+            "metric": ",".join(total_value_metrics),
+            "period": "day",
+            "since": str(date_from),
+            "until": str(date_to),
+            "metric_type": "total_value",
+        }
+        data = _try_get(f"{endpoint}/insights", params, token=token)
+        if data:
+            for m in data.get("data", []):
+                name = m.get("name")
+                tv = m.get("total_value", {})
+                if name and isinstance(tv, dict) and "value" in tv:
+                    out[name] = int(tv["value"] or 0)
+
+    # 2) Métricas time-series (individuales, sumadas)
+    for metric in time_series_metrics:
+        val = _fetch_metric_time_series_sum(
+            endpoint, metric, date_from, date_to, token,
+        )
+        if val is not None:
+            out[metric] = val
+
+    return out
+
+
 def _classify_facebook_post_type(post: dict) -> str:
     """
     Clasifica un post de FB en: Reel, Video, Foto, Álbum, Enlace, Texto.
@@ -1001,30 +1053,44 @@ def fetch_meta_instagram_monthly_evolution(
 
     monthly["engagement"] = monthly["likes"] + monthly["comentarios"]
 
-    # --- RECONSTRUIR HISTÓRICO DE SEGUIDORES ---
+    # --- RECONSTRUIR HISTÓRICO DE SEGUIDORES (paralelo) ---
     # Para cada mes calendario, pedir follower_count (nuevos seguidores del mes)
     # Luego: seguidores_fin_mes_actual = snapshot - sum(nuevos seguidores meses futuros)
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _ac
+
     nuevos_por_mes: dict[pd.Timestamp, int] = {}
     monthly_sorted = monthly.sort_values("mes").reset_index(drop=True)
-    for ts in monthly_sorted["mes"]:
+
+    def _fetch_follower_count_for_month(ts):
         mes_date = ts.date()
         y_, m_ = mes_date.year, mes_date.month
         first_of_month = date(y_, m_, 1)
         last_of_month = date(y_, m_, _monthrange(y_, m_)[1])
-        # Limitar al rango con datos (no pedir futuro)
         rng_start = first_of_month
         rng_end = min(last_of_month, today_d)
         if rng_start > today_d:
-            continue
+            return ts, None
         try:
             val = _fetch_metric_total_value_chunk(
                 f"/{ig_id}", "follower_count",
                 rng_start, rng_end, page_token,
             )
-            if val is not None:
-                nuevos_por_mes[ts] = val
+            return ts, val
         except Exception:  # noqa: BLE001
-            pass
+            return ts, None
+
+    with _TPE(max_workers=6) as pool:
+        futures = [
+            pool.submit(_fetch_follower_count_for_month, ts)
+            for ts in monthly_sorted["mes"]
+        ]
+        for fut in _ac(futures):
+            try:
+                ts, val = fut.result()
+                if val is not None:
+                    nuevos_por_mes[ts] = val
+            except Exception:  # noqa: BLE001
+                continue
 
     # Reconstrucción hacia atrás:
     # seguidores_fin_mes = snapshot - sum(nuevos_seguidores_meses_posteriores)
@@ -1418,18 +1484,37 @@ def fetch_meta_instagram_data(
         if y > date_to.year + 1:
             break
 
-    # Pedir métricas para CADA MES — almacenar tanto el total del período
-    # como el desglose por mes
+    # Pedir métricas BULK (todas en 1 llamada) POR MES, en paralelo.
+    # Antes: 12 métricas × 3 meses = 36 round-trips
+    # Después: ~2 llamadas/mes × 3 meses paralelos = ~2 round-trips totales
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     period_totals: dict[str, int] = {}
-    by_month: dict[date, dict[str, int]] = {}  # {mes_fin: {alias: value}}
-    for mr_start, mr_end in monthly_ranges:
-        month_key = mr_end  # el ÚLTIMO día del mes (o date_to si es el último mes)
-        by_month.setdefault(month_key, {})
-        for metric, alias in metrics_to_fetch:
-            val = _fetch_metric_total_value_chunk(
-                f"/{ig_id}", metric, mr_start, mr_end, page_token
-            )
-            if val is not None:
+    by_month: dict[date, dict[str, int]] = {}
+    metric_to_alias = {m: a for m, a in metrics_to_fetch}
+    metric_names = [m for m, _ in metrics_to_fetch]
+
+    def _fetch_month(mr_start, mr_end):
+        result = _fetch_metrics_bulk_chunk(
+            f"/{ig_id}", metric_names, mr_start, mr_end, page_token,
+        )
+        return mr_end, result
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futures = {
+            pool.submit(_fetch_month, s, e): (s, e)
+            for s, e in monthly_ranges
+        }
+        for fut in as_completed(futures):
+            try:
+                month_key, result = fut.result()
+            except Exception:  # noqa: BLE001
+                continue
+            by_month.setdefault(month_key, {})
+            for metric_name, val in result.items():
+                alias = metric_to_alias.get(metric_name)
+                if alias is None:
+                    continue
                 period_totals[alias + "_periodo"] = (
                     period_totals.get(alias + "_periodo", 0) + val
                 )
