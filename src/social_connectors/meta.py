@@ -1135,7 +1135,13 @@ def fetch_meta_instagram_top_posts(
     date_to: date,
     n: int = 10,
 ) -> pd.DataFrame:
-    """Top N posts/reels de IG por engagement."""
+    """
+    Top N posts/reels/carruseles + STORIES activas de IG por engagement.
+
+    NOTA sobre Stories: solo se pueden traer las stories ACTIVAS (últimas
+    24h). Para histórico habría que correr esta función diariamente como
+    cron.
+    """
     cfg = get_secret_dict("meta") or {}
     ig_id = cfg.get("instagram_user_id")
     if not ig_id:
@@ -1147,10 +1153,8 @@ def fetch_meta_instagram_top_posts(
     )
     params = {"fields": fields, "limit": 100}
     data = _try_get(f"/{ig_id}/media", params, token=page_token)
-    if not data:
-        return pd.DataFrame()
     rows = []
-    for m in data.get("data", []):
+    for m in (data or {}).get("data", []):
         ts_full = m.get("timestamp", "")
         ts = ts_full[:10]
         if not ts:
@@ -1158,7 +1162,6 @@ def fetch_meta_instagram_top_posts(
         media_date = datetime.strptime(ts, "%Y-%m-%d").date()
         if media_date < date_from or media_date > date_to:
             continue
-        # Extraer hora
         hora = None
         try:
             if "T" in ts_full:
@@ -1178,6 +1181,45 @@ def fetch_meta_instagram_top_posts(
             "comentarios": comments,
             "engagement": likes + comments,
         })
+
+    # --- Agregar STORIES (solo activas, últimas 24h) ---
+    try:
+        stories_data = _try_get(
+            f"/{ig_id}/stories",
+            {"fields": "id,timestamp,media_type,media_url,permalink", "limit": 100},
+            token=page_token,
+        )
+        for s in (stories_data or {}).get("data", []):
+            ts_full = s.get("timestamp", "")
+            ts = ts_full[:10]
+            if not ts:
+                continue
+            try:
+                story_date = datetime.strptime(ts, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if story_date < date_from or story_date > date_to:
+                continue
+            hora = None
+            try:
+                if "T" in ts_full:
+                    hora = int(ts_full[11:13])
+            except (ValueError, IndexError):
+                hora = None
+            rows.append({
+                "fecha": ts,
+                "hora": hora,
+                "post_id": s.get("id"),
+                "tipo": "Story",
+                "caption": "",
+                "url": s.get("permalink", ""),
+                "likes": 0,
+                "comentarios": 0,
+                "engagement": 0,
+            })
+    except Exception:  # noqa: BLE001
+        pass
+
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame(rows)
