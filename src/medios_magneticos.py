@@ -346,30 +346,45 @@ def build_formato_1001(
         lambda c: _get_concepto(c, CONCEPTOS_1001_POR_PUC)
     )
 
-    # Retenciones por tercero (cuentas 2365 retención renta, 2367 reteIVA, 2368 reteICA)
+    # ── Retenciones cruzadas por ASIENTO (move_id) ──
+    # Las retenciones en Colombia siempre se contabilizan en el MISMO
+    # asiento contable que el pago/factura. Por eso es más confiable
+    # cruzar por move_id que por partner_id (que puede no estar bien
+    # asignado en algunas líneas de retención).
     ret_mask = df["account_code"].str.startswith(("2365", "2367", "2368"))
-    rets = df[ret_mask & (df["partner_id"].notna())].copy()
-    rets_pivot = pd.DataFrame()
-    if not rets.empty:
+    rets = df[ret_mask].copy()
+    rets_by_move = pd.DataFrame()
+    if not rets.empty and "move_id" in rets.columns:
         rets["monto_ret"] = rets["credit"].fillna(0) - rets["debit"].fillna(0)
-        rets["cuenta_4d"] = rets["account_code"].str[:4]
-        rets_by_partner = rets.groupby(
-            ["partner_id", "cuenta_4d"], as_index=False,
-        )["monto_ret"].sum()
-        if not rets_by_partner.empty:
-            rets_pivot = rets_by_partner.pivot_table(
-                index="partner_id", columns="cuenta_4d",
-                values="monto_ret", aggfunc="sum", fill_value=0,
-            )
-            rets_pivot = rets_pivot.rename(columns={
-                "2365": "ret_fuente_renta",
-                "2367": "ret_iva",
-                "2368": "ret_ica",
-            })
+        rets["tipo_ret"] = rets["account_code"].str[:4].map({
+            "2365": "ret_fuente_renta",
+            "2367": "ret_iva",
+            "2368": "ret_ica",
+        })
+        # Pivot por move_id × tipo_ret
+        rets_by_move = rets.pivot_table(
+            index="move_id", columns="tipo_ret",
+            values="monto_ret", aggfunc="sum", fill_value=0,
+        ).reset_index()
 
-    # Agrupar pagos por tercero + concepto
-    grp = pagos.groupby(["partner_id", "concepto"], as_index=False).agg(
+    # Asociar retenciones al pago vía move_id, agrupado por (partner, concepto)
+    if not rets_by_move.empty and "move_id" in pagos.columns:
+        pagos_con_ret = pagos.merge(rets_by_move, on="move_id", how="left")
+    else:
+        pagos_con_ret = pagos.copy()
+    for col in ("ret_fuente_renta", "ret_iva", "ret_ica"):
+        if col not in pagos_con_ret.columns:
+            pagos_con_ret[col] = 0
+        pagos_con_ret[col] = pagos_con_ret[col].fillna(0)
+
+    # Agrupar pagos + retenciones por (tercero, concepto)
+    grp = pagos_con_ret.groupby(
+        ["partner_id", "concepto"], as_index=False,
+    ).agg(
         pago_deducible=("monto", "sum"),
+        ret_fuente_renta=("ret_fuente_renta", "sum"),
+        ret_iva=("ret_iva", "sum"),
+        ret_ica=("ret_ica", "sum"),
     )
 
     # Join con info de tercero
@@ -385,18 +400,14 @@ def build_formato_1001(
             t = _row_tercero(p)
             row = {
                 **t,
+                "partner_id": int(pid) if pid is not None else None,
                 "concepto": r["concepto"],
                 "pago_deducible": round(float(r["pago_deducible"]), 0),
                 "pago_no_deducible": 0,
-                "ret_fuente_renta": 0,
-                "ret_iva": 0,
-                "ret_ica": 0,
+                "ret_fuente_renta": round(float(r["ret_fuente_renta"]), 0),
+                "ret_iva": round(float(r["ret_iva"]), 0),
+                "ret_ica": round(float(r["ret_ica"]), 0),
             }
-            # Sumar retenciones del tercero
-            if not rets_pivot.empty and pid in rets_pivot.index:
-                for col in ("ret_fuente_renta", "ret_iva", "ret_ica"):
-                    if col in rets_pivot.columns:
-                        row[col] = round(float(rets_pivot.loc[pid, col] or 0), 0)
             out_rows.append(row)
         out = pd.DataFrame(out_rows)
     else:
@@ -408,6 +419,123 @@ def build_formato_1001(
             out["pago_deducible"].abs() >= umbral_minimo
         ].reset_index(drop=True)
     return out
+
+
+def diagnosticar_formato_1001(
+    moves: pd.DataFrame,
+    chart: pd.DataFrame,
+    partners: pd.DataFrame,
+    year: int,
+) -> dict:
+    """
+    Diagnóstico del Formato 1001. Identifica problemas:
+
+    1. Retenciones SIN pago asociado en el mismo asiento (cuenta 2365/67/68
+       con tercero pero sin gasto en el mismo move_id).
+    2. Retenciones con partner_id distinto al del pago (puede indicar
+       error en la contabilización).
+    3. Terceros sin NIT o datos incompletos.
+
+    Devuelve dict con:
+      - sin_nit: DF con terceros sin NIT que tienen pagos
+      - ret_huerfanas: retenciones sin pago en mismo asiento
+      - ret_diferente_partner: retenciones con partner distinto al pago
+    """
+    if moves is None or moves.empty:
+        return {}
+    df = moves.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df[df["date"].dt.year == year]
+    if df.empty:
+        return {}
+    df = _enrich_moves_with_puc(df, chart)
+
+    # 1) Pagos a terceros
+    pagos = df[
+        df["puc_group"].isin(["5", "6"]) & df["partner_id"].notna()
+    ].copy()
+    pagos["monto"] = pagos["debit"].fillna(0) - pagos["credit"].fillna(0)
+
+    # 2) Retenciones
+    rets = df[
+        df["account_code"].str.startswith(("2365", "2367", "2368"))
+    ].copy()
+    rets["monto_ret"] = rets["credit"].fillna(0) - rets["debit"].fillna(0)
+
+    diag = {}
+
+    # === A) Terceros con pagos pero SIN NIT ===
+    if partners is not None and not partners.empty and not pagos.empty:
+        partners_idx = partners.set_index("id")
+        pagos_partner = pagos.groupby("partner_id", as_index=False)["monto"].sum()
+        sin_nit_rows = []
+        for _, r in pagos_partner.iterrows():
+            pid = r["partner_id"]
+            try:
+                p = partners_idx.loc[int(pid)].to_dict() if pid in partners_idx.index else {}
+            except Exception:  # noqa: BLE001
+                p = {}
+            vat = (p.get("vat") or "").strip()
+            if not vat:
+                sin_nit_rows.append({
+                    "partner_id": int(pid) if pid else None,
+                    "nombre": p.get("name", "(sin nombre)"),
+                    "monto_pagos": round(float(r["monto"]), 0),
+                })
+        diag["sin_nit"] = pd.DataFrame(sin_nit_rows).sort_values(
+            "monto_pagos", ascending=False,
+        ) if sin_nit_rows else pd.DataFrame()
+
+    # === B) Retenciones HUÉRFANAS: con tercero pero sin pago en el mismo asiento ===
+    if not rets.empty and "move_id" in rets.columns:
+        moves_con_pago = set(pagos["move_id"].dropna().unique())
+        rets_con_partner = rets[rets["partner_id"].notna()].copy()
+        rets_huerfanas = rets_con_partner[
+            ~rets_con_partner["move_id"].isin(moves_con_pago)
+        ].copy()
+        if not rets_huerfanas.empty:
+            grp_h = rets_huerfanas.groupby(
+                "partner_id", as_index=False,
+            )["monto_ret"].sum()
+            if partners is not None and not partners.empty:
+                grp_h["nombre"] = grp_h["partner_id"].map(
+                    partners.set_index("id")["name"]
+                )
+            diag["ret_huerfanas"] = grp_h.sort_values(
+                "monto_ret", ascending=False,
+            )
+
+    # === C) Retenciones con partner_id DIFERENTE al partner del pago ===
+    if not rets.empty and not pagos.empty and "move_id" in rets.columns:
+        # Partner por move (del pago)
+        partner_pago_por_move = (
+            pagos.dropna(subset=["partner_id"])
+            .groupby("move_id")["partner_id"]
+            .first()
+        )
+        # Partner de la retención
+        rets_con_pago = rets.dropna(subset=["partner_id"]).merge(
+            partner_pago_por_move.rename("partner_pago"),
+            on="move_id", how="inner",
+        )
+        diff = rets_con_pago[
+            rets_con_pago["partner_id"] != rets_con_pago["partner_pago"]
+        ]
+        if not diff.empty:
+            if partners is not None and not partners.empty:
+                partner_names = partners.set_index("id")["name"]
+                diff = diff.copy()
+                diff["nombre_ret"] = diff["partner_id"].map(partner_names)
+                diff["nombre_pago"] = diff["partner_pago"].map(partner_names)
+            diag["ret_diferente_partner"] = diff[[
+                c for c in [
+                    "move_id", "partner_id", "nombre_ret",
+                    "partner_pago", "nombre_pago",
+                    "account_code", "monto_ret",
+                ] if c in diff.columns
+            ]]
+
+    return diag
 
 
 # ===========================================================================

@@ -45,6 +45,7 @@ from src.medios_magneticos import (
     build_formato_1647,
     build_formato_2275,
     build_formato_2276,
+    diagnosticar_formato_1001,
     generar_excel_medios_magneticos,
 )
 from src.ui_components import render_company_context, render_sidebar_filters
@@ -248,6 +249,9 @@ if st.button(
     # Guardar en session state para no recalcular al pasar de tab
     st.session_state["mm_formatos"] = formatos
     st.session_state["mm_year"] = year_fiscal
+    st.session_state["mm_moves_year"] = moves_year
+    st.session_state["mm_chart_df"] = chart_df
+    st.session_state["mm_partners_df"] = partners_df
 
 
 # ── Mostrar resultados ──
@@ -304,6 +308,133 @@ if "mm_formatos" in st.session_state:
                     use_container_width=True, hide_index=True,
                     height=500,
                 )
+
+    # ── Diagnóstico Formato 1001 ──
+    st.markdown("---")
+    st.markdown("### 🔍 Diagnóstico Formato 1001 (terceros con valores en cero)")
+    st.caption(
+        "Identifica casos sospechosos: terceros con pagos pero sin NIT, "
+        "retenciones huérfanas (sin pago en el mismo asiento), y "
+        "retenciones cuyo tercero no coincide con el del pago."
+    )
+    if (
+        "mm_moves_year" in st.session_state
+        and "mm_chart_df" in st.session_state
+        and "mm_partners_df" in st.session_state
+    ):
+        diag = diagnosticar_formato_1001(
+            st.session_state["mm_moves_year"],
+            st.session_state["mm_chart_df"],
+            st.session_state["mm_partners_df"],
+            year_fiscal,
+        )
+
+        # A) Terceros sin NIT
+        sin_nit = diag.get("sin_nit")
+        if sin_nit is not None and not sin_nit.empty:
+            with st.container(border=True):
+                st.markdown(
+                    f"#### ⚠️ A) {len(sin_nit)} terceros con pagos pero SIN NIT"
+                )
+                st.caption(
+                    "Estos pagos aparecerán en el formato 1001 sin "
+                    "identificación de tercero. Hay que actualizar el NIT "
+                    "en Odoo (Contactos → editar → campo 'NIT/Cédula')."
+                )
+                st.dataframe(
+                    sin_nit,
+                    column_config={
+                        "partner_id": st.column_config.NumberColumn(
+                            "ID", format="%d",
+                        ),
+                        "nombre": "Tercero",
+                        "monto_pagos": st.column_config.NumberColumn(
+                            "Total pagos", format="$%,.0f",
+                        ),
+                    },
+                    use_container_width=True, hide_index=True, height=300,
+                )
+        else:
+            st.success("✅ A) Todos los terceros con pagos tienen NIT registrado.")
+
+        # B) Retenciones huérfanas
+        ret_h = diag.get("ret_huerfanas")
+        if ret_h is not None and not ret_h.empty:
+            with st.container(border=True):
+                st.markdown(
+                    f"#### 🔻 B) {len(ret_h)} retenciones HUÉRFANAS "
+                    "(sin pago en el mismo asiento)"
+                )
+                st.caption(
+                    "Estas retenciones están contabilizadas pero NO hay "
+                    "un pago/gasto al mismo tercero en el mismo asiento. "
+                    "Puede indicar un error de contabilización o que el "
+                    "pago se hizo a otro tercero. Reviselo en Odoo."
+                )
+                cols_show = [
+                    c for c in ["partner_id", "nombre", "monto_ret"]
+                    if c in ret_h.columns
+                ]
+                st.dataframe(
+                    ret_h[cols_show],
+                    column_config={
+                        "partner_id": st.column_config.NumberColumn(
+                            "ID", format="%d",
+                        ),
+                        "nombre": "Tercero",
+                        "monto_ret": st.column_config.NumberColumn(
+                            "Total retención", format="$%,.0f",
+                        ),
+                    },
+                    use_container_width=True, hide_index=True, height=300,
+                )
+        else:
+            st.success(
+                "✅ B) Todas las retenciones tienen un pago asociado en "
+                "el mismo asiento."
+            )
+
+        # C) Retenciones con partner diferente al del pago
+        ret_dif = diag.get("ret_diferente_partner")
+        if ret_dif is not None and not ret_dif.empty:
+            with st.container(border=True):
+                st.markdown(
+                    f"#### 🚨 C) {len(ret_dif)} retenciones con TERCERO "
+                    "DIFERENTE al del pago"
+                )
+                st.caption(
+                    "La retención está marcada con un partner_id distinto "
+                    "al del gasto en el mismo asiento. Esto es un ERROR "
+                    "de contabilización: en Odoo cambiar el tercero de la "
+                    "línea de retención para que coincida con el proveedor."
+                )
+                cols_show = [
+                    c for c in [
+                        "move_id", "partner_id", "nombre_ret",
+                        "partner_pago", "nombre_pago",
+                        "account_code", "monto_ret",
+                    ] if c in ret_dif.columns
+                ]
+                st.dataframe(
+                    ret_dif[cols_show],
+                    column_config={
+                        "move_id": "Asiento",
+                        "partner_id": "ID retención",
+                        "nombre_ret": "Tercero retención",
+                        "partner_pago": "ID pago",
+                        "nombre_pago": "Tercero pago",
+                        "account_code": "Cuenta ret.",
+                        "monto_ret": st.column_config.NumberColumn(
+                            "Monto", format="$%,.0f",
+                        ),
+                    },
+                    use_container_width=True, hide_index=True, height=300,
+                )
+        else:
+            st.success(
+                "✅ C) Todas las retenciones tienen el mismo tercero "
+                "que el pago asociado."
+            )
 
     # Notas y advertencias
     st.markdown("---")
