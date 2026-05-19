@@ -32,6 +32,65 @@ from typing import Optional
 
 import pandas as pd
 
+from .financial_statements import enrich_chart_with_puc
+
+
+def _enrich_moves_with_puc(
+    moves: pd.DataFrame,
+    chart: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Enriquece movimientos contables con columnas de clasificación PUC.
+
+    Agrega:
+      - account_code: código real (o inferido desde account_id_name)
+      - account_name: nombre de la cuenta
+      - puc_group: '1', '2', '3', '4', '5', '6', '7'
+      - puc_subgroup: '11', '14', '21', '22', '23', '24', '41', '51', etc.
+
+    Usa la misma lógica robusta que financial_statements: si el `code`
+    de la cuenta no es código PUC, infiere desde `account_type` y nombre.
+    """
+    if moves is None or moves.empty:
+        return moves
+    if chart is None or chart.empty:
+        df = moves.copy()
+        df["account_code"] = df.get("account_code", "").astype(str)
+        df["puc_group"] = ""
+        df["puc_subgroup"] = ""
+        return df
+
+    # Enriquecer chart con clasificación PUC
+    chart_e = enrich_chart_with_puc(chart)
+    keep_cols = [c for c in [
+        "id", "code", "name", "puc_group", "puc_subgroup",
+        "subgrupo", "account_type",
+    ] if c in chart_e.columns]
+    chart_min = chart_e[keep_cols].rename(columns={
+        "id": "account_id",
+        "code": "account_code",
+        "name": "account_name",
+    })
+
+    df = moves.copy()
+    # Si moves ya tiene account_code (de un merge previo), no lo pisamos
+    if "account_code" in df.columns and df["account_code"].notna().any():
+        # Hacer merge solo para añadir puc_group/puc_subgroup
+        cols_to_add = [
+            "account_id", "puc_group", "puc_subgroup",
+        ]
+        if "account_name" not in df.columns:
+            cols_to_add.append("account_name")
+        df = df.merge(chart_min[cols_to_add], on="account_id", how="left")
+    else:
+        df = df.merge(chart_min, on="account_id", how="left")
+
+    # Defaults seguros
+    df["account_code"] = df["account_code"].fillna("").astype(str)
+    df["puc_group"] = df["puc_group"].fillna("").astype(str)
+    df["puc_subgroup"] = df["puc_subgroup"].fillna("").astype(str)
+    return df
+
 
 # ===========================================================================
 # Mapeo genérico PUC colombiano → Concepto DIAN
@@ -247,15 +306,20 @@ def build_formato_1001(
     chart: pd.DataFrame,
     partners: pd.DataFrame,
     year: int,
+    umbral_minimo: float = 0,
 ) -> pd.DataFrame:
     """
     Construye Formato 1001: pagos a terceros por concepto.
 
-    Toma movimientos de cuentas 5xxx (gastos) y 6xxx (costos), agrupados
+    Toma movimientos de cuentas grupo 5 (gastos) y 6 (costos), agrupados
     por (tercero, concepto). El "pago" es el débito a esas cuentas.
 
     Retenciones: suma de movimientos a cuentas 2365 (Retención en la
     fuente) y 2367 (IVA retenido) del mismo período por cada tercero.
+
+    Args:
+        umbral_minimo: monto mínimo para incluir un pago. Por defecto 0
+            (sin filtro). Ajusta según resolución DIAN.
     """
     if moves is None or moves.empty:
         return pd.DataFrame()
@@ -266,17 +330,11 @@ def build_formato_1001(
     if df.empty:
         return pd.DataFrame()
 
-    # Join con plan de cuentas para obtener código
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code", "name"]].rename(
-            columns={"id": "account_id", "code": "account_code", "name": "account_name"}
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
+    # Enriquecer con clasificación PUC robusta (igual que Estados Financieros)
+    df = _enrich_moves_with_puc(df, chart)
 
-    df["account_code"] = df.get("account_code", "").astype(str)
-
-    # Filtrar pagos a terceros: gastos (5xxx, 6xxx) y compras (143x)
-    pagos_mask = df["account_code"].str.startswith(("5", "6")) | (
+    # Filtrar pagos a terceros: usa puc_group (más robusto que el code)
+    pagos_mask = df["puc_group"].isin(["5", "6"]) | (
         df["account_code"].str.startswith("143")
     )
     pagos = df[pagos_mask & (df["partner_id"].notna())].copy()
@@ -291,24 +349,23 @@ def build_formato_1001(
     # Retenciones por tercero (cuentas 2365 retención renta, 2367 reteIVA, 2368 reteICA)
     ret_mask = df["account_code"].str.startswith(("2365", "2367", "2368"))
     rets = df[ret_mask & (df["partner_id"].notna())].copy()
-    rets["monto_ret"] = rets["credit"].fillna(0) - rets["debit"].fillna(0)
-    rets_by_partner = rets.groupby(
-        ["partner_id", df.loc[rets.index, "account_code"].str[:4]],
-        as_index=False,
-    )["monto_ret"].sum()
-    # Construir tabla pivotada de retenciones por tercero
-    if not rets_by_partner.empty:
-        rets_pivot = rets_by_partner.pivot_table(
-            index="partner_id", columns="account_code",
-            values="monto_ret", aggfunc="sum", fill_value=0,
-        )
-        rets_pivot = rets_pivot.rename(columns={
-            "2365": "ret_fuente_renta",
-            "2367": "ret_iva",
-            "2368": "ret_ica",
-        })
-    else:
-        rets_pivot = pd.DataFrame()
+    rets_pivot = pd.DataFrame()
+    if not rets.empty:
+        rets["monto_ret"] = rets["credit"].fillna(0) - rets["debit"].fillna(0)
+        rets["cuenta_4d"] = rets["account_code"].str[:4]
+        rets_by_partner = rets.groupby(
+            ["partner_id", "cuenta_4d"], as_index=False,
+        )["monto_ret"].sum()
+        if not rets_by_partner.empty:
+            rets_pivot = rets_by_partner.pivot_table(
+                index="partner_id", columns="cuenta_4d",
+                values="monto_ret", aggfunc="sum", fill_value=0,
+            )
+            rets_pivot = rets_pivot.rename(columns={
+                "2365": "ret_fuente_renta",
+                "2367": "ret_iva",
+                "2368": "ret_ica",
+            })
 
     # Agrupar pagos por tercero + concepto
     grp = pagos.groupby(["partner_id", "concepto"], as_index=False).agg(
@@ -345,10 +402,11 @@ def build_formato_1001(
     else:
         out = grp
 
-    # Filtrar montos < $100k (umbral DIAN típico — el real es ~$1M pero
-    # esto se ajusta según resolución del año)
-    if "pago_deducible" in out.columns:
-        out = out[out["pago_deducible"].abs() >= 100_000].reset_index(drop=True)
+    # Aplicar umbral si > 0
+    if umbral_minimo > 0 and "pago_deducible" in out.columns:
+        out = out[
+            out["pago_deducible"].abs() >= umbral_minimo
+        ].reset_index(drop=True)
     return out
 
 
@@ -375,13 +433,7 @@ def build_formato_1003(
     df = df[df["date"].dt.year == year]
     if df.empty:
         return pd.DataFrame()
-
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code"]].rename(
-            columns={"id": "account_id", "code": "account_code"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
     # 1355xx = anticipos y retenciones practicadas a la empresa
     ret_mask = df["account_code"].str.startswith("1355")
@@ -431,12 +483,7 @@ def build_formato_1004(
     df = df[df["date"].dt.year == year]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code"]].rename(
-            columns={"id": "account_id", "code": "account_code"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
     # Cuentas típicas para descuentos tributarios
     mask = df["account_code"].str.startswith(("1715", "1620"))
@@ -471,12 +518,7 @@ def build_formato_1005(
     df = df[df["date"].dt.year == year]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code"]].rename(
-            columns={"id": "account_id", "code": "account_code"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
     mask = df["account_code"].str.startswith("2408")
     sub = df[mask & (df["partner_id"].notna())].copy()
@@ -508,12 +550,7 @@ def build_formato_1006(
     df = df[df["date"].dt.year == year]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code"]].rename(
-            columns={"id": "account_id", "code": "account_code"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
     mask = df["account_code"].str.startswith(("2408", "240805"))
     sub = df[mask & (df["partner_id"].notna())].copy()
@@ -538,8 +575,8 @@ def build_formato_1007(
     year: int,
 ) -> pd.DataFrame:
     """
-    Ingresos por tercero (cliente). Suma los créditos a cuentas 4xxx
-    del año fiscal, agrupado por (tercero, concepto).
+    Ingresos por tercero (cliente). Suma los créditos a cuentas grupo 4
+    (ingresos) del año fiscal, agrupado por (tercero, concepto).
     """
     if moves is None or moves.empty:
         return pd.DataFrame()
@@ -548,14 +585,9 @@ def build_formato_1007(
     df = df[df["date"].dt.year == year]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code"]].rename(
-            columns={"id": "account_id", "code": "account_code"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
-    mask = df["account_code"].str.startswith("4")
+    mask = df["puc_group"] == "4"
     sub = df[mask & (df["partner_id"].notna())].copy()
     if sub.empty:
         return pd.DataFrame()
@@ -580,7 +612,7 @@ def build_formato_1008(
     year: int,
 ) -> pd.DataFrame:
     """
-    Saldo de cuentas por cobrar (1305, 1330, 1355, etc.) al 31 dic del año.
+    Saldo de cuentas por cobrar (subgrupo 13) al 31 dic del año.
     """
     if moves is None or moves.empty:
         return pd.DataFrame()
@@ -589,15 +621,12 @@ def build_formato_1008(
     df = df[df["date"].dt.date <= date(year, 12, 31)]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code"]].rename(
-            columns={"id": "account_id", "code": "account_code"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
-    # CxC: 1305 deudores nacionales, 1310 cliente nacionales, 1325 cuentas por cobrar
-    mask = df["account_code"].str.startswith(("1305", "1310", "1325", "1330"))
+    # CxC: subgrupo 13 (deudores comerciales) usando PUC robusto + fallback código
+    mask = (df["puc_subgroup"] == "13") | df["account_code"].str.startswith((
+        "1305", "1310", "1325", "1330",
+    ))
     sub = df[mask & (df["partner_id"].notna())].copy()
     if sub.empty:
         return pd.DataFrame()
@@ -618,7 +647,7 @@ def build_formato_1009(
     partners: pd.DataFrame,
     year: int,
 ) -> pd.DataFrame:
-    """Saldos de CxP (22xx, 2335, etc.) al 31 dic."""
+    """Saldos de CxP (subgrupos 22-23) al 31 dic."""
     if moves is None or moves.empty:
         return pd.DataFrame()
     df = moves.copy()
@@ -626,15 +655,12 @@ def build_formato_1009(
     df = df[df["date"].dt.date <= date(year, 12, 31)]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code"]].rename(
-            columns={"id": "account_id", "code": "account_code"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
-    # CxP: 22xx (proveedores), 2335 (otros costos)
-    mask = df["account_code"].str.startswith(("22", "2335", "2380"))
+    # CxP: subgrupos 22 (proveedores) y 23 (cuentas por pagar)
+    mask = df["puc_subgroup"].isin(["22", "23"]) | df["account_code"].str.startswith((
+        "22", "2335", "2380",
+    ))
     sub = df[mask & (df["partner_id"].notna())].copy()
     if sub.empty:
         return pd.DataFrame()
@@ -711,26 +737,26 @@ def build_formato_1011(
     df = df[df["date"].dt.year == year]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code"]].rename(
-            columns={"id": "account_id", "code": "account_code"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
-    def _suma(prefix: str | tuple) -> float:
-        m = df["account_code"].str.startswith(prefix)
+    def _suma_subgroup(subgroup: str) -> float:
+        m = df["puc_subgroup"] == subgroup
+        sub = df[m]
+        return float(sub["credit"].sum() - sub["debit"].sum())
+
+    def _suma_group(group: str) -> float:
+        m = df["puc_group"] == group
         sub = df[m]
         return float(sub["credit"].sum() - sub["debit"].sum())
 
     rows = [
         ("Concepto", "Valor"),
-        ("Ingresos brutos operacionales (41)", _suma("41")),
-        ("Ingresos no operacionales (42)", _suma("42")),
-        ("Costo de ventas (6)", -_suma("6")),  # invertir signo (es débito)
-        ("Gastos administración (51)", -_suma("51")),
-        ("Gastos ventas (52)", -_suma("52")),
-        ("Gastos no operacionales (53)", -_suma("53")),
+        ("Ingresos brutos operacionales (41)", _suma_subgroup("41")),
+        ("Ingresos no operacionales (42)", _suma_subgroup("42")),
+        ("Costo de ventas (6)", -_suma_group("6")),  # invertir signo
+        ("Gastos administración (51)", -_suma_subgroup("51")),
+        ("Gastos ventas (52)", -_suma_subgroup("52")),
+        ("Gastos no operacionales (53)", -_suma_subgroup("53")),
     ]
     return pd.DataFrame(rows[1:], columns=rows[0])
 
@@ -760,15 +786,12 @@ def build_formato_1012(
     df = df[df["date"].dt.date <= date(year, 12, 31)]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code", "name"]].rename(
-            columns={"id": "account_id", "code": "account_code", "name": "account_name"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
-    # 11xx Disponible, 12xx Inversiones
-    mask = df["account_code"].str.startswith(("11", "12"))
+    # Subgrupos 11 (Disponible: caja/bancos) y 12 (Inversiones)
+    mask = df["puc_subgroup"].isin(["11", "12"]) | df["account_code"].str.startswith(
+        ("11", "12")
+    )
     sub = df[mask].copy()
     if sub.empty:
         return pd.DataFrame()
@@ -841,15 +864,12 @@ def build_formato_1015(
     df = df[df["date"].dt.date <= date(year, 12, 31)]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code", "name"]].rename(
-            columns={"id": "account_id", "code": "account_code", "name": "account_name"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
-    # Pasivos: 21, 22, 23, 24, 25
-    mask = df["account_code"].str.startswith(("21", "22", "23", "24", "25"))
+    # Pasivos: puc_group "2" (pasivos) — incluye 21-25
+    mask = (df["puc_group"] == "2") | df["account_code"].str.startswith(
+        ("21", "22", "23", "24", "25")
+    )
     sub = df[mask & (df["partner_id"].notna())].copy()
     if sub.empty:
         return pd.DataFrame()
@@ -889,20 +909,15 @@ def build_formato_1056(
     df = df[df["date"].dt.year == year]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code"]].rename(
-            columns={"id": "account_id", "code": "account_code"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
-    # Devoluciones en ventas: cuentas 4175 o débitos a ingresos 4xxx
+    # Devoluciones en ventas: cuentas 4175 o débitos a ingresos (puc_group="4")
     mask_dev_v = df["account_code"].str.startswith("4175") | (
-        df["account_code"].str.startswith("4") & (df["debit"] > 0)
+        (df["puc_group"] == "4") & (df["debit"] > 0)
     )
-    # Devoluciones en compras: cuentas 6225 o créditos a costos 6xxx
+    # Devoluciones en compras: cuentas 6225 o créditos a costos (puc_group="6")
     mask_dev_c = df["account_code"].str.startswith("6225") | (
-        df["account_code"].str.startswith("6") & (df["credit"] > 0)
+        (df["puc_group"] == "6") & (df["credit"] > 0)
     )
 
     devoluciones_ventas = df[mask_dev_v & (df["partner_id"].notna())].copy()
@@ -964,12 +979,7 @@ def build_formato_1647(
     df = df[df["date"].dt.year == year]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code"]].rename(
-            columns={"id": "account_id", "code": "account_code"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
     mask = df["account_code"].str.startswith("2815")
     sub = df[mask & (df["partner_id"].notna())].copy()
@@ -1009,14 +1019,10 @@ def build_formato_2275(
     df = df[df["date"].dt.year == year]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code", "name"]].rename(
-            columns={"id": "account_id", "code": "account_code", "name": "account_name"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
-    mask = df["account_code"].str.startswith(("5", "6", "7"))
+    # Costos y deducciones: puc_group 5 (gastos), 6 (costos), 7 (costos producción)
+    mask = df["puc_group"].isin(["5", "6", "7"])
     sub = df[mask & (df["partner_id"].notna())].copy()
     if sub.empty:
         return pd.DataFrame()
@@ -1056,12 +1062,7 @@ def build_formato_2276(
     df = df[df["date"].dt.year == year]
     if df.empty:
         return pd.DataFrame()
-    if "account_id" in df.columns and chart is not None and "id" in chart.columns:
-        chart_min = chart[["id", "code", "name"]].rename(
-            columns={"id": "account_id", "code": "account_code", "name": "account_name"},
-        )
-        df = df.merge(chart_min, on="account_id", how="left")
-    df["account_code"] = df.get("account_code", "").astype(str)
+    df = _enrich_moves_with_puc(df, chart)
 
     # Cuentas laborales: 5105, 5108, 5110-laborales, 7105, 2510-2530
     mask_lab = df["account_code"].str.startswith((
