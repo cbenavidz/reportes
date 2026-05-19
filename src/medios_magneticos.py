@@ -42,6 +42,10 @@ def _enrich_moves_with_puc(
     """
     Enriquece movimientos contables con columnas de clasificación PUC.
 
+    GARANTÍA: filtra explícitamente parent_state == 'posted' para excluir
+    asientos en borrador o cancelados, aunque el extractor ya lo haga
+    server-side (doble validación defensiva).
+
     Agrega:
       - account_code: código real (o inferido desde account_id_name)
       - account_name: nombre de la cuenta
@@ -53,6 +57,16 @@ def _enrich_moves_with_puc(
     """
     if moves is None or moves.empty:
         return moves
+
+    # DOBLE VALIDACIÓN: filtrar parent_state=posted si la columna existe.
+    # El extractor ya lo hace server-side pero esto garantiza que si en
+    # el futuro alguien cambia el extractor, los formatos DIAN sigan
+    # excluyendo borradores y cancelados.
+    moves = moves.copy()
+    if "parent_state" in moves.columns:
+        moves = moves[moves["parent_state"] == "posted"]
+    elif "state" in moves.columns:
+        moves = moves[moves["state"] == "posted"]
     if chart is None or chart.empty:
         df = moves.copy()
         df["account_code"] = df.get("account_code", "").astype(str)

@@ -177,11 +177,29 @@ if st.button(
         )
         st.stop()
 
-    st.success(
-        f"✅ Datos cargados: {len(moves_year):,} líneas del año {year_fiscal}, "
-        f"{len(moves_to_eoy):,} líneas históricas (para saldos), "
-        f"{len(partners_df):,} terceros."
-    )
+    # Validar que todos los movimientos sean posted (defensa adicional)
+    if "parent_state" in moves_year.columns:
+        posted_count = (moves_year["parent_state"] == "posted").sum()
+        otros_count = len(moves_year) - posted_count
+        if otros_count > 0:
+            st.warning(
+                f"⚠️ {otros_count} líneas con estado distinto a 'posted' "
+                "fueron filtradas (borradores o cancelados)."
+            )
+            moves_year = moves_year[moves_year["parent_state"] == "posted"]
+            moves_to_eoy = moves_to_eoy[moves_to_eoy["parent_state"] == "posted"]
+        st.success(
+            f"✅ Datos cargados: {posted_count:,} líneas PUBLICADAS del "
+            f"año {year_fiscal} · {len(moves_to_eoy):,} líneas históricas "
+            f"(para saldos) · {len(partners_df):,} terceros. "
+            "Borradores y cancelados excluidos."
+        )
+    else:
+        st.success(
+            f"✅ Datos cargados: {len(moves_year):,} líneas del año "
+            f"{year_fiscal}, {len(moves_to_eoy):,} líneas históricas, "
+            f"{len(partners_df):,} terceros."
+        )
 
     # ── Construir formatos ──
     formatos: dict[str, pd.DataFrame] = {}
