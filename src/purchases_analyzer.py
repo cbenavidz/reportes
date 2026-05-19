@@ -889,3 +889,146 @@ def compute_inventory_recommendations(
     prio_order = {"alta": 0, "media": 1, "baja": 2}
     recs.sort(key=lambda r: prio_order.get(r.get("prioridad", "baja"), 3))
     return recs
+
+
+# ---------------------------------------------------------------------------
+# 8. Rotación por categoría en múltiples ventanas (30/90/180/365 días)
+# ---------------------------------------------------------------------------
+
+
+def compute_rotacion_categoria_multi_ventana(
+    sales_lines: pd.DataFrame,
+    stock_df: pd.DataFrame,
+    today: date | None = None,
+    ventanas_dias: list[int] | None = None,
+    anualizar: bool = True,
+) -> pd.DataFrame:
+    """
+    Rotación por categoría en múltiples ventanas temporales ancladas a HOY.
+
+    Numerador: ventas (price_subtotal_signed) de la ventana, agrupado por
+    categoría de producto.
+    Denominador: stock_valor de la categoría (snapshot actual de stock.quant
+    valuado a costo promedio cuando no hay valor en quant).
+
+    Si `anualizar=True` (default), cada ventana se anualiza:
+      - 30d → ventas/stock × 12
+      - 90d → ventas/stock × 365/90
+      - 180d → ventas/stock × 365/180
+      - 365d → ventas/stock × 1
+
+    Args:
+        sales_lines: DataFrame con líneas de facturas de venta (debe cubrir
+            al menos la ventana más larga = ventanas_dias[-1]).
+        stock_df: stock por producto (qty_available, stock_value).
+        today: fecha de hoy (default date.today()).
+        ventanas_dias: lista de tamaños de ventana en días. Default
+            [30, 90, 180, 365].
+        anualizar: si True, multiplica por 365/días_ventana.
+
+    Returns:
+        DataFrame con columnas:
+          - product_categ_name
+          - stock_valor_categoria
+          - ventas_<N>d (para cada ventana)
+          - rotacion_<N>d (para cada ventana)
+    """
+    if today is None:
+        today = date.today()
+    if ventanas_dias is None:
+        ventanas_dias = [30, 90, 180, 365]
+
+    sl = _apply_default_exclusions(_normalize_sales_signed(sales_lines))
+    if sl is None or sl.empty:
+        return pd.DataFrame()
+
+    # Anclar fechas
+    if "invoice_date" in sl.columns:
+        sl["_d"] = pd.to_datetime(sl["invoice_date"], errors="coerce").dt.date
+    else:
+        return pd.DataFrame()
+
+    # Fill categoría
+    if "product_categ_name" not in sl.columns:
+        sl["product_categ_name"] = "(Sin categoría)"
+    sl["product_categ_name"] = sl["product_categ_name"].fillna("(Sin categoría)")
+
+    # Calcular ventas por categoría para cada ventana
+    rows: dict[str, dict] = {}
+    for days in ventanas_dias:
+        rng_start = today - timedelta(days=days)
+        sl_v = sl[(sl["_d"] >= rng_start) & (sl["_d"] <= today)]
+        ventas_cat = sl_v.groupby(
+            "product_categ_name", as_index=False
+        )["price_subtotal_signed"].sum()
+        for _, r in ventas_cat.iterrows():
+            cat = r["product_categ_name"]
+            rows.setdefault(cat, {"product_categ_name": cat})
+            rows[cat][f"ventas_{days}d"] = float(r["price_subtotal_signed"])
+
+    # Stock por categoría (necesita el crosstab para mapear product_id → categoría)
+    # Como recibimos solo stock_df (sin categoría), unimos vía sales_lines
+    # que sí tiene product_id ↔ product_categ_name
+    if stock_df is not None and not stock_df.empty:
+        # Map product_id -> product_categ_name (de las líneas de venta)
+        prod_cat = (
+            sl[["product_id", "product_categ_name"]]
+            .drop_duplicates(subset="product_id")
+            .dropna(subset=["product_id"])
+        )
+        stock_join = stock_df.merge(prod_cat, on="product_id", how="left")
+        stock_join["product_categ_name"] = stock_join[
+            "product_categ_name"
+        ].fillna("(Sin categoría)")
+        stock_por_cat = stock_join.groupby(
+            "product_categ_name", as_index=False
+        ).agg(
+            stock_qty=("qty_available", "sum"),
+            stock_valor=("stock_value", "sum"),
+        )
+    else:
+        stock_por_cat = pd.DataFrame(columns=[
+            "product_categ_name", "stock_qty", "stock_valor",
+        ])
+
+    # Combinar ventas + stock
+    df = pd.DataFrame(list(rows.values()))
+    if df.empty:
+        return df
+    df = df.merge(stock_por_cat, on="product_categ_name", how="left")
+    df["stock_valor"] = df["stock_valor"].fillna(0)
+    df["stock_qty"] = df["stock_qty"].fillna(0)
+
+    # Asegurar columnas de ventas (0 si no había datos)
+    for days in ventanas_dias:
+        col = f"ventas_{days}d"
+        if col not in df.columns:
+            df[col] = 0
+        df[col] = df[col].fillna(0)
+
+    # Calcular rotación por ventana
+    for days in ventanas_dias:
+        ventas_col = f"ventas_{days}d"
+        rot_col = f"rotacion_{days}d"
+        if anualizar:
+            factor = 365.0 / days
+            df[rot_col] = np.where(
+                df["stock_valor"] > 0,
+                df[ventas_col] / df["stock_valor"] * factor,
+                0,
+            )
+        else:
+            df[rot_col] = np.where(
+                df["stock_valor"] > 0,
+                df[ventas_col] / df["stock_valor"],
+                0,
+            )
+
+    # Renombrar para claridad
+    df = df.rename(columns={"stock_valor": "stock_valor_categoria"})
+
+    # Ordenar por rotación del más largo (más estable)
+    sort_col = f"rotacion_{ventanas_dias[-1]}d"
+    if sort_col in df.columns:
+        df = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
+    return df

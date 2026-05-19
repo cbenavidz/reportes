@@ -37,6 +37,7 @@ from src.purchases_analyzer import (
     compute_inventory_recommendations,
     compute_product_crosstab,
     compute_purchases_vs_sales_summary,
+    compute_rotacion_categoria_multi_ventana,
     compute_rotacion_cuenta_14,
 )
 from src.financial_statements import enrich_chart_with_puc
@@ -214,6 +215,10 @@ with st.spinner("Cargando plan de cuentas, ventas y compras..."):
                 date_to=today.isoformat(),
                 company_ids=filters["company_ids"],
             )
+        bal_inicio_30 = load_account_balances_aggregated(
+            date_to=(today - timedelta(days=31)).isoformat(),
+            company_ids=filters["company_ids"],
+        )
         bal_inicio_90 = load_account_balances_aggregated(
             date_to=(today - timedelta(days=91)).isoformat(),
             company_ids=filters["company_ids"],
@@ -230,6 +235,7 @@ with st.spinner("Cargando plan de cuentas, ventas y compras..."):
         # Placeholders vacíos — no se usarán si show_mobile=False
         import pandas as _pd
         balances_hoy = balances_corte
+        bal_inicio_30 = _pd.DataFrame()
         bal_inicio_90 = _pd.DataFrame()
         bal_inicio_180 = _pd.DataFrame()
         bal_inicio_365 = _pd.DataFrame()
@@ -382,8 +388,12 @@ def _rotacion_rango(
     }
 
 
-# Calcular rotación a 90d, 180d, 365d — solo si el toggle está ON
+# Calcular rotación a 30d, 90d, 180d, 365d — solo si el toggle está ON
 if show_mobile:
+    rot_30 = _rotacion_rango(
+        sales_365, today - timedelta(days=30), today,
+        bal_inicio_30, balances_hoy, cat_filter, cat_tab,
+    )
     rot_90 = _rotacion_rango(
         sales_365, today - timedelta(days=90), today,
         bal_inicio_90, balances_hoy, cat_filter, cat_tab,
@@ -401,6 +411,7 @@ else:
         "ventas": 0, "costo": 0, "saldo_prom": 0,
         "rot_v": 0, "rot_c": 0, "rot_v_anu": 0, "dias_v": 0, "period_d": 0,
     }
+    rot_30 = _empty_rot
     rot_90 = _empty_rot
     rot_180 = _empty_rot
     rot_365 = _empty_rot
@@ -469,16 +480,17 @@ if st.button("🔄 Recargar datos (limpia caché)", key="ri_reload"):
 
 st.markdown("---")
 
-# ── KPIs móviles: 90d, 180d, 365d (anclados a HOY) — SOLO si toggle ON ──
+# ── KPIs móviles: 30d, 90d, 180d, 365d (anclados a HOY) — SOLO si toggle ON ──
 if show_mobile:
     st.markdown(f"### 📐 Rotación móvil — anclada a hoy ({today})")
     st.caption(
-        "Mismo cálculo (ventas / denominador) aplicado a ventanas de 90, 180 "
-        "y 365 días que terminan hoy. Permite ver si el inventario está "
+        "Mismo cálculo (ventas / denominador) aplicado a ventanas de 30, 90, "
+        "180 y 365 días que terminan hoy. Permite ver si el inventario está "
         "rotando mejor o peor en el corto, medio y largo plazo."
     )
-    cm1, cm2, cm3 = st.columns(3)
+    cm0, cm1, cm2, cm3 = st.columns(4)
     for col, label, r in [
+        (cm0, "30 días", rot_30),
         (cm1, "90 días", rot_90),
         (cm2, "180 días", rot_180),
         (cm3, "365 días", rot_365),
@@ -512,17 +524,31 @@ if show_mobile:
                     f"Denominador: {_money(r['saldo_prom'])}"
                 )
 
-# Análisis de tendencia entre las 3 ventanas (solo si toggle ON)
+# Análisis de tendencia entre las 4 ventanas (solo si toggle ON)
 trend_msg = []
-if show_mobile and rot_90["rot_v"] and rot_180["rot_v"] and rot_365["rot_v"]:
-    if rot_90["rot_v"] > rot_180["rot_v"] > rot_365["rot_v"]:
-        trend_msg.append("📈 **Mejorando:** rotación creciente en corto, medio y largo plazo.")
-    elif rot_90["rot_v"] < rot_180["rot_v"] < rot_365["rot_v"]:
-        trend_msg.append("📉 **Deteriorándose:** rotación decreciente — revisar surtido y ventas.")
-    elif rot_90["rot_v"] > rot_365["rot_v"] * 1.1:
-        trend_msg.append("📈 Últimos 90d rotan más que el promedio anual.")
-    elif rot_90["rot_v"] < rot_365["rot_v"] * 0.9:
-        trend_msg.append("📉 Últimos 90d rotan menos que el promedio anual.")
+if (
+    show_mobile
+    and rot_30["rot_v_anu"] and rot_90["rot_v_anu"]
+    and rot_180["rot_v_anu"] and rot_365["rot_v_anu"]
+):
+    # Comparar la anualizada del último mes vs el promedio anual
+    r30a = rot_30["rot_v_anu"]
+    r365a = rot_365["rot_v_anu"]
+    if r30a > r365a * 1.2:
+        trend_msg.append(
+            "📈 **Mes anterior acelerando:** rotación anualizada del "
+            f"último mes ({r30a:.1f}x) supera al promedio anual ({r365a:.1f}x)."
+        )
+    elif r30a < r365a * 0.8:
+        trend_msg.append(
+            "📉 **Mes anterior desacelerando:** rotación anualizada del "
+            f"último mes ({r30a:.1f}x) está por debajo del promedio anual "
+            f"({r365a:.1f}x)."
+        )
+    if rot_30["rot_v"] > rot_90["rot_v"] > rot_180["rot_v"]:
+        trend_msg.append("📈 Tendencia creciente progresiva (30d > 90d > 180d).")
+    elif rot_30["rot_v"] < rot_90["rot_v"] < rot_180["rot_v"]:
+        trend_msg.append("📉 Tendencia decreciente progresiva (30d < 90d < 180d).")
 if trend_msg:
     st.info(" · ".join(trend_msg))
 
@@ -760,7 +786,77 @@ with t_evol:
 
 # ─── Tab Por categoría ───
 with t_cat:
-    st.markdown("### Rotación por categoría")
+    # ── Tabla NUEVA: rotación multi-ventana por categoría ──
+    st.markdown("### 📊 Rotación por categoría — ventanas múltiples")
+    st.caption(
+        "Rotación anualizada por categoría calculada en 4 ventanas que "
+        "terminan hoy: 30 días (mes anterior), 90, 180 y 365 días. "
+        "Permite ver si una categoría está acelerando o desacelerando."
+    )
+
+    multi_rot = compute_rotacion_categoria_multi_ventana(
+        sales_lines if sales_lines is not None else sales_365,
+        stock_df,
+        today=today,
+        anualizar=True,
+    )
+    if multi_rot is None or multi_rot.empty:
+        st.info(
+            "No hay datos suficientes. Activa el toggle "
+            "'Mostrar KPIs móviles 90/180/365' arriba para cargar las "
+            "ventas de 365 días que requiere este análisis."
+        )
+    else:
+        # Quitar categorías sin stock valorado (no se puede calcular)
+        mr = multi_rot[multi_rot["stock_valor_categoria"] > 0].copy()
+        if mr.empty:
+            st.info(
+                "Ninguna categoría tiene stock valorado. Las rotaciones "
+                "requieren valor de stock (de stock.quant)."
+            )
+        else:
+            cols_order = [
+                "product_categ_name",
+                "stock_valor_categoria",
+                "rotacion_30d", "rotacion_90d",
+                "rotacion_180d", "rotacion_365d",
+            ]
+            st.dataframe(
+                mr[cols_order],
+                column_config={
+                    "product_categ_name": st.column_config.TextColumn(
+                        "Categoría", width="large"
+                    ),
+                    "stock_valor_categoria": st.column_config.NumberColumn(
+                        "Stock $", format="$%,.0f",
+                    ),
+                    "rotacion_30d": st.column_config.NumberColumn(
+                        "Rot. 30d (anual)", format="%.2fx",
+                        help="Ventas últimos 30 días × 12 / Stock",
+                    ),
+                    "rotacion_90d": st.column_config.NumberColumn(
+                        "Rot. 90d (anual)", format="%.2fx",
+                        help="Ventas últimos 90 días × 4.06 / Stock",
+                    ),
+                    "rotacion_180d": st.column_config.NumberColumn(
+                        "Rot. 180d (anual)", format="%.2fx",
+                        help="Ventas últimos 180 días × 2.03 / Stock",
+                    ),
+                    "rotacion_365d": st.column_config.NumberColumn(
+                        "Rot. 1 año", format="%.2fx",
+                        help="Ventas últimos 365 días / Stock",
+                    ),
+                },
+                use_container_width=True, hide_index=True, height=420,
+            )
+            st.caption(
+                "💡 **Cómo leer:** si la rotación 30d es muy superior a la 365d, "
+                "la categoría está acelerando. Si es muy inferior, está "
+                "desacelerando. Compáralas para detectar tendencias."
+            )
+
+    st.markdown("---")
+    st.markdown("### Rotación por categoría (período seleccionado)")
     st.caption(
         "Rotación = costo de ventas / valor de stock por categoría. "
         "Calculada con el snapshot actual de stock.quant."
