@@ -556,72 +556,68 @@ st.markdown("---")
 
 
 # ── Serie mensual: saldo cuenta 14 + ventas del mes ──
+# Usamos la MISMA lógica que el KPI cabecera (que funciona): cargar el
+# balance al cierre de cada mes con load_account_balances_aggregated y
+# aplicar _saldo_cuenta_14_from_balances. Esto garantiza consistencia.
 with st.spinner("Construyendo serie mensual..."):
+    from calendar import monthrange as _mr
+    from concurrent.futures import ThreadPoolExecutor as _TP3
+    from src.purchases_analyzer import _saldo_cuenta_14_from_balances
+
     chart_e = enrich_chart_with_puc(chart_df)
 
-    # Identificar IDs de cuentas 14 (Inventarios) UNA sola vez.
-    # Misma estrategia robusta que `_saldo_cuenta_14_from_balances`:
-    # primero por código (14xx), después por puc_subgroup, después por
-    # account_type (stock/inventory).
-    chart_e_copy = chart_e.copy()
-    if "code" in chart_e_copy.columns:
-        chart_e_copy["code_str"] = chart_e_copy["code"].astype(str)
-    else:
-        chart_e_copy["code_str"] = ""
-    inv_mask = chart_e_copy["code_str"].str.startswith("14")
-    if not inv_mask.any() and "puc_subgroup" in chart_e_copy.columns:
-        inv_mask = chart_e_copy["puc_subgroup"].astype(str) == "14"
-    if not inv_mask.any() and "account_type" in chart_e_copy.columns:
-        inv_mask = chart_e_copy["account_type"].astype(str).str.contains(
-            "stock|inventory", case=False, na=False,
-        )
-    if "id" in chart_e_copy.columns:
-        inv_account_ids: tuple[int, ...] = tuple(
-            int(i) for i in chart_e_copy.loc[inv_mask, "id"].dropna().unique()
-        )
-    else:
-        inv_account_ids = ()
+    # Lista de fechas de cierre de mes en el rango
+    eom_list: list[date] = []
+    y, m = fecha_desde.year, fecha_desde.month
+    while True:
+        first = date(y, m, 1)
+        if first > fecha_hasta:
+            break
+        last = date(y, m, _mr(y, m)[1])
+        cierre = min(last, fecha_hasta)
+        eom_list.append(cierre)
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+        if y > fecha_hasta.year + 1:
+            break
 
-    # Diagnóstico visible si no se encontraron cuentas
-    if not inv_account_ids:
-        st.warning(
-            "⚠️ No se encontraron cuentas de inventario en el plan de "
-            "cuentas. Verifica que existan cuentas con código que empiece "
-            "con '14' o con account_type tipo 'stock'/'inventory'. "
-            f"Columnas disponibles en chart: {list(chart_e_copy.columns)}"
+    def _saldo_at(d: date) -> tuple[date, float]:
+        bal = load_account_balances_aggregated(
+            date_to=d.isoformat(),
+            company_ids=filters["company_ids"],
         )
+        saldo, _ = _saldo_cuenta_14_from_balances(bal, chart_e)
+        return d, saldo
 
-    # Saldos mensuales en 1 sola consulta (read_group + cumsum)
-    saldo_mes_df = load_inventory_balance_monthly_series(
-        date_from=fecha_desde.isoformat(),
-        date_to=fecha_hasta.isoformat(),
-        inventory_account_ids=inv_account_ids,
-        company_ids=filters["company_ids"],
-    )
-    saldo_mes = saldo_mes_df.rename(columns={"saldo_cierre": "saldo_inv_cierre"})
+    saldos_por_mes: dict[date, float] = {}
+    with _TP3(max_workers=6) as pool:
+        for d, saldo in pool.map(_saldo_at, eom_list):
+            saldos_por_mes[d] = saldo
 
-    # Diagnóstico de la serie mensual de inventario
+    # Construir saldo_mes con la misma estructura que antes esperaba
+    saldo_mes = pd.DataFrame([
+        {
+            "mes": pd.Timestamp(d.replace(day=1)),
+            "saldo_inv_cierre": saldos_por_mes.get(d, 0),
+        }
+        for d in eom_list
+    ])
+
+    # Diagnóstico
     with st.expander("🔍 Diagnóstico de saldo cuenta 14 mensual", expanded=False):
-        st.write(
-            f"**Cuentas de inventario detectadas:** {len(inv_account_ids)} "
-            f"→ IDs: {list(inv_account_ids)[:10]}"
-            f"{' (... y más)' if len(inv_account_ids) > 10 else ''}"
-        )
-        if not inv_account_ids:
-            st.error(
-                "NO se detectaron cuentas 14. Por eso los saldos salen en 0."
-            )
+        st.write(f"**Meses calculados:** {len(eom_list)}")
         st.write(f"**Rango pedido:** {fecha_desde} → {fecha_hasta}")
-        st.write(f"**Filas en saldo_mes_df:** {len(saldo_mes_df)}")
-        if not saldo_mes_df.empty:
-            st.write("**Contenido:**")
-            st.dataframe(saldo_mes_df, hide_index=True, use_container_width=True)
-            st.write(
-                f"**Suma de saldo_cierre:** ${saldo_mes_df['saldo_cierre'].sum():,.0f}"
-            )
-            st.write(
-                f"**Max saldo_cierre:** ${saldo_mes_df['saldo_cierre'].max():,.0f}"
-            )
+        st.dataframe(saldo_mes, hide_index=True, use_container_width=True)
+        st.write(
+            f"**Suma de saldo_inv_cierre:** "
+            f"${saldo_mes['saldo_inv_cierre'].sum():,.0f}"
+        )
+        st.write(
+            f"**Max saldo_inv_cierre:** "
+            f"${saldo_mes['saldo_inv_cierre'].max():,.0f}"
+        )
 
     # Ventas del período mensualizadas (cálculo en memoria, ya tenemos las líneas)
     ventas_mes = pd.DataFrame()
