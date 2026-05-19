@@ -432,7 +432,7 @@ def load_inventory_balance_monthly_series(
     date_to: str,
     inventory_account_ids: tuple[int, ...],
     company_ids: tuple[int, ...] | None = None,
-    _cache_v: int = 1,
+    _cache_v: int = 2,  # v2: bump para limpiar caché con datos vacíos
 ) -> "pd.DataFrame":
     """
     Serie mensual del saldo agregado de cuentas de inventario.

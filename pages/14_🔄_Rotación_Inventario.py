@@ -574,6 +574,29 @@ with st.spinner("Construyendo serie mensual..."):
     )
     saldo_mes = saldo_mes_df.rename(columns={"saldo_cierre": "saldo_inv_cierre"})
 
+    # Diagnóstico de la serie mensual de inventario
+    with st.expander("🔍 Diagnóstico de saldo cuenta 14 mensual", expanded=False):
+        st.write(
+            f"**Cuentas de inventario detectadas:** {len(inv_account_ids)} "
+            f"→ IDs: {list(inv_account_ids)[:10]}"
+            f"{' (... y más)' if len(inv_account_ids) > 10 else ''}"
+        )
+        if not inv_account_ids:
+            st.error(
+                "NO se detectaron cuentas 14. Por eso los saldos salen en 0."
+            )
+        st.write(f"**Rango pedido:** {fecha_desde} → {fecha_hasta}")
+        st.write(f"**Filas en saldo_mes_df:** {len(saldo_mes_df)}")
+        if not saldo_mes_df.empty:
+            st.write("**Contenido:**")
+            st.dataframe(saldo_mes_df, hide_index=True, use_container_width=True)
+            st.write(
+                f"**Suma de saldo_cierre:** ${saldo_mes_df['saldo_cierre'].sum():,.0f}"
+            )
+            st.write(
+                f"**Max saldo_cierre:** ${saldo_mes_df['saldo_cierre'].max():,.0f}"
+            )
+
     # Ventas del período mensualizadas (cálculo en memoria, ya tenemos las líneas)
     ventas_mes = pd.DataFrame()
     if sales_lines is not None and not sales_lines.empty:
