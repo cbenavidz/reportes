@@ -347,8 +347,9 @@ if "mm_formatos" in st.session_state:
             year_fiscal,
         )
 
-        # A) Terceros sin NIT
+        # A) Terceros sin NIT (resumen + detalle por asiento)
         sin_nit = diag.get("sin_nit")
+        sin_nit_det = diag.get("sin_nit_detalle")
         if sin_nit is not None and not sin_nit.empty:
             with st.container(border=True):
                 st.markdown(
@@ -359,6 +360,7 @@ if "mm_formatos" in st.session_state:
                     "identificación de tercero. Hay que actualizar el NIT "
                     "en Odoo (Contactos → editar → campo 'NIT/Cédula')."
                 )
+                st.markdown("**Resumen por tercero:**")
                 st.dataframe(
                     sin_nit,
                     column_config={
@@ -369,9 +371,89 @@ if "mm_formatos" in st.session_state:
                         "monto_pagos": st.column_config.NumberColumn(
                             "Total pagos", format="$%,.0f",
                         ),
+                        "n_asientos": st.column_config.NumberColumn(
+                            "# Asientos", format="%d",
+                        ),
                     },
                     use_container_width=True, hide_index=True, height=300,
                 )
+
+                # Detalle por asiento contable
+                if sin_nit_det is not None and not sin_nit_det.empty:
+                    st.markdown(
+                        "**Detalle por asiento contable** "
+                        f"({len(sin_nit_det):,} líneas):"
+                    )
+                    # Filtros para buscar fácil
+                    cflt1, cflt2 = st.columns([2, 2])
+                    with cflt1:
+                        partners_uniq = sin_nit_det["nombre_tercero"].dropna().unique().tolist()
+                        partner_sel = st.selectbox(
+                            "Filtrar por tercero",
+                            options=["(Todos)"] + sorted(partners_uniq),
+                            key="mm_sin_nit_partner",
+                        )
+                    with cflt2:
+                        q = st.text_input(
+                            "Buscar (asiento, referencia, descripción)",
+                            key="mm_sin_nit_buscar",
+                        )
+
+                    det_show = sin_nit_det.copy()
+                    if partner_sel and partner_sel != "(Todos)":
+                        det_show = det_show[
+                            det_show["nombre_tercero"] == partner_sel
+                        ]
+                    if q:
+                        ql = q.lower()
+                        # Buscar en columnas de texto
+                        text_cols = [
+                            c for c in [
+                                "move_id_name", "ref", "name",
+                                "account_code", "account_name",
+                            ] if c in det_show.columns
+                        ]
+                        if text_cols:
+                            mask = pd.Series(False, index=det_show.index)
+                            for c in text_cols:
+                                mask = mask | (
+                                    det_show[c].astype(str).str.lower()
+                                    .str.contains(ql, na=False, regex=False)
+                                )
+                            det_show = det_show[mask]
+
+                    st.caption(f"{len(det_show):,} líneas")
+                    st.dataframe(
+                        det_show,
+                        column_config={
+                            "partner_id": st.column_config.NumberColumn(
+                                "ID", format="%d",
+                            ),
+                            "nombre_tercero": "Tercero",
+                            "date": st.column_config.DateColumn(
+                                "Fecha", format="YYYY-MM-DD",
+                            ),
+                            "move_id_name": "Asiento",
+                            "move_id": "ID asiento",
+                            "ref": "Referencia",
+                            "name": "Descripción",
+                            "account_code": "Cuenta",
+                            "account_name": "Nombre cuenta",
+                            "monto": st.column_config.NumberColumn(
+                                "Monto", format="$%,.0f",
+                            ),
+                        },
+                        use_container_width=True, hide_index=True, height=500,
+                    )
+
+                    # Botón de descarga del detalle
+                    csv_data = det_show.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        label="⬇️ Descargar detalle en CSV",
+                        data=csv_data,
+                        file_name=f"sin_nit_detalle_{year_fiscal}.csv",
+                        mime="text/csv",
+                    )
         else:
             st.success("✅ A) Todos los terceros con pagos tienen NIT registrado.")
 

@@ -479,26 +479,74 @@ def diagnosticar_formato_1001(
     diag = {}
 
     # === A) Terceros con pagos pero SIN NIT ===
+    # Devolvemos DOS DataFrames:
+    #   - sin_nit (resumen): partner_id, nombre, total pagos
+    #   - sin_nit_detalle: una fila por asiento contable, con
+    #     move_id_name, ref, fecha, account_code, account_name, monto
     if partners is not None and not partners.empty and not pagos.empty:
         partners_idx = partners.set_index("id")
-        pagos_partner = pagos.groupby("partner_id", as_index=False)["monto"].sum()
-        sin_nit_rows = []
-        for _, r in pagos_partner.iterrows():
-            pid = r["partner_id"]
+        # Identificar partners sin NIT
+        partners_sin_nit_ids = set()
+        partners_info = {}
+        for pid in pagos["partner_id"].dropna().unique():
             try:
                 p = partners_idx.loc[int(pid)].to_dict() if pid in partners_idx.index else {}
             except Exception:  # noqa: BLE001
                 p = {}
             vat = (p.get("vat") or "").strip()
+            partners_info[int(pid)] = {
+                "name": p.get("name", "(sin nombre)"),
+                "vat": vat,
+            }
             if not vat:
-                sin_nit_rows.append({
-                    "partner_id": int(pid) if pid else None,
-                    "nombre": p.get("name", "(sin nombre)"),
-                    "monto_pagos": round(float(r["monto"]), 0),
-                })
-        diag["sin_nit"] = pd.DataFrame(sin_nit_rows).sort_values(
-            "monto_pagos", ascending=False,
-        ) if sin_nit_rows else pd.DataFrame()
+                partners_sin_nit_ids.add(int(pid))
+
+        # A.1) Resumen: total pagos por partner sin NIT
+        pagos_sin_nit = pagos[pagos["partner_id"].isin(partners_sin_nit_ids)]
+        if not pagos_sin_nit.empty:
+            resumen = pagos_sin_nit.groupby("partner_id", as_index=False).agg(
+                monto_pagos=("monto", "sum"),
+                n_asientos=("move_id", "nunique") if "move_id" in pagos_sin_nit.columns else ("monto", "count"),
+            )
+            resumen["nombre"] = resumen["partner_id"].map(
+                lambda p: partners_info.get(int(p), {}).get("name", "")
+            )
+            diag["sin_nit"] = resumen[[
+                "partner_id", "nombre", "monto_pagos", "n_asientos",
+            ]].sort_values("monto_pagos", ascending=False).reset_index(drop=True)
+
+            # A.2) Detalle de cada asiento donde aparecen
+            detalle_cols = [c for c in [
+                "partner_id", "date", "move_id", "move_id_name",
+                "ref", "name",
+                "account_code", "account_name",
+                "debit", "credit", "monto",
+            ] if c in pagos_sin_nit.columns]
+            det = pagos_sin_nit[detalle_cols].copy()
+            det["nombre_tercero"] = det["partner_id"].map(
+                lambda p: partners_info.get(int(p), {}).get("name", "")
+            )
+            # Reordenar columnas
+            cols_order = ["partner_id", "nombre_tercero", "date"]
+            if "move_id_name" in det.columns:
+                cols_order.append("move_id_name")
+            elif "move_id" in det.columns:
+                cols_order.append("move_id")
+            if "ref" in det.columns:
+                cols_order.append("ref")
+            if "name" in det.columns:
+                cols_order.append("name")
+            if "account_code" in det.columns:
+                cols_order.append("account_code")
+            if "account_name" in det.columns:
+                cols_order.append("account_name")
+            cols_order.append("monto")
+            det = det[[c for c in cols_order if c in det.columns]]
+            det = det.sort_values(["partner_id", "date"]).reset_index(drop=True)
+            diag["sin_nit_detalle"] = det
+        else:
+            diag["sin_nit"] = pd.DataFrame()
+            diag["sin_nit_detalle"] = pd.DataFrame()
 
     # === B) Retenciones HUÉRFANAS: con tercero pero sin pago en el mismo asiento ===
     if not rets.empty and "move_id" in rets.columns:
