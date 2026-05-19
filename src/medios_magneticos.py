@@ -27,12 +27,97 @@ NOTAS:
 """
 from __future__ import annotations
 
+import re
 from datetime import date
 from typing import Optional
 
 import pandas as pd
 
 from .financial_statements import enrich_chart_with_puc
+
+
+# Patrones regex para extraer cédula/NIT desde texto libre (ref del asiento,
+# nombre de línea, etc.). Importante para casos donde el partner no tiene
+# documento registrado en su ficha pero la cédula aparece en la referencia.
+#
+# Ejemplos que matchean:
+#   "Nomina de 1077468686-01"         → 1077468686
+#   "Pago nómina CC 1077468686"       → 1077468686
+#   "Factura proveedor NIT 900123456" → 900123456
+#   "C.C. 52123456"                   → 52123456
+_PATRONES_DOC = [
+    re.compile(r"(?:nomina\s+de\s+|nómina\s+de\s+)(\d{6,15})", re.IGNORECASE),
+    re.compile(r"(?:^|\W)(?:c\.?\s*c\.?|cc|cedula|cédula)[\s:.\-]*(\d{6,15})", re.IGNORECASE),
+    re.compile(r"(?:^|\W)(?:nit|n\.?i\.?t\.?)[\s:.\-]*(\d{6,15})", re.IGNORECASE),
+    re.compile(r"(?:^|\W)(?:c\.?\s*e\.?|ce)[\s:.\-]*(\d{6,15})", re.IGNORECASE),
+]
+
+
+def _extract_doc_from_text(text: str) -> str:
+    """
+    Intenta extraer una cédula/NIT desde texto libre (referencia, descripción).
+    Devuelve el número o cadena vacía si no encuentra.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+    s = text.strip()
+    if not s or s.lower() == "false":
+        return ""
+    for pat in _PATRONES_DOC:
+        m = pat.search(s)
+        if m:
+            doc = m.group(1)
+            # Validar longitud razonable (cédula CO: 6-10 dígitos, NIT: 9-10)
+            if 6 <= len(doc) <= 15:
+                return doc
+    return ""
+
+
+def _inferir_documentos_desde_refs(moves: pd.DataFrame) -> dict[int, str]:
+    """
+    Construye un dict {partner_id: cedula_inferida} a partir de los campos
+    `ref` y `name` (descripción de la línea) de los movimientos.
+
+    Para cada partner_id, busca el primer texto donde aparezca un patrón
+    de documento válido. Si encuentra varios distintos, usa el más
+    frecuente (probabilidad de ser el correcto).
+    """
+    if moves is None or moves.empty or "partner_id" not in moves.columns:
+        return {}
+
+    # Construir texto combinado por partner_id desde varios campos
+    text_cols = [c for c in ["ref", "name", "move_id_name"] if c in moves.columns]
+    if not text_cols:
+        return {}
+
+    # Para cada partner_id, recolectar candidatos
+    candidates: dict[int, list[str]] = {}
+    sub = moves[moves["partner_id"].notna()].copy()
+    for _, row in sub.iterrows():
+        try:
+            pid = int(row["partner_id"])
+        except (TypeError, ValueError):
+            continue
+        for col in text_cols:
+            val = row.get(col)
+            doc = _extract_doc_from_text(str(val) if val else "")
+            if doc:
+                candidates.setdefault(pid, []).append(doc)
+                break  # un doc por línea, no replicar
+
+    # Para cada partner, escoger el documento más frecuente
+    result: dict[int, str] = {}
+    for pid, docs in candidates.items():
+        if not docs:
+            continue
+        # Conteo de frecuencias
+        counter: dict[str, int] = {}
+        for d in docs:
+            counter[d] = counter.get(d, 0) + 1
+        # Tomar el más frecuente
+        best = max(counter.items(), key=lambda kv: kv[1])
+        result[pid] = best[0]
+    return result
 
 
 def _enrich_moves_with_puc(
@@ -388,6 +473,10 @@ def build_formato_1001(
     # Enriquecer con clasificación PUC robusta (igual que Estados Financieros)
     df = _enrich_moves_with_puc(df, chart)
 
+    # Inferir documentos desde refs/descripciones para partners sin doc
+    # en su ficha (ej: empleados con cédula en "Nomina de XXXXXXXXXX-01")
+    docs_inferidos = _inferir_documentos_desde_refs(df)
+
     # Filtrar pagos a terceros: usa puc_group (más robusto que el code)
     pagos_mask = df["puc_group"].isin(["5", "6"]) | (
         df["account_code"].str.startswith("143")
@@ -453,6 +542,16 @@ def build_formato_1001(
             except Exception:  # noqa: BLE001
                 p = {}
             t = _row_tercero(p)
+            # Si el partner NO tiene documento en su ficha pero sí lo
+            # inferimos desde la referencia del asiento (ej. nóminas),
+            # usar la cédula inferida.
+            if not t.get("numero_doc"):
+                doc_inferido = docs_inferidos.get(int(pid), "")
+                if doc_inferido:
+                    t["numero_doc"] = doc_inferido
+                    # Si no era empresa, asumimos cédula
+                    if not p.get("is_company", False):
+                        t["tipo_doc"] = "13"
             row = {
                 **t,
                 "partner_id": int(pid) if pid is not None else None,
@@ -505,6 +604,9 @@ def diagnosticar_formato_1001(
         return {}
     df = _enrich_moves_with_puc(df, chart)
 
+    # Inferir cédulas desde refs (nóminas y similares)
+    docs_inferidos = _inferir_documentos_desde_refs(df)
+
     # 1) Pagos a terceros
     pagos = df[
         df["puc_group"].isin(["5", "6"]) & df["partner_id"].notna()
@@ -539,9 +641,13 @@ def diagnosticar_formato_1001(
             # Usar _get_partner_document que revisa varios campos (vat,
             # l10n_co_document_number, identification_document, ref)
             doc = _get_partner_document(p)
+            doc_inferido = docs_inferidos.get(int(pid), "")
+            # Si tiene doc en ficha O lo inferimos de la referencia, OK
+            doc_efectivo = doc or doc_inferido
             partners_info[int(pid)] = {
                 "name": p.get("name", "(sin nombre)"),
-                "documento": doc,
+                "documento": doc_efectivo,
+                "doc_inferido_ref": doc_inferido,
                 "vat": (p.get("vat") or "").strip() if str(p.get("vat", "")).lower() != "false" else "",
                 "l10n_co_doc": (p.get("l10n_co_document_number") or "") if str(p.get("l10n_co_document_number", "")).lower() != "false" else "",
                 "ref": (p.get("ref") or "") if str(p.get("ref", "")).lower() != "false" else "",
@@ -550,7 +656,7 @@ def diagnosticar_formato_1001(
                 "is_company": p.get("is_company", False),
                 "active": p.get("active", True),
             }
-            if not doc:
+            if not doc_efectivo:
                 partners_sin_nit_ids.add(int(pid))
 
         # A.1) Resumen: total pagos por partner sin NIT
