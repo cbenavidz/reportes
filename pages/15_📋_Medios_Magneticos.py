@@ -22,13 +22,12 @@ import streamlit as st
 
 from src.auth import logout_button, require_auth
 from src.data_loader import (
+    get_odoo_client,
     load_account_movements,
     load_chart_of_accounts,
     load_companies,
 )
 from src.extractor import extract_partners
-from src.odoo_client import OdooClient
-from src.secrets_loader import load_environment
 from src.medios_magneticos import (
     build_formato_1001,
     build_formato_1003,
@@ -160,8 +159,7 @@ if st.button(
 
         # 3. Partners (terceros)
         try:
-            load_environment()
-            client = OdooClient.from_env()
+            client = get_odoo_client()
             partners_df = extract_partners(
                 client,
                 company_ids=list(filters["company_ids"])
