@@ -533,9 +533,15 @@ st.markdown("---")
 with st.spinner("Construyendo serie mensual..."):
     chart_e = enrich_chart_with_puc(chart_df)
 
-    # Identificar IDs de cuentas 14 (Inventarios) UNA sola vez
+    # Identificar IDs de cuentas 14 (Inventarios) UNA sola vez.
+    # Misma estrategia robusta que `_saldo_cuenta_14_from_balances`:
+    # primero por código (14xx), después por puc_subgroup, después por
+    # account_type (stock/inventory).
     chart_e_copy = chart_e.copy()
-    chart_e_copy["code_str"] = chart_e_copy.get("code", "").astype(str)
+    if "code" in chart_e_copy.columns:
+        chart_e_copy["code_str"] = chart_e_copy["code"].astype(str)
+    else:
+        chart_e_copy["code_str"] = ""
     inv_mask = chart_e_copy["code_str"].str.startswith("14")
     if not inv_mask.any() and "puc_subgroup" in chart_e_copy.columns:
         inv_mask = chart_e_copy["puc_subgroup"].astype(str) == "14"
@@ -543,9 +549,21 @@ with st.spinner("Construyendo serie mensual..."):
         inv_mask = chart_e_copy["account_type"].astype(str).str.contains(
             "stock|inventory", case=False, na=False,
         )
-    inv_account_ids: tuple[int, ...] = tuple(
-        int(i) for i in chart_e_copy.loc[inv_mask, "id"].dropna().unique()
-    ) if "id" in chart_e_copy.columns else ()
+    if "id" in chart_e_copy.columns:
+        inv_account_ids: tuple[int, ...] = tuple(
+            int(i) for i in chart_e_copy.loc[inv_mask, "id"].dropna().unique()
+        )
+    else:
+        inv_account_ids = ()
+
+    # Diagnóstico visible si no se encontraron cuentas
+    if not inv_account_ids:
+        st.warning(
+            "⚠️ No se encontraron cuentas de inventario en el plan de "
+            "cuentas. Verifica que existan cuentas con código que empiece "
+            "con '14' o con account_type tipo 'stock'/'inventory'. "
+            f"Columnas disponibles en chart: {list(chart_e_copy.columns)}"
+        )
 
     # Saldos mensuales en 1 sola consulta (read_group + cumsum)
     saldo_mes_df = load_inventory_balance_monthly_series(
