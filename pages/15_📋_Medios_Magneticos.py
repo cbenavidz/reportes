@@ -158,14 +158,36 @@ if st.button(
             company_ids=filters["company_ids"],
         )
 
-        # 3. Partners (terceros)
+        # 3. Partners (terceros) — IMPORTANTE: traer TODOS los que aparezcan
+        # en movimientos (clientes Y proveedores Y empleados). El default de
+        # extract_partners es only_customers=True, lo que excluye proveedores.
+        # Para garantizar que TODOS los terceros usados en asientos contables
+        # del año fiscal aparezcan, extraemos sus IDs de los moves y pedimos
+        # exactamente esos al extractor (modo partner_ids).
         try:
             client = get_odoo_client()
-            partners_df = extract_partners(
-                client,
-                company_ids=list(filters["company_ids"])
-                if filters["company_ids"] else None,
-            )
+            partner_ids_en_moves = set()
+            for df_src in (moves_year, moves_to_eoy):
+                if df_src is not None and not df_src.empty and "partner_id" in df_src.columns:
+                    ids = df_src["partner_id"].dropna().unique().tolist()
+                    partner_ids_en_moves.update(int(i) for i in ids if i)
+            partner_ids_list = list(partner_ids_en_moves)
+
+            if partner_ids_list:
+                # Modo: pedir EXACTAMENTE esos IDs (ignora only_customers
+                # y filtros de active/company_id internamente).
+                partners_df = extract_partners(
+                    client,
+                    partner_ids=partner_ids_list,
+                )
+            else:
+                # Fallback: traer clientes + proveedores activos
+                partners_df = extract_partners(
+                    client,
+                    only_customers=False,
+                    company_ids=list(filters["company_ids"])
+                    if filters["company_ids"] else None,
+                )
         except Exception as exc:  # noqa: BLE001
             st.error(f"Error cargando partners: {exc}")
             partners_df = pd.DataFrame()
