@@ -1388,7 +1388,10 @@ def fetch_meta_instagram_data(
         ("accounts_engaged", "cuentas_engagement"),
         ("profile_views", "vistas_perfil"),
         ("website_clicks", "clicks_web"),
-        ("follower_count", "nuevos_seguidores_total"),
+        # follower_count requiere time-series (lo maneja
+        # _fetch_metric_total_value_chunk internamente). Devuelve NUEVOS
+        # seguidores netos del mes (suma de los diarios).
+        ("follower_count", "nuevos_seguidores_mes"),
         ("likes", "likes_cuenta"),
         ("comments", "comentarios_cuenta"),
         ("shares", "compartidos_cuenta"),
@@ -1457,6 +1460,8 @@ def fetch_meta_instagram_data(
 
     df["compartidos"] = 0  # se llena abajo con métrica agregada de cuenta
     df["engagement"] = df.get("likes", 0) + df.get("comentarios", 0)
+    # `seguidores` se reconstruye por mes más abajo (con la inyección mensual)
+    # — aquí solo lo pre-llenamos con el snapshot actual como default.
     df["seguidores"] = period_totals.get("seguidores_actual", 0)
 
     # Inyectar métricas POR MES: agregar una fila virtual por cada mes
@@ -1482,6 +1487,21 @@ def fetch_meta_instagram_data(
         if use_account_shares:
             df["compartidos"] = 0
 
+        # Reconstruir seguidores hacia atrás: saldo = snapshot - sum(nuevos
+        # seguidores de meses MÁS RECIENTES que este mes)
+        seguidores_snapshot = period_totals.get("seguidores_actual", 0)
+        # Ordenar meses descendente para reconstruir
+        meses_ordenados = sorted(by_month.keys(), reverse=True)
+        seguidores_por_mes: dict[date, int] = {}
+        saldo = seguidores_snapshot
+        for mes in meses_ordenados:
+            # Al CIERRE de este mes, los seguidores son el saldo actual
+            seguidores_por_mes[mes] = saldo
+            # Para el mes anterior, restar los nuevos seguidores ganados
+            # en ESTE mes (porque al inicio del mes el saldo era menor)
+            nuevos_este_mes = int(by_month[mes].get("nuevos_seguidores_mes", 0))
+            saldo -= nuevos_este_mes
+
         # Construir filas mensuales y agregarlas al df
         new_rows = []
         for month_end_date, vals in by_month.items():
@@ -1492,9 +1512,15 @@ def fetch_meta_instagram_data(
             new_row["vistas_perfil"] = vals.get("vistas_perfil", 0)
             new_row["clicks_web"] = vals.get("clicks_web", 0)
             new_row["cuentas_engagement"] = vals.get("cuentas_engagement", 0)
-            new_row["nuevos_seguidores_total"] = vals.get("nuevos_seguidores_total", 0)
+            new_row["nuevos_seguidores_total"] = vals.get(
+                "nuevos_seguidores_mes", 0
+            )
             new_row["guardados"] = vals.get("guardados", 0)
             new_row["interacciones_totales"] = vals.get("interacciones_totales", 0)
+            # Seguidores: valor reconstruido para ese mes (NO snapshot constante)
+            new_row["seguidores"] = seguidores_por_mes.get(
+                month_end_date, seguidores_snapshot
+            )
             # Si usamos métricas de cuenta para likes/comments/shares, inyectar
             if use_account_likes:
                 new_row["likes"] = vals.get("likes_cuenta", 0)
