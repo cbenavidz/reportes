@@ -365,6 +365,39 @@ CONCEPTOS_1009_POR_PUC: dict[str, str] = {
 }
 
 
+# Descripciones de los conceptos DIAN para que el Excel sea legible.
+# (Referenciales — verifique contra la resolución DIAN del año gravable.)
+CONCEPTOS_DESCRIPCION: dict[str, str] = {
+    # Formato 1001 — pagos
+    "5001": "Salarios, prestaciones y demás pagos laborales",
+    "5002": "Honorarios",
+    "5003": "Comisiones",
+    "5004": "Servicios",
+    "5005": "Arrendamientos",
+    "5006": "Intereses y rendimientos financieros",
+    "5007": "Otros costos y deducciones",
+    "5009": "Compra de bienes raíces / mercancías",
+    "5010": "Compra de activos fijos",
+    "5011": "Aportes seguridad social en salud",
+    "5012": "Aportes a pensiones obligatorias",
+    "5016": "Demás costos y deducciones",
+    # Formato 1007 — ingresos
+    "4001": "Ingresos operacionales (venta de bienes/servicios)",
+    "4002": "Otros ingresos",
+    # Formato 1009 — cuentas por pagar
+    "1301": "Saldo a favor de proveedores",
+    "1304": "Acreedores varios",
+    "1306": "Costos y gastos por pagar",
+}
+
+
+def _descripcion_concepto(concepto: str) -> str:
+    """Devuelve la descripción legible de un concepto DIAN."""
+    if concepto is None:
+        return ""
+    return CONCEPTOS_DESCRIPCION.get(str(concepto).strip(), "")
+
+
 def _get_concepto(account_code: str, mapping: dict) -> str:
     """Mapea código PUC a concepto DIAN usando el mapeo dado."""
     if not account_code:
@@ -664,6 +697,7 @@ def build_formato_1001(
                 **t,
                 "partner_id": int(pid) if pid is not None else None,
                 "concepto": r["concepto"],
+                "concepto_desc": _descripcion_concepto(r["concepto"]),
                 "pago_deducible": round(float(r["pago_deducible"]), 0),
                 "pago_no_deducible": 0,
                 "ret_fuente_renta": round(float(r["ret_fuente_renta"]), 0),
@@ -1756,6 +1790,7 @@ SCHEMA_POR_FORMATO: dict[str, list[tuple[str, str, str]]] = {
     # (col_interna, col_dian, tipo: 'money' | 'text' | 'int' | 'pct')
     "1001": [
         ("concepto", "Concepto", "text"),
+        ("concepto_desc", "Descripción Concepto", "text"),
         ("pago_deducible", "Pago o Abono Deducible", "money"),
         ("pago_no_deducible", "Pago o Abono No Deducible", "money"),
         ("ret_fuente_renta", "Retención en la Fuente Renta", "money"),
