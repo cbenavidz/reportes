@@ -191,6 +191,38 @@ def _enrich_moves_with_puc(
         if col in df.columns:
             df[col] = df[col].replace({False: None, "False": None})
             df[col] = df[col].fillna("").astype(str)
+
+    # FALLBACK: si account_code quedó vacío pero account_id_name SÍ existe,
+    # extraer el código del display_name de la cuenta. Odoo formatea como
+    # "510515 Sueldos" o "1305 - Deudores nacionales". Tomamos los dígitos
+    # iniciales (típicamente 4-10 dígitos).
+    if "account_code" in df.columns and "account_id_name" in df.columns:
+        codigo_vacio = df["account_code"].astype(str).isin(["", "False", "nan", "None"])
+        if codigo_vacio.any():
+            def _extraer_codigo(nombre):
+                if not nombre or str(nombre).lower() in ("false", "nan", "none"):
+                    return ""
+                s = str(nombre).strip()
+                m = re.match(r"^(\d{4,15})\b", s)
+                return m.group(1) if m else ""
+            df.loc[codigo_vacio, "account_code"] = df.loc[
+                codigo_vacio, "account_id_name"
+            ].apply(_extraer_codigo)
+
+    # FALLBACK 2: si account_name quedó vacío, usar account_id_name limpio
+    if "account_name" in df.columns and "account_id_name" in df.columns:
+        nombre_vacio = df["account_name"].astype(str).isin(["", "False", "nan", "None"])
+        if nombre_vacio.any():
+            def _limpiar_nombre(nombre):
+                if not nombre or str(nombre).lower() in ("false", "nan", "none"):
+                    return ""
+                s = str(nombre).strip()
+                # Quitar el código inicial ("510515 Sueldos" → "Sueldos")
+                return re.sub(r"^\d{4,15}\s*[-:]?\s*", "", s).strip()
+            df.loc[nombre_vacio, "account_name"] = df.loc[
+                nombre_vacio, "account_id_name"
+            ].apply(_limpiar_nombre)
+
     return df
 
 
