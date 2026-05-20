@@ -550,7 +550,7 @@ ACCOUNT_MOVEMENTS_CACHE_VERSION = 3  # v3: incluir move_type para filtrar factur
 @st.cache_data(ttl=900, show_spinner="Descargando plan de cuentas...")
 def load_chart_of_accounts(
     company_ids: tuple[int, ...] | None = None,
-    _cache_v: int = 4,  # v4: refetch de códigos vacíos vía read() + display_name
+    _cache_v: int = 6,  # v6: code_mapping_ids + diagnóstico por estrategia
 ) -> "pd.DataFrame":
     """Descarga plan de cuentas (account.account)."""
     from .extractor import extract_chart_of_accounts

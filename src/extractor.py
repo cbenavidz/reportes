@@ -1127,81 +1127,239 @@ def extract_chart_of_accounts(
 
     # ─────────────────────────────────────────────────────────────────────
     # FIX Odoo 17+/19 con localización CO: el campo `code` de account.account
-    # puede venir como False vía XML-RPC porque ahora es per-company
-    # (`code_mapping_ids`). Si detectamos que muchos códigos vienen False,
-    # forzamos un read() adicional con company-context para extraer codes,
-    # y como fallback extraemos del display_name (formato "510515 Sueldos").
+    # es per-company. En Odoo 17+ se movió a un modelo aparte
+    # `account.code.mapping` (one2many code_mapping_ids). Por XML-RPC,
+    # `code` directo viene como False para muchas cuentas.
+    #
+    # Estrategia en cascada:
+    #   1) Consultar account.code.mapping si existe (Odoo 17+)
+    #   2) Refetch read() con allowed_company_ids context
+    #   3) Parsear de display_name (fallback final)
     # ─────────────────────────────────────────────────────────────────────
     if "code" in df.columns:
-        # Normalizar: False → None, luego ver cuántos quedan vacíos
+        # Normalizar: False → None
         df["code"] = df["code"].replace({False: None})
-        nulos = df["code"].isna().sum()
-        if nulos > 0:
+    else:
+        df["code"] = None
+
+    # Diagnóstico: contar resoluciones por estrategia
+    diag = {"inicial_vacios": int(df["code"].isna().sum()),
+            "via_mapping_directo": 0,
+            "via_code_mapping_ids": 0,
+            "via_read_context": 0,
+            "via_display_name": 0,
+            "via_name_regex": 0}
+
+    # ── ESTRATEGIA 1A: leer code_mapping_ids desde account.account ──
+    # En Odoo 17+/19 account.account tiene un one2many code_mapping_ids
+    # apuntando a account.code.mapping con {account_id, code, company_id}.
+    # Esta es la fuente AUTORITATIVA per-company. Pedimos los IDs de
+    # mapping primero, después los leemos.
+    try:
+        all_ids = df["id"].astype(int).tolist()
+        accs_with_mapping = client.read(
+            "account.account",
+            all_ids,
+            fields=["id", "code_mapping_ids"],
+        )
+        mapping_ids_to_read: list[int] = []
+        for r in (accs_with_mapping or []):
+            mids = r.get("code_mapping_ids")
+            if isinstance(mids, list):
+                mapping_ids_to_read.extend(int(x) for x in mids if x)
+        if mapping_ids_to_read:
             logger.info(
-                "Plan de cuentas: %d/%d códigos vinieron vacíos. "
-                "Intentando refetch con display_name...",
-                nulos, len(df),
+                "code_mapping_ids: %d IDs de mapping encontrados, leyendo...",
+                len(mapping_ids_to_read),
             )
-            # Pedir display_name vía read() (más confiable que search_read
-            # para campos computados/per-company)
-            try:
-                ids_to_refetch = df.loc[df["code"].isna(), "id"].astype(int).tolist()
-                ctx = {}
-                if company_ids_clean:
-                    ctx["allowed_company_ids"] = company_ids_clean
-                    ctx["force_company"] = company_ids_clean[0]
-                extra = client.read(
-                    "account.account",
-                    ids_to_refetch,
-                    fields=["id", "code", "display_name"],
-                    context=ctx or None,
+            # Leer los mapping records (probamos múltiples nombres de modelo)
+            mappings = []
+            for model_name in ("account.code.mapping", "account.account.code.mapping"):
+                try:
+                    mappings = client.read(
+                        model_name,
+                        mapping_ids_to_read,
+                        fields=["account_id", "code", "company_id"],
+                    )
+                    if mappings:
+                        logger.info("Modelo %s respondió con %d registros.",
+                                    model_name, len(mappings))
+                        break
+                except Exception as e:  # noqa: BLE001
+                    logger.info("Modelo %s no funcionó: %s", model_name, e)
+                    continue
+            # Construir dict {account_id: code} priorizando company_ids_clean
+            code_map: dict[int, str] = {}
+            code_map_company_priority: dict[int, str] = {}
+            for m in (mappings or []):
+                acc = m.get("account_id")
+                code_val = m.get("code")
+                comp = m.get("company_id")
+                if isinstance(acc, list) and len(acc) >= 1:
+                    acc_id = int(acc[0])
+                else:
+                    try:
+                        acc_id = int(acc) if acc else None
+                    except (TypeError, ValueError):
+                        acc_id = None
+                if isinstance(comp, list) and len(comp) >= 1:
+                    comp_id = int(comp[0])
+                else:
+                    try:
+                        comp_id = int(comp) if comp else None
+                    except (TypeError, ValueError):
+                        comp_id = None
+                if not acc_id or not code_val or str(code_val).lower() == "false":
+                    continue
+                code_str = str(code_val).strip()
+                # Prioridad: primero los de empresas seleccionadas, después cualquier otro
+                if company_ids_clean and comp_id in company_ids_clean:
+                    code_map_company_priority[acc_id] = code_str
+                else:
+                    code_map.setdefault(acc_id, code_str)
+            # Merge — priority gana
+            final_map = {**code_map, **code_map_company_priority}
+            if final_map:
+                df["code"] = df.apply(
+                    lambda r: final_map.get(int(r["id"])) or r.get("code"),
+                    axis=1,
                 )
-                extra_map: dict[int, dict] = {
-                    int(r["id"]): r for r in (extra or [])
-                }
-
-                def _resolve_code(row):
-                    rid = int(row["id"])
-                    rec = extra_map.get(rid, {})
-                    # 1) code directo si vino con read()
-                    c = rec.get("code")
-                    if c and str(c).lower() != "false":
-                        return str(c).strip()
-                    # 2) extraer del display_name
-                    dn = rec.get("display_name") or ""
-                    if dn and str(dn).lower() != "false":
-                        s = str(dn).strip()
-                        # "510515 Sueldos" o "510515-Sueldos" o "510515 - Sueldos"
-                        m = re.match(r"^\s*(\d{4,15})\b", s)
-                        if m:
-                            return m.group(1)
-                        # "[510515] Sueldos"
-                        m = re.match(r"^\s*\[\s*(\d{4,15})\s*\]", s)
-                        if m:
-                            return m.group(1)
-                    # 3) último intento: parsear del campo name si está
-                    n = row.get("name") or ""
-                    if n and str(n).lower() != "false":
-                        m = re.match(r"^\s*(\d{4,15})\b", str(n).strip())
-                        if m:
-                            return m.group(1)
-                    return None
-
-                df.loc[df["code"].isna(), "code"] = df.loc[
-                    df["code"].isna()
-                ].apply(_resolve_code, axis=1)
-                aun_nulos = df["code"].isna().sum()
+                diag["via_code_mapping_ids"] = len(final_map)
                 logger.info(
-                    "Tras refetch: %d códigos resueltos, %d siguen vacíos.",
-                    nulos - aun_nulos, aun_nulos,
+                    "code_mapping_ids resolvió: %d cuentas.", len(final_map),
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(
-                    "Refetch de códigos con display_name falló: %s. "
-                    "Se mantiene el chart parcial.", exc,
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Lectura de code_mapping_ids falló: %s", exc,
+        )
+
+    # ── ESTRATEGIA 1B (fallback): search_read directo en account.code.mapping ──
+    nulos_tras_1a = df["code"].isna().sum()
+    if nulos_tras_1a > 0:
+        try:
+            mapping_domain = []
+            if company_ids_clean:
+                mapping_domain = [("company_id", "in", company_ids_clean)]
+            mappings2 = client.search_read(
+                "account.code.mapping",
+                domain=mapping_domain,
+                fields=["account_id", "code", "company_id"],
+            )
+            if mappings2:
+                logger.info(
+                    "search_read account.code.mapping: %d encontrados.",
+                    len(mappings2),
                 )
-        # Garantizar string para downstream
-        df["code"] = df["code"].fillna("").astype(str)
+                code_map2: dict[int, str] = {}
+                for m in mappings2:
+                    acc = m.get("account_id")
+                    code_val = m.get("code")
+                    if isinstance(acc, list) and len(acc) >= 1:
+                        acc_id = int(acc[0])
+                    else:
+                        try:
+                            acc_id = int(acc) if acc else None
+                        except (TypeError, ValueError):
+                            acc_id = None
+                    if acc_id and code_val and str(code_val).lower() != "false":
+                        code_map2[acc_id] = str(code_val).strip()
+                if code_map2:
+                    before = int(df["code"].isna().sum())
+                    df["code"] = df.apply(
+                        lambda r: r.get("code") if (r.get("code") and pd.notna(r.get("code")))
+                        else code_map2.get(int(r["id"])),
+                        axis=1,
+                    )
+                    diag["via_mapping_directo"] = before - int(df["code"].isna().sum())
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "search_read account.code.mapping no disponible: %s", exc,
+            )
+
+    # ── ESTRATEGIA 2 + 3: read() + display_name (si quedan vacíos) ──
+    nulos = int(df["code"].isna().sum())
+    if nulos > 0:
+        logger.info(
+            "Plan de cuentas: %d/%d códigos aún vacíos tras mapping. "
+            "Probando read() con company context...",
+            nulos, len(df),
+        )
+        try:
+            ids_to_refetch = df.loc[df["code"].isna(), "id"].astype(int).tolist()
+            ctx = {}
+            if company_ids_clean:
+                ctx["allowed_company_ids"] = company_ids_clean
+                ctx["force_company"] = company_ids_clean[0]
+            extra = client.read(
+                "account.account",
+                ids_to_refetch,
+                fields=["id", "code", "display_name"],
+                context=ctx or None,
+            )
+            extra_map: dict[int, dict] = {
+                int(r["id"]): r for r in (extra or [])
+            }
+
+            def _resolve_code(row):
+                rid = int(row["id"])
+                rec = extra_map.get(rid, {})
+                # 1) code directo (vía read con context)
+                c = rec.get("code")
+                if c and str(c).lower() != "false":
+                    return ("ctx", str(c).strip())
+                # 2) display_name "510515 Sueldos" / "[510515] Sueldos"
+                dn = rec.get("display_name") or ""
+                if dn and str(dn).lower() != "false":
+                    s = str(dn).strip()
+                    m = re.match(r"^\s*(\d{4,15})\b", s)
+                    if m:
+                        return ("display_name", m.group(1))
+                    m = re.match(r"^\s*\[\s*(\d{4,15})\s*\]", s)
+                    if m:
+                        return ("display_name", m.group(1))
+                # 3) name como último recurso
+                n = row.get("name") or ""
+                if n and str(n).lower() != "false":
+                    m = re.match(r"^\s*(\d{4,15})\b", str(n).strip())
+                    if m:
+                        return ("name_regex", m.group(1))
+                return ("none", None)
+
+            counters = {"ctx": 0, "display_name": 0, "name_regex": 0, "none": 0}
+
+            def _apply_resolve(row):
+                source, val = _resolve_code(row)
+                counters[source] += 1
+                return val
+
+            df.loc[df["code"].isna(), "code"] = df.loc[
+                df["code"].isna()
+            ].apply(_apply_resolve, axis=1)
+            diag["via_read_context"] = counters["ctx"]
+            diag["via_display_name"] = counters["display_name"]
+            diag["via_name_regex"] = counters["name_regex"]
+            aun_nulos = int(df["code"].isna().sum())
+            logger.info(
+                "Tras refetch read()+display_name: ctx=%d display=%d name=%d, "
+                "%d aún vacíos.",
+                counters["ctx"], counters["display_name"], counters["name_regex"],
+                aun_nulos,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Refetch read() falló: %s. Se mantiene chart parcial.", exc,
+            )
+
+    # Garantizar string para downstream
+    df["code"] = df["code"].fillna("").astype(str)
+    diag["finales_vacios"] = int((df["code"].astype(str) == "").sum())
+    diag["total_cuentas"] = int(len(df))
+
+    # Guardar diagnóstico en attrs (pandas mantiene esto a través de operaciones simples)
+    try:
+        df.attrs["chart_code_diag"] = diag
+    except Exception:  # noqa: BLE001
+        pass
 
     # Primer dígito del código → grupo PUC colombiano
     df["puc_grupo"] = df["code"].astype(str).str[0]

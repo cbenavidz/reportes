@@ -130,12 +130,24 @@ if not seleccionados:
     st.stop()
 
 
+# ── Botones de control ──
+ccol1, ccol2 = st.columns([3, 1])
+with ccol2:
+    if st.button("🗑️ Limpiar caché", use_container_width=True,
+                 help="Fuerza recarga del plan de cuentas y movimientos."):
+        st.cache_data.clear()
+        st.success("Caché limpiado. Vuelve a generar el reporte.")
+        st.rerun()
+
 # ── Botón generar ──
-if st.button(
-    f"🔄 Generar reporte año {year_fiscal}",
-    type="primary",
-    use_container_width=True,
-):
+with ccol1:
+    generar_btn = st.button(
+        f"🔄 Generar reporte año {year_fiscal}",
+        type="primary",
+        use_container_width=True,
+    )
+
+if generar_btn:
     fecha_desde = date(year_fiscal, 1, 1)
     fecha_hasta = date(year_fiscal, 12, 31)
 
@@ -246,12 +258,54 @@ if st.button(
                     f"📚 Plan de cuentas: {total_cuentas:,} cuentas, "
                     f"{total_cuentas - codes_vacios:,} con código."
                 )
+
+            # Diagnóstico detallado: qué estrategia resolvió los códigos
+            diag_chart = getattr(chart_df, "attrs", {}).get("chart_code_diag") or {}
+            if diag_chart:
+                with st.expander(
+                    "🔬 Diagnóstico técnico: ¿cómo se resolvieron los códigos?",
+                    expanded=(pct_vacios > 30),
+                ):
+                    dcol1, dcol2, dcol3 = st.columns(3)
+                    with dcol1:
+                        st.metric("Total cuentas", diag_chart.get("total_cuentas", 0))
+                        st.metric("Inicial sin código",
+                                  diag_chart.get("inicial_vacios", 0))
+                    with dcol2:
+                        st.metric("Resueltos por code_mapping_ids",
+                                  diag_chart.get("via_code_mapping_ids", 0))
+                        st.metric("Resueltos por search_read mapping",
+                                  diag_chart.get("via_mapping_directo", 0))
+                    with dcol3:
+                        st.metric("Resueltos por read() con context",
+                                  diag_chart.get("via_read_context", 0))
+                        st.metric("Resueltos por regex display_name",
+                                  diag_chart.get("via_display_name", 0)
+                                  + diag_chart.get("via_name_regex", 0))
+                    if diag_chart.get("finales_vacios", 0) > 0:
+                        st.error(
+                            f"❌ {diag_chart.get('finales_vacios')} cuentas "
+                            "quedaron SIN código después de las 4 estrategias. "
+                            "Probablemente son cuentas auxiliares sin nombre "
+                            "ni código en Odoo. Estas no aparecerán en la "
+                            "columna `cuentas_contables`."
+                        )
+                    else:
+                        st.success(
+                            "✅ Todas las cuentas resolvieron un código."
+                        )
+
             # Mostrar muestra del chart en expander para auditar
             with st.expander("🔍 Ver muestra del plan de cuentas (auditoría)"):
                 muestra_cols = [c for c in ["id", "code", "name", "account_type"]
                                if c in chart_df.columns]
+                # Mostrar primero las que tienen código vacío
+                df_show = chart_df[muestra_cols].copy()
+                df_show["_sin_code"] = df_show["code"].astype(str).isin(["", "False", "nan", "None"])
+                df_show = df_show.sort_values("_sin_code", ascending=False).drop(columns="_sin_code")
+                st.caption("Primeras 30 cuentas (priorizando las que tienen código vacío):")
                 st.dataframe(
-                    chart_df[muestra_cols].head(20),
+                    df_show.head(30),
                     use_container_width=True, hide_index=True,
                 )
 
