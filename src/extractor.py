@@ -1125,6 +1125,84 @@ def extract_chart_of_accounts(
                 lambda v: _unpack_m2o(v)[0] if isinstance(v, list) else None
             )
 
+    # ─────────────────────────────────────────────────────────────────────
+    # FIX Odoo 17+/19 con localización CO: el campo `code` de account.account
+    # puede venir como False vía XML-RPC porque ahora es per-company
+    # (`code_mapping_ids`). Si detectamos que muchos códigos vienen False,
+    # forzamos un read() adicional con company-context para extraer codes,
+    # y como fallback extraemos del display_name (formato "510515 Sueldos").
+    # ─────────────────────────────────────────────────────────────────────
+    if "code" in df.columns:
+        # Normalizar: False → None, luego ver cuántos quedan vacíos
+        df["code"] = df["code"].replace({False: None})
+        nulos = df["code"].isna().sum()
+        if nulos > 0:
+            logger.info(
+                "Plan de cuentas: %d/%d códigos vinieron vacíos. "
+                "Intentando refetch con display_name...",
+                nulos, len(df),
+            )
+            # Pedir display_name vía read() (más confiable que search_read
+            # para campos computados/per-company)
+            try:
+                ids_to_refetch = df.loc[df["code"].isna(), "id"].astype(int).tolist()
+                ctx = {}
+                if company_ids_clean:
+                    ctx["allowed_company_ids"] = company_ids_clean
+                    ctx["force_company"] = company_ids_clean[0]
+                extra = client.read(
+                    "account.account",
+                    ids_to_refetch,
+                    fields=["id", "code", "display_name"],
+                    context=ctx or None,
+                )
+                extra_map: dict[int, dict] = {
+                    int(r["id"]): r for r in (extra or [])
+                }
+
+                def _resolve_code(row):
+                    rid = int(row["id"])
+                    rec = extra_map.get(rid, {})
+                    # 1) code directo si vino con read()
+                    c = rec.get("code")
+                    if c and str(c).lower() != "false":
+                        return str(c).strip()
+                    # 2) extraer del display_name
+                    dn = rec.get("display_name") or ""
+                    if dn and str(dn).lower() != "false":
+                        s = str(dn).strip()
+                        # "510515 Sueldos" o "510515-Sueldos" o "510515 - Sueldos"
+                        m = re.match(r"^\s*(\d{4,15})\b", s)
+                        if m:
+                            return m.group(1)
+                        # "[510515] Sueldos"
+                        m = re.match(r"^\s*\[\s*(\d{4,15})\s*\]", s)
+                        if m:
+                            return m.group(1)
+                    # 3) último intento: parsear del campo name si está
+                    n = row.get("name") or ""
+                    if n and str(n).lower() != "false":
+                        m = re.match(r"^\s*(\d{4,15})\b", str(n).strip())
+                        if m:
+                            return m.group(1)
+                    return None
+
+                df.loc[df["code"].isna(), "code"] = df.loc[
+                    df["code"].isna()
+                ].apply(_resolve_code, axis=1)
+                aun_nulos = df["code"].isna().sum()
+                logger.info(
+                    "Tras refetch: %d códigos resueltos, %d siguen vacíos.",
+                    nulos - aun_nulos, aun_nulos,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "Refetch de códigos con display_name falló: %s. "
+                    "Se mantiene el chart parcial.", exc,
+                )
+        # Garantizar string para downstream
+        df["code"] = df["code"].fillna("").astype(str)
+
     # Primer dígito del código → grupo PUC colombiano
     df["puc_grupo"] = df["code"].astype(str).str[0]
     return df

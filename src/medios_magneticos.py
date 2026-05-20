@@ -193,21 +193,60 @@ def _enrich_moves_with_puc(
             df[col] = df[col].fillna("").astype(str)
 
     # FALLBACK: si account_code quedó vacío pero account_id_name SÍ existe,
-    # extraer el código del display_name de la cuenta. Odoo formatea como
-    # "510515 Sueldos" o "1305 - Deudores nacionales". Tomamos los dígitos
-    # iniciales (típicamente 4-10 dígitos).
+    # extraer el código del display_name de la cuenta. Probar múltiples
+    # formatos que Odoo puede usar:
+    #   "510515 Sueldos"      → 510515
+    #   "510515 - Sueldos"    → 510515
+    #   "510515-Sueldos"      → 510515
+    #   "[510515] Sueldos"    → 510515
+    #   "Sueldos (510515)"    → 510515
+    #   "Sueldos"             → "" (no recuperable)
     if "account_code" in df.columns and "account_id_name" in df.columns:
         codigo_vacio = df["account_code"].astype(str).isin(["", "False", "nan", "None"])
         if codigo_vacio.any():
+            patrones_codigo = [
+                re.compile(r"^\s*(\d{4,15})\b"),           # "510515 Sueldos"
+                re.compile(r"^\s*\[\s*(\d{4,15})\s*\]"),   # "[510515] Sueldos"
+                re.compile(r"\((\d{4,15})\)\s*$"),          # "Sueldos (510515)"
+                re.compile(r"\b(\d{4,15})\s*[-:]"),         # "510515-Sueldos"
+            ]
+
             def _extraer_codigo(nombre):
                 if not nombre or str(nombre).lower() in ("false", "nan", "none"):
                     return ""
                 s = str(nombre).strip()
-                m = re.match(r"^(\d{4,15})\b", s)
-                return m.group(1) if m else ""
+                for pat in patrones_codigo:
+                    m = pat.search(s)
+                    if m:
+                        return m.group(1)
+                return ""
+
             df.loc[codigo_vacio, "account_code"] = df.loc[
                 codigo_vacio, "account_id_name"
             ].apply(_extraer_codigo)
+
+        # SEGUNDO FALLBACK: usar account_name si todavía está vacío
+        codigo_vacio2 = df["account_code"].astype(str).isin(["", "False", "nan", "None"])
+        if codigo_vacio2.any() and "account_name" in df.columns:
+            patrones_codigo = [
+                re.compile(r"^\s*(\d{4,15})\b"),
+                re.compile(r"^\s*\[\s*(\d{4,15})\s*\]"),
+                re.compile(r"\((\d{4,15})\)\s*$"),
+            ]
+
+            def _extraer_codigo2(nombre):
+                if not nombre or str(nombre).lower() in ("false", "nan", "none"):
+                    return ""
+                s = str(nombre).strip()
+                for pat in patrones_codigo:
+                    m = pat.search(s)
+                    if m:
+                        return m.group(1)
+                return ""
+
+            df.loc[codigo_vacio2, "account_code"] = df.loc[
+                codigo_vacio2, "account_name"
+            ].apply(_extraer_codigo2)
 
     # FALLBACK 2: si account_name quedó vacío, usar account_id_name limpio
     if "account_name" in df.columns and "account_id_name" in df.columns:

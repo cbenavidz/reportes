@@ -224,6 +224,37 @@ if st.button(
             f"{len(partners_df):,} terceros."
         )
 
+    # ── Diagnóstico del plan de cuentas ──
+    # Verificar que los códigos de cuenta se cargaron correctamente.
+    # Si vienen mayormente vacíos (problema Odoo 17+ con localización CO),
+    # avisar al usuario antes de generar los formatos.
+    if chart_df is not None and not chart_df.empty:
+        codes_serie = chart_df["code"].astype(str) if "code" in chart_df.columns else pd.Series([])
+        codes_vacios = codes_serie.isin(["", "False", "nan", "None"]).sum() if len(codes_serie) else 0
+        total_cuentas = len(chart_df)
+        if total_cuentas > 0:
+            pct_vacios = codes_vacios / total_cuentas * 100
+            if pct_vacios > 30:
+                st.warning(
+                    f"⚠️ Plan de cuentas: {codes_vacios:,}/{total_cuentas:,} "
+                    f"({pct_vacios:.0f}%) sin código. Esto puede afectar la "
+                    "calidad del Formato 1001 (columna `cuentas_contables` "
+                    "podría salir vacía)."
+                )
+            else:
+                st.caption(
+                    f"📚 Plan de cuentas: {total_cuentas:,} cuentas, "
+                    f"{total_cuentas - codes_vacios:,} con código."
+                )
+            # Mostrar muestra del chart en expander para auditar
+            with st.expander("🔍 Ver muestra del plan de cuentas (auditoría)"):
+                muestra_cols = [c for c in ["id", "code", "name", "account_type"]
+                               if c in chart_df.columns]
+                st.dataframe(
+                    chart_df[muestra_cols].head(20),
+                    use_container_width=True, hide_index=True,
+                )
+
     # ── Construir formatos ──
     formatos: dict[str, pd.DataFrame] = {}
 
