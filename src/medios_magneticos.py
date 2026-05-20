@@ -184,10 +184,13 @@ def _enrich_moves_with_puc(
     else:
         df = df.merge(chart_min, on="account_id", how="left")
 
-    # Defaults seguros
-    df["account_code"] = df["account_code"].fillna("").astype(str)
-    df["puc_group"] = df["puc_group"].fillna("").astype(str)
-    df["puc_subgroup"] = df["puc_subgroup"].fillna("").astype(str)
+    # Defaults seguros — Odoo devuelve False (booleano) para valores
+    # nulos vía XML-RPC. fillna+astype convertiría a "False" literal,
+    # así que primero reemplazamos False por None y luego rellenamos.
+    for col in ("account_code", "account_name", "puc_group", "puc_subgroup"):
+        if col in df.columns:
+            df[col] = df[col].replace({False: None, "False": None})
+            df[col] = df[col].fillna("").astype(str)
     return df
 
 
@@ -1245,8 +1248,16 @@ def _enrich_with_partner(
 
 
 def _cuentas_unicas_agg(s: pd.Series) -> str:
-    """Helper: agrega códigos/nombres únicos separados por coma."""
-    vals = sorted({str(v).strip() for v in s.dropna() if str(v).strip()})
+    """Helper: agrega códigos/nombres únicos separados por coma.
+
+    Excluye valores vacíos, None y el literal "False" (que aparece
+    cuando Odoo devuelve campos nulos vía XML-RPC).
+    """
+    vals = sorted({
+        str(v).strip()
+        for v in s.dropna()
+        if str(v).strip() and str(v).strip().lower() != "false"
+    })
     return ", ".join(vals)
 
 
