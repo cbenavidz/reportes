@@ -281,6 +281,7 @@ def _enrich_moves_with_puc(
 #   5010 Compras de activos fijos diferentes a bienes raíces
 #   5011 Aportes a sistemas de seguridad social en salud
 #   5012 Aportes a pensiones obligatorias
+#   5016 Demás costos y deducciones (gastos diversos deducibles)
 #   ... (lista completa en resoluciones DIAN anuales)
 #
 # Mapeo simplificado por prefijo de cuenta PUC:
@@ -296,12 +297,23 @@ CONCEPTOS_1001_POR_PUC: dict[str, str] = {
     "5115": "5003",
     # Servicios técnicos / asistencia técnica / servicios generales
     "5135": "5004",  # Servicios → Servicios
-    "5140": "5004",
-    "5145": "5004",
-    "5150": "5004",
-    "5155": "5004",
-    "5160": "5004",
-    "5165": "5004",
+    # Concepto 5016 — Demás costos y deducciones (gastos diversos)
+    "5130": "5016",  # Seguros (administración)
+    "5140": "5016",  # Gastos legales (administración)
+    "5145": "5016",  # Mantenimiento y reparaciones (administración)
+    "5150": "5016",  # Adecuación e instalación (administración)
+    "5155": "5016",  # Gastos de viaje (administración)
+    "5160": "5016",  # Depreciaciones (administración)
+    "5165": "5016",  # Amortizaciones (administración)
+    "5195": "5016",  # Diversos (administración)
+    "5230": "5016",  # Seguros (ventas)
+    "5240": "5016",  # Gastos legales (ventas)
+    "5245": "5016",  # Mantenimiento y reparaciones (ventas)
+    "5250": "5016",  # Adecuación e instalación (ventas)
+    "5255": "5016",  # Gastos de viaje (ventas)
+    "5260": "5016",  # Depreciaciones (ventas)
+    "5265": "5016",  # Amortizaciones (ventas)
+    "5295": "5016",  # Diversos (ventas)
     # Arrendamientos
     "5120": "5005",
     "5125": "5005",
