@@ -1811,3 +1811,171 @@ def extract_stock_quants(
     if df.empty:
         return pd.DataFrame(columns=["product_id", "qty_available", "stock_value"])
     return df
+
+
+# ---------------------------------------------------------------------------
+# Cuentas por Pagar (facturas de proveedor abiertas + términos de pago)
+# ---------------------------------------------------------------------------
+
+PAYABLE_FIELDS = [
+    "id", "name", "ref", "partner_id",
+    "invoice_date", "invoice_date_due", "date",
+    "amount_untaxed", "amount_total", "amount_residual",
+    "invoice_payment_term_id",
+    "payment_state", "state", "move_type",
+    "currency_id", "company_id", "journal_id",
+]
+
+
+def extract_payables(
+    client: OdooClient,
+    company_ids: list[int] | tuple[int, ...] | None = None,
+    include_refunds: bool = True,
+) -> pd.DataFrame:
+    """
+    Descarga facturas de PROVEEDOR abiertas (con saldo pendiente).
+
+    Trae account.move con move_type in_invoice/in_refund, state='posted'
+    y payment_state in ('not_paid', 'partial'). Estas son las facturas
+    que la empresa todavía debe pagar.
+
+    Devuelve un DataFrame con montos en POSITIVO (amount_total,
+    amount_residual sin signo), fechas de factura y vencimiento, y el
+    término de pago (para detectar descuento por pronto pago).
+    """
+    move_types = ["in_invoice"]
+    if include_refunds:
+        move_types.append("in_refund")
+
+    domain: list = [
+        ("move_type", "in", move_types),
+        ("state", "=", "posted"),
+        ("payment_state", "in", OPEN_PAYMENT_STATES),
+    ]
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
+
+    logger.info("Descargando cuentas por pagar con dominio: %s", domain)
+    records = client.search_read(
+        "account.move",
+        domain=domain,
+        fields=PAYABLE_FIELDS,
+        order="invoice_date_due asc",
+    )
+    logger.info("Facturas de proveedor abiertas descargadas: %s", len(records))
+
+    if not records:
+        return pd.DataFrame(columns=PAYABLE_FIELDS + [
+            "partner_name", "currency_name", "payment_term_id",
+            "payment_term_name", "company_name", "journal_name",
+        ])
+
+    df = pd.DataFrame(records)
+
+    # Desempaquetar many2ones
+    df[["partner_id", "partner_name"]] = df["partner_id"].apply(
+        lambda v: pd.Series(_unpack_m2o(v))
+    )
+    if "currency_id" in df.columns:
+        df[["currency_id", "currency_name"]] = df["currency_id"].apply(
+            lambda v: pd.Series(_unpack_m2o(v))
+        )
+    if "invoice_payment_term_id" in df.columns:
+        df[["payment_term_id", "payment_term_name"]] = df[
+            "invoice_payment_term_id"
+        ].apply(lambda v: pd.Series(_unpack_m2o(v)))
+        df = df.drop(columns=["invoice_payment_term_id"])
+    for col in ("company_id", "journal_id"):
+        if col in df.columns:
+            df[[col, f"{col}_name"]] = df[col].apply(
+                lambda v: pd.Series(_unpack_m2o(v))
+            )
+
+    # Fechas
+    for col in ("invoice_date", "invoice_date_due", "date"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    # Montos — para in_invoice/in_refund Odoo guarda amount_total y
+    # amount_residual en valor absoluto positivo (la "deuda" con el
+    # proveedor). Las NC de proveedor (in_refund) reducen la deuda, así
+    # que les aplicamos signo negativo.
+    for col in ("amount_untaxed", "amount_total", "amount_residual"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    if "move_type" in df.columns:
+        sign = df["move_type"].map({"in_invoice": 1, "in_refund": -1}).fillna(1)
+        for col in ("amount_untaxed", "amount_total", "amount_residual"):
+            if col in df.columns:
+                df[f"{col}_signed"] = df[col] * sign
+
+    return df
+
+
+def extract_payment_terms(
+    client: OdooClient,
+) -> pd.DataFrame:
+    """
+    Descarga los términos de pago (account.payment.term) con la
+    información de descuento por pronto pago (early payment discount).
+
+    Campos Odoo 17+:
+      - early_discount: bool — si el término ofrece descuento anticipado
+      - discount_percentage: float — % de descuento
+      - discount_days: int — días dentro de los cuales pagar para el dto
+
+    Es defensivo: si los campos no existen (Odoo <17), los omite y
+    devuelve sólo id + name.
+    """
+    desired = [
+        "id", "name",
+        "early_discount", "discount_percentage", "discount_days",
+    ]
+    try:
+        meta = client.fields_get("account.payment.term", attributes=["string"])
+        available = set(meta.keys())
+        fields = [f for f in desired if f in available]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fields_get(account.payment.term) falló: %s", exc)
+        fields = ["id", "name"]
+
+    try:
+        records = client.search_read(
+            "account.payment.term",
+            domain=[],
+            fields=fields,
+            order="name asc",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("extract_payment_terms falló: %s", exc)
+        return pd.DataFrame(columns=[
+            "id", "name", "early_discount",
+            "discount_percentage", "discount_days",
+        ])
+
+    if not records:
+        return pd.DataFrame(columns=[
+            "id", "name", "early_discount",
+            "discount_percentage", "discount_days",
+        ])
+
+    df = pd.DataFrame(records)
+    # Defaults seguros
+    if "early_discount" not in df.columns:
+        df["early_discount"] = False
+    if "discount_percentage" not in df.columns:
+        df["discount_percentage"] = 0.0
+    if "discount_days" not in df.columns:
+        df["discount_days"] = 0
+    # Normalizar: Odoo devuelve False para nulos
+    df["early_discount"] = df["early_discount"].apply(
+        lambda v: bool(v) if v not in (False, None, "") else False
+    )
+    df["discount_percentage"] = pd.to_numeric(
+        df["discount_percentage"], errors="coerce"
+    ).fillna(0.0)
+    df["discount_days"] = pd.to_numeric(
+        df["discount_days"], errors="coerce"
+    ).fillna(0).astype(int)
+    return df

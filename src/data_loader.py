@@ -541,6 +541,38 @@ def load_stock_quants(
 
 
 # ---------------------------------------------------------------------------
+# Loaders para Cuentas por Pagar
+# ---------------------------------------------------------------------------
+
+PAYABLES_CACHE_VERSION = 1
+
+
+@st.cache_data(ttl=600, show_spinner="Descargando cuentas por pagar...")
+def load_payables(
+    company_ids: tuple[int, ...] | None = None,
+    _cache_v: int = PAYABLES_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """Facturas de proveedor abiertas (con saldo pendiente)."""
+    from .extractor import extract_payables
+    client = get_odoo_client()
+    return extract_payables(
+        client,
+        company_ids=list(company_ids) if company_ids else None,
+        include_refunds=True,
+    )
+
+
+@st.cache_data(ttl=900, show_spinner="Descargando términos de pago...")
+def load_payment_terms(
+    _cache_v: int = PAYABLES_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """Términos de pago con info de descuento por pronto pago."""
+    from .extractor import extract_payment_terms
+    client = get_odoo_client()
+    return extract_payment_terms(client)
+
+
+# ---------------------------------------------------------------------------
 # Loaders para Estados Financieros
 # ---------------------------------------------------------------------------
 
