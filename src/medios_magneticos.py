@@ -1704,6 +1704,227 @@ def build_validacion_por_cuenta(
     ).reset_index(drop=True)
 
 
+# ===========================================================================
+# Configuración de exportación Excel — mapeo de columnas a nombres DIAN
+# ===========================================================================
+#
+# Para cada formato definimos:
+#   columnas_dian: orden y nombres DIAN-friendly (lo que va al reporte oficial)
+#   columnas_auditoria: columnas extra que añadimos para revisar/validar
+#                       (cuentas usadas, # líneas, IDs internos)
+#
+# Las columnas comunes de "tercero" tienen estos nombres internos:
+#   tipo_doc, numero_doc, dv, apellido1, apellido2, nombre1, nombre2,
+#   razon_social, direccion, departamento, municipio, pais
+
+COLS_TERCERO_DIAN: list[tuple[str, str]] = [
+    ("tipo_doc", "Tipo Documento"),
+    ("numero_doc", "Número Identificación"),
+    ("dv", "DV"),
+    ("apellido1", "Primer Apellido"),
+    ("apellido2", "Segundo Apellido"),
+    ("nombre1", "Primer Nombre"),
+    ("nombre2", "Otros Nombres"),
+    ("razon_social", "Razón Social"),
+    ("direccion", "Dirección"),
+    ("departamento", "Departamento"),
+    ("municipio", "Municipio"),
+    ("pais", "País"),
+]
+
+COLS_AUDITORIA: list[tuple[str, str]] = [
+    ("cuentas_contables", "Cuentas Contables (auditoría)"),
+    ("nombres_cuentas", "Nombres Cuentas (auditoría)"),
+    ("n_lineas", "# Líneas (auditoría)"),
+    ("partner_id", "ID Tercero (interno)"),
+]
+
+# Mapeo específico por formato: monto + columnas adicionales
+SCHEMA_POR_FORMATO: dict[str, list[tuple[str, str, str]]] = {
+    # (col_interna, col_dian, tipo: 'money' | 'text' | 'int' | 'pct')
+    "1001": [
+        ("concepto", "Concepto", "text"),
+        ("pago_deducible", "Pago o Abono Deducible", "money"),
+        ("pago_no_deducible", "Pago o Abono No Deducible", "money"),
+        ("ret_fuente_renta", "Retención en la Fuente Renta", "money"),
+        ("ret_iva", "Retención IVA", "money"),
+        ("ret_ica", "Retención ICA", "money"),
+    ],
+    "1003": [
+        ("retencion_practicada", "Retención que Practicaron", "money"),
+    ],
+    "1004": [
+        ("descuento_tributario", "Descuento Tributario", "money"),
+    ],
+    "1005": [
+        ("iva_descontable", "IVA Descontable", "money"),
+    ],
+    "1006": [
+        ("iva_generado", "IVA Generado", "money"),
+    ],
+    "1007": [
+        ("concepto", "Concepto", "text"),
+        ("ingreso_bruto", "Ingreso Bruto Recibido", "money"),
+    ],
+    "1008": [
+        ("saldo_cuenta_cobrar", "Saldo Cuenta por Cobrar", "money"),
+    ],
+    "1009": [
+        ("concepto", "Concepto", "text"),
+        ("saldo_cuenta_pagar", "Saldo Cuenta por Pagar", "money"),
+    ],
+    "1010": [
+        ("porcentaje_participacion", "% Participación", "pct"),
+        ("valor_aportes", "Valor Aportes", "money"),
+    ],
+    "1011": [
+        ("concepto", "Concepto", "text"),
+        ("valor", "Valor", "money"),
+    ],
+    "1012": [
+        ("concepto", "Concepto", "text"),
+        ("saldo", "Saldo a 31 Diciembre", "money"),
+    ],
+    "1015": [
+        ("concepto", "Concepto", "text"),
+        ("saldo", "Saldo Pasivo", "money"),
+    ],
+    "1056": [
+        ("concepto", "Concepto", "text"),
+        ("valor", "Valor Devolución/Anulación", "money"),
+    ],
+    "1647": [
+        ("concepto", "Concepto", "text"),
+        ("ingreso_terceros", "Ingreso para Terceros", "money"),
+    ],
+    "2275": [
+        ("concepto", "Concepto", "text"),
+        ("valor", "Costo/Deducción", "money"),
+    ],
+    "2276": [
+        ("concepto", "Concepto", "text"),
+        ("pago_laboral", "Pago Laboral", "money"),
+    ],
+}
+
+
+def _formato_code_from_key(key: str) -> str:
+    """Extrae el código del formato ('1001') del título completo."""
+    return key.split(" ")[0].strip()
+
+
+def _reordenar_columnas_dian(
+    df: pd.DataFrame,
+    formato_code: str,
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """
+    Reordena las columnas del DataFrame según el orden DIAN oficial
+    y retorna (df_ordenado, mapeo_nombres) donde mapeo_nombres lleva
+    nombres internos → nombres DIAN-friendly.
+    """
+    if df is None or df.empty:
+        return df, {}
+
+    schema = SCHEMA_POR_FORMATO.get(formato_code, [])
+
+    # Orden: tercero → schema-específico → auditoría
+    orden_cols: list[str] = []
+    nombres: dict[str, str] = {}
+
+    for internal, dian in COLS_TERCERO_DIAN:
+        if internal in df.columns:
+            orden_cols.append(internal)
+            nombres[internal] = dian
+
+    for internal, dian, _tipo in schema:
+        if internal in df.columns:
+            orden_cols.append(internal)
+            nombres[internal] = dian
+
+    # Cualquier columna que no esté mapeada explícitamente
+    cols_no_mapeadas = [
+        c for c in df.columns
+        if c not in orden_cols
+        and c not in [x[0] for x in COLS_AUDITORIA]
+    ]
+    orden_cols.extend(cols_no_mapeadas)
+    for c in cols_no_mapeadas:
+        nombres[c] = c
+
+    # Auditoría al final
+    for internal, dian in COLS_AUDITORIA:
+        if internal in df.columns:
+            orden_cols.append(internal)
+            nombres[internal] = dian
+
+    df_out = df[orden_cols].copy()
+    return df_out, nombres
+
+
+def _aplicar_formato_excel(worksheet, df: pd.DataFrame,
+                            formato_code: str, nombres: dict[str, str]) -> None:
+    """Aplica formato a una hoja: header bold, freeze, números, anchos."""
+    try:
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.utils import get_column_letter
+    except ImportError:
+        return
+
+    # Header
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    header_fill = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for col_idx, _col_name in enumerate(df.columns, start=1):
+        cell = worksheet.cell(row=1, column=col_idx)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = header_align
+
+    # Freeze header
+    worksheet.freeze_panes = "A2"
+
+    # Formato numérico para columnas money/int/pct
+    schema = SCHEMA_POR_FORMATO.get(formato_code, [])
+    tipo_por_col_dian: dict[str, str] = {dian: tipo for _, dian, tipo in schema}
+    # Columnas de auditoría que son numéricas
+    tipo_por_col_dian["# Líneas (auditoría)"] = "int"
+    tipo_por_col_dian["ID Tercero (interno)"] = "int"
+    tipo_por_col_dian["DV"] = "text"
+    tipo_por_col_dian["Tipo Documento"] = "text"
+
+    formato_money = '#,##0;[Red]-#,##0'
+    formato_int = '#,##0'
+    formato_pct = '0.00%'
+
+    for col_idx, col_name in enumerate(df.columns, start=1):
+        tipo = tipo_por_col_dian.get(col_name, "text")
+        col_letter = get_column_letter(col_idx)
+        if tipo == "money":
+            for row in range(2, worksheet.max_row + 1):
+                worksheet.cell(row=row, column=col_idx).number_format = formato_money
+        elif tipo == "int":
+            for row in range(2, worksheet.max_row + 1):
+                worksheet.cell(row=row, column=col_idx).number_format = formato_int
+        elif tipo == "pct":
+            for row in range(2, worksheet.max_row + 1):
+                worksheet.cell(row=row, column=col_idx).number_format = formato_pct
+
+        # Auto-width aproximado (max length de los valores en la columna)
+        try:
+            max_len = max(
+                [len(str(col_name))] +
+                [len(str(v)) for v in df.iloc[:, col_idx - 1].fillna("").head(200)]
+            )
+            ancho = min(max(max_len + 2, 12), 50)
+            worksheet.column_dimensions[col_letter].width = ancho
+        except Exception:  # noqa: BLE001
+            worksheet.column_dimensions[col_letter].width = 18
+
+    # Altura de fila del header
+    worksheet.row_dimensions[1].height = 32
+
+
 def generar_excel_medios_magneticos(
     formatos: dict[str, pd.DataFrame],
     output_path: str,
@@ -1711,37 +1932,127 @@ def generar_excel_medios_magneticos(
     validacion: pd.DataFrame | None = None,
 ) -> None:
     """
-    Escribe todos los formatos en un Excel multi-hoja.
+    Escribe todos los formatos en un Excel multi-hoja con formato profesional:
+      - Nombres de columnas DIAN-friendly (en español, claros)
+      - Orden de columnas: identificación tercero → datos del formato → auditoría
+      - Formato de moneda en columnas de pagos/retenciones/saldos
+      - Header en negrita con fondo azul oscuro, fila congelada
+      - Auto-ancho de columnas
+      - Hoja 00_Resumen con totales por formato
+      - Hoja ZZ_Validación con cruce cuenta × tercero (si se pasa)
 
     Args:
-        formatos: dict {nombre_formato: DataFrame}
-        output_path: ruta del archivo de salida
+        formatos: dict {nombre_formato: DataFrame}, e.g.
+                  {"1001 — Pagos y retenciones practicadas": df1001, ...}
+        output_path: ruta del archivo de salida (o BytesIO)
         year: año fiscal reportado
         validacion: DataFrame opcional con cruce cuenta × tercero
-            (lo genera build_validacion_por_cuenta).
     """
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
-        # Hoja de resumen
-        resumen = pd.DataFrame([
-            {"Formato": k, "Filas": len(v), "Estado": (
-                "OK" if not v.empty else "VACÍO"
-            )}
-            for k, v in formatos.items()
-        ])
-        resumen.to_excel(writer, sheet_name="00_Resumen", index=False)
-
-        # Una hoja por formato
+        # ── Hoja 00: Resumen con totales por formato ──
+        resumen_rows = []
         for nombre, df in formatos.items():
-            if df is None or df.empty:
-                # Hoja vacía con encabezado
-                pd.DataFrame({"Sin datos": [f"Año {year}"]}).to_excel(
-                    writer, sheet_name=nombre[:31], index=False,
-                )
-            else:
-                df.to_excel(writer, sheet_name=nombre[:31], index=False)
+            formato_code = _formato_code_from_key(nombre)
+            schema = SCHEMA_POR_FORMATO.get(formato_code, [])
+            # Total del primer campo monetario del formato
+            total_principal = 0.0
+            campo_total = ""
+            if df is not None and not df.empty:
+                for internal, dian, tipo in schema:
+                    if tipo == "money" and internal in df.columns:
+                        try:
+                            total_principal = float(df[internal].sum())
+                            campo_total = dian
+                            break
+                        except Exception:  # noqa: BLE001
+                            pass
+            resumen_rows.append({
+                "Formato": nombre,
+                "Año": year,
+                "Filas": len(df) if df is not None else 0,
+                "Campo Principal": campo_total,
+                "Total Principal": total_principal,
+                "Estado": ("OK" if (df is not None and not df.empty) else "VACÍO"),
+            })
+        resumen_df = pd.DataFrame(resumen_rows)
+        resumen_df.to_excel(writer, sheet_name="00_Resumen", index=False)
 
-        # Hoja de validación al final
+        # Aplicar formato a resumen
+        ws_resumen = writer.sheets["00_Resumen"]
+        try:
+            from openpyxl.styles import Font, PatternFill, Alignment
+            from openpyxl.utils import get_column_letter
+
+            header_font = Font(bold=True, color="FFFFFF", size=11)
+            header_fill = PatternFill(
+                start_color="1ABC9C", end_color="1ABC9C", fill_type="solid",
+            )
+            for col_idx, _ in enumerate(resumen_df.columns, start=1):
+                cell = ws_resumen.cell(row=1, column=col_idx)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal="center", wrap_text=True)
+            # Formato monetario en columna "Total Principal"
+            total_idx = list(resumen_df.columns).index("Total Principal") + 1
+            for row in range(2, ws_resumen.max_row + 1):
+                ws_resumen.cell(row=row, column=total_idx).number_format = '#,##0;[Red]-#,##0'
+            # Anchos
+            anchos = {"Formato": 50, "Año": 10, "Filas": 10,
+                      "Campo Principal": 32, "Total Principal": 20, "Estado": 12}
+            for col_idx, col_name in enumerate(resumen_df.columns, start=1):
+                ws_resumen.column_dimensions[get_column_letter(col_idx)].width = (
+                    anchos.get(col_name, 15)
+                )
+            ws_resumen.freeze_panes = "A2"
+            ws_resumen.row_dimensions[1].height = 28
+        except Exception:  # noqa: BLE001
+            pass
+
+        # ── Una hoja por formato ──
+        for nombre, df in formatos.items():
+            formato_code = _formato_code_from_key(nombre)
+            sheet_name = f"{formato_code}"[:31]  # Excel limit
+
+            if df is None or df.empty:
+                pd.DataFrame({"Mensaje": [
+                    f"Sin datos para el formato {formato_code} en el año {year}.",
+                    "Puede ser normal si la empresa no tiene operaciones aplicables.",
+                ]}).to_excel(writer, sheet_name=sheet_name, index=False)
+                continue
+
+            # Reordenar y renombrar columnas
+            df_out, nombres = _reordenar_columnas_dian(df, formato_code)
+            df_out = df_out.rename(columns=nombres)
+            df_out.to_excel(writer, sheet_name=sheet_name, index=False)
+
+            # Aplicar formato
+            _aplicar_formato_excel(
+                writer.sheets[sheet_name], df_out, formato_code, nombres,
+            )
+
+        # ── Hoja de validación al final ──
         if validacion is not None and not validacion.empty:
             validacion.to_excel(
                 writer, sheet_name="ZZ_Validacion_cuenta", index=False,
             )
+            try:
+                ws_val = writer.sheets["ZZ_Validacion_cuenta"]
+                from openpyxl.styles import Font, PatternFill, Alignment
+                from openpyxl.utils import get_column_letter
+
+                header_font = Font(bold=True, color="FFFFFF", size=11)
+                header_fill = PatternFill(
+                    start_color="E67E22", end_color="E67E22", fill_type="solid",
+                )
+                for col_idx, _ in enumerate(validacion.columns, start=1):
+                    cell = ws_val.cell(row=1, column=col_idx)
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = Alignment(horizontal="center", wrap_text=True)
+                ws_val.freeze_panes = "A2"
+                ws_val.row_dimensions[1].height = 28
+                # Anchos por defecto
+                for col_idx in range(1, len(validacion.columns) + 1):
+                    ws_val.column_dimensions[get_column_letter(col_idx)].width = 22
+            except Exception:  # noqa: BLE001
+                pass
