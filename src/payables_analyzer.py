@@ -346,6 +346,114 @@ def compute_calendar_semanal(
     return pd.DataFrame(rows)
 
 
+def _normalizar_cobrar(receivables: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normaliza el DataFrame de cuentas por cobrar (extract_receivables)
+    para que tenga columnas `saldo` y `invoice_date_due` consistentes
+    con las cuentas por pagar.
+    """
+    if receivables is None or receivables.empty:
+        return pd.DataFrame(columns=["saldo", "invoice_date_due"])
+    df = receivables.copy()
+    if "amount_residual_signed" in df.columns:
+        df["saldo"] = pd.to_numeric(
+            df["amount_residual_signed"], errors="coerce"
+        ).fillna(0.0)
+    elif "amount_residual" in df.columns:
+        df["saldo"] = pd.to_numeric(
+            df["amount_residual"], errors="coerce"
+        ).fillna(0.0)
+    else:
+        df["saldo"] = 0.0
+    if "invoice_date_due" in df.columns:
+        df["invoice_date_due"] = pd.to_datetime(
+            df["invoice_date_due"], errors="coerce"
+        )
+        if "invoice_date" in df.columns:
+            df["invoice_date"] = pd.to_datetime(
+                df["invoice_date"], errors="coerce"
+            )
+            df["invoice_date_due"] = df["invoice_date_due"].fillna(
+                df["invoice_date"]
+            )
+    return df
+
+
+def compute_flujo_caja_semanal(
+    payables_enriched: pd.DataFrame,
+    receivables: pd.DataFrame | None,
+    today: date | None = None,
+    semanas: int = 8,
+) -> pd.DataFrame:
+    """
+    Proyección de flujo de caja semanal combinando:
+      - INGRESOS esperados: cobros de cuentas por cobrar (clientes).
+      - EGRESOS: pagos de cuentas por pagar (proveedores).
+
+    Se agrupa por semana (lunes a domingo). La primera semana incluye
+    todo lo ya vencido (tanto por cobrar como por pagar).
+
+    Devuelve DataFrame con columnas:
+      semana_inicio, semana_label,
+      ingresos, egresos, flujo_neto, flujo_acumulado,
+      n_fac_cobrar, n_fac_pagar
+    """
+    if today is None:
+        today = date.today()
+    today_ts = pd.Timestamp(today)
+    lunes_actual = today_ts - pd.Timedelta(days=today_ts.weekday())
+
+    # Normalizar ambos lados
+    df_pagar = pd.DataFrame(columns=["saldo", "invoice_date_due"])
+    if payables_enriched is not None and not payables_enriched.empty:
+        df_pagar = payables_enriched.copy()
+        df_pagar = df_pagar[df_pagar["invoice_date_due"].notna()]
+
+    df_cobrar = _normalizar_cobrar(receivables)
+    df_cobrar = df_cobrar[df_cobrar["invoice_date_due"].notna()]
+
+    rows = []
+    acumulado = 0.0
+    for i in range(semanas):
+        ini = lunes_actual + pd.Timedelta(weeks=i)
+        nxt = ini + pd.Timedelta(weeks=1)
+        if i == 0:
+            mask_p = df_pagar["invoice_date_due"] < nxt if not df_pagar.empty else None
+            mask_c = df_cobrar["invoice_date_due"] < nxt if not df_cobrar.empty else None
+        else:
+            mask_p = (
+                (df_pagar["invoice_date_due"] >= ini)
+                & (df_pagar["invoice_date_due"] < nxt)
+            ) if not df_pagar.empty else None
+            mask_c = (
+                (df_cobrar["invoice_date_due"] >= ini)
+                & (df_cobrar["invoice_date_due"] < nxt)
+            ) if not df_cobrar.empty else None
+
+        sub_p = df_pagar[mask_p] if mask_p is not None else df_pagar.iloc[0:0]
+        sub_c = df_cobrar[mask_c] if mask_c is not None else df_cobrar.iloc[0:0]
+
+        egresos = float(sub_p["saldo"].sum()) if not sub_p.empty else 0.0
+        ingresos = float(sub_c["saldo"].sum()) if not sub_c.empty else 0.0
+        neto = ingresos - egresos
+        acumulado += neto
+
+        rows.append({
+            "semana_inicio": ini,
+            "semana_label": (
+                "Vencido + " + ini.strftime("%d/%m")
+                if i == 0 else ini.strftime("%d/%m")
+            ),
+            "ingresos": ingresos,
+            "egresos": egresos,
+            "flujo_neto": neto,
+            "flujo_acumulado": acumulado,
+            "n_fac_cobrar": int(len(sub_c)),
+            "n_fac_pagar": int(len(sub_p)),
+        })
+    return pd.DataFrame(rows)
+
+
 # ===========================================================================
 # Alertas de pronto pago
 # ===========================================================================

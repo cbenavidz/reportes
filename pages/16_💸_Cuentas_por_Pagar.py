@@ -27,12 +27,13 @@ from src.data_loader import (
     load_payables,
     load_payment_terms,
     load_purchase_invoice_lines,
+    load_receivables,
 )
 from src.payables_analyzer import (
     build_tabla_detalle,
     compute_aging,
     compute_calendar,
-    compute_calendar_semanal,
+    compute_flujo_caja_semanal,
     compute_dpo,
     compute_payables_kpis,
     compute_pronto_pago_alerts,
@@ -103,6 +104,7 @@ with st.spinner("Cargando facturas de proveedor..."):
     )
     payables = load_payables(company_ids=company_ids)
     payment_terms = load_payment_terms()
+    receivables = load_receivables(company_ids=company_ids)
 
 if payables is None or payables.empty:
     st.success(
@@ -446,38 +448,108 @@ st.markdown("---")
 
 
 # ===========================================================================
-# 💧 PROYECCIÓN DE FLUJO DE CAJA
+# 💧 PROYECCIÓN DE FLUJO DE CAJA (ingresos vs egresos)
 # ===========================================================================
-st.markdown("### 💧 Proyección de Flujo de Pagos — Semanal")
+st.markdown("### 💧 Proyección de Flujo de Caja — Semanal")
 st.caption(
-    "Cuánto dinero necesitas cada semana para cubrir los pagos. "
-    "La primera barra incluye todo lo que ya está vencido."
+    "Ingresos esperados (cobros a clientes) vs egresos (pagos a proveedores), "
+    "semana a semana. La primera barra incluye todo lo ya vencido. "
+    "La línea muestra la posición de caja acumulada."
 )
 
-cal_sem = compute_calendar_semanal(enriched, today=today, semanas=8)
+cal_sem = compute_flujo_caja_semanal(
+    enriched, receivables, today=today, semanas=8,
+)
 if cal_sem is not None and not cal_sem.empty:
     fig_sem = go.Figure()
-    colores = [
-        "#E74C3C" if i == 0 else "#1ABC9C"
-        for i in range(len(cal_sem))
-    ]
+    # Ingresos hacia arriba (verde)
     fig_sem.add_trace(go.Bar(
         x=cal_sem["semana_label"],
-        y=cal_sem["monto"],
-        marker_color=colores,
-        text=[fmt_cop(m) for m in cal_sem["monto"]],
+        y=cal_sem["ingresos"],
+        name="Ingresos esperados (CxC)",
+        marker_color="#2ECC71",
+        text=[fmt_cop(m) for m in cal_sem["ingresos"]],
         textposition="outside",
-        hovertext=[f"{n} facturas" for n in cal_sem["n_facturas"]],
+        hovertext=[f"{n} facturas por cobrar" for n in cal_sem["n_fac_cobrar"]],
+    ))
+    # Egresos hacia abajo (rojo) — se grafican negativos
+    fig_sem.add_trace(go.Bar(
+        x=cal_sem["semana_label"],
+        y=-cal_sem["egresos"],
+        name="Pagos a proveedores (CxP)",
+        marker_color="#E74C3C",
+        text=[fmt_cop(m) for m in cal_sem["egresos"]],
+        textposition="outside",
+        hovertext=[f"{n} facturas por pagar" for n in cal_sem["n_fac_pagar"]],
+    ))
+    # Línea de posición acumulada
+    fig_sem.add_trace(go.Scatter(
+        x=cal_sem["semana_label"],
+        y=cal_sem["flujo_acumulado"],
+        name="Posición de caja acumulada",
+        mode="lines+markers",
+        line=dict(color="#2C3E50", width=3),
+        marker=dict(size=8),
     ))
     fig_sem.update_layout(
-        height=320, margin=dict(l=0, r=0, t=20, b=0),
-        yaxis_title="Monto a pagar ($)",
+        height=420, margin=dict(l=0, r=0, t=20, b=0),
+        barmode="relative",
+        yaxis_title="Flujo de caja ($)",
         xaxis_title="Semana (inicio)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        hovermode="x unified",
     )
+    fig_sem.add_hline(y=0, line_width=1, line_color="#888")
     st.plotly_chart(fig_sem, use_container_width=True)
 
-    total_8sem = cal_sem["monto"].sum()
-    st.caption(f"Total a pagar en las próximas 8 semanas: **{fmt_cop(total_8sem)}**")
+    # KPIs de flujo
+    total_ing = cal_sem["ingresos"].sum()
+    total_egr = cal_sem["egresos"].sum()
+    neto_total = total_ing - total_egr
+    fk1, fk2, fk3 = st.columns(3)
+    with fk1:
+        st.metric("Ingresos esperados (8 sem.)", fmt_cop(total_ing))
+    with fk2:
+        st.metric("Pagos proyectados (8 sem.)", fmt_cop(total_egr))
+    with fk3:
+        st.metric(
+            "Flujo neto proyectado", fmt_cop(neto_total),
+            delta=("Superávit" if neto_total >= 0 else "Déficit"),
+            delta_color=("normal" if neto_total >= 0 else "inverse"),
+        )
+
+    # Alertas de semanas con déficit
+    semanas_deficit = cal_sem[cal_sem["flujo_neto"] < 0]
+    if not semanas_deficit.empty:
+        peor = semanas_deficit.loc[semanas_deficit["flujo_neto"].idxmin()]
+        st.warning(
+            f"⚠️ Hay {len(semanas_deficit)} semana(s) con déficit "
+            f"(pagas más de lo que cobras). La más crítica es la del "
+            f"**{peor['semana_label']}** con un déficit de "
+            f"**{fmt_cop(abs(peor['flujo_neto']))}**. "
+            "Planea con anticipación cómo cubrir ese faltante."
+        )
+    # Alerta de caja acumulada negativa
+    caja_negativa = cal_sem[cal_sem["flujo_acumulado"] < 0]
+    if not caja_negativa.empty:
+        primera = caja_negativa.iloc[0]
+        st.error(
+            f"🔴 La posición de caja acumulada se vuelve **negativa** "
+            f"a partir de la semana del **{primera['semana_label']}** "
+            f"({fmt_cop(primera['flujo_acumulado'])}). "
+            "Sin ingresos adicionales no alcanzarás a cubrir los pagos."
+        )
+    else:
+        st.success(
+            "✅ Con los cobros esperados, la posición de caja se mantiene "
+            "positiva en todo el horizonte proyectado."
+        )
+
+    st.caption(
+        "ℹ️ Los ingresos se proyectan según la **fecha de vencimiento** de "
+        "las facturas de cliente. Si tus clientes suelen pagar tarde, "
+        "considera el flujo real algo más diferido."
+    )
 
 st.markdown("---")
 
@@ -739,7 +811,7 @@ if detalle is not None and not detalle.empty:
                 )
             if cal_sem is not None and not cal_sem.empty:
                 cal_sem.to_excel(
-                    writer, sheet_name="Proyeccion Semanal", index=False,
+                    writer, sheet_name="Flujo de Caja Semanal", index=False,
                 )
         buffer.seek(0)
         return buffer.getvalue()

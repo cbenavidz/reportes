@@ -562,6 +562,21 @@ def load_payables(
     )
 
 
+@st.cache_data(ttl=600, show_spinner="Descargando cuentas por cobrar...")
+def load_receivables(
+    company_ids: tuple[int, ...] | None = None,
+    _cache_v: int = PAYABLES_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """Facturas de cliente abiertas (ingresos esperados)."""
+    from .extractor import extract_receivables
+    client = get_odoo_client()
+    return extract_receivables(
+        client,
+        company_ids=list(company_ids) if company_ids else None,
+        include_refunds=True,
+    )
+
+
 @st.cache_data(ttl=900, show_spinner="Descargando términos de pago...")
 def load_payment_terms(
     _cache_v: int = PAYABLES_CACHE_VERSION,

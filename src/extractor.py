@@ -1913,6 +1913,89 @@ def extract_payables(
     return df
 
 
+def extract_receivables(
+    client: OdooClient,
+    company_ids: list[int] | tuple[int, ...] | None = None,
+    include_refunds: bool = True,
+) -> pd.DataFrame:
+    """
+    Descarga facturas de CLIENTE abiertas (con saldo pendiente de cobro).
+
+    Trae account.move con move_type out_invoice/out_refund, state='posted'
+    y payment_state in ('not_paid', 'partial'). Estas son las facturas que
+    los clientes todavía deben pagar a la empresa (ingresos esperados).
+
+    Misma estructura que extract_payables para que el análisis de flujo de
+    caja pueda tratar ambos de forma simétrica.
+    """
+    move_types = ["out_invoice"]
+    if include_refunds:
+        move_types.append("out_refund")
+
+    domain: list = [
+        ("move_type", "in", move_types),
+        ("state", "=", "posted"),
+        ("payment_state", "in", OPEN_PAYMENT_STATES),
+    ]
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
+
+    logger.info("Descargando cuentas por cobrar con dominio: %s", domain)
+    records = client.search_read(
+        "account.move",
+        domain=domain,
+        fields=PAYABLE_FIELDS,
+        order="invoice_date_due asc",
+    )
+    logger.info("Facturas de cliente abiertas descargadas: %s", len(records))
+
+    if not records:
+        return pd.DataFrame(columns=PAYABLE_FIELDS + [
+            "partner_name", "currency_name", "payment_term_id",
+            "payment_term_name", "company_name", "journal_name",
+        ])
+
+    df = pd.DataFrame(records)
+
+    # Desempaquetar many2ones
+    df[["partner_id", "partner_name"]] = df["partner_id"].apply(
+        lambda v: pd.Series(_unpack_m2o(v))
+    )
+    if "currency_id" in df.columns:
+        df[["currency_id", "currency_name"]] = df["currency_id"].apply(
+            lambda v: pd.Series(_unpack_m2o(v))
+        )
+    if "invoice_payment_term_id" in df.columns:
+        df[["payment_term_id", "payment_term_name"]] = df[
+            "invoice_payment_term_id"
+        ].apply(lambda v: pd.Series(_unpack_m2o(v)))
+        df = df.drop(columns=["invoice_payment_term_id"])
+    for col in ("company_id", "journal_id"):
+        if col in df.columns:
+            df[[col, f"{col}_name"]] = df[col].apply(
+                lambda v: pd.Series(_unpack_m2o(v))
+            )
+
+    # Fechas
+    for col in ("invoice_date", "invoice_date_due", "date"):
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce")
+
+    # Montos — para out_invoice/out_refund Odoo guarda valores positivos.
+    # Las NC de cliente (out_refund) reducen lo que el cliente debe.
+    for col in ("amount_untaxed", "amount_total", "amount_residual"):
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    if "move_type" in df.columns:
+        sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
+        for col in ("amount_untaxed", "amount_total", "amount_residual"):
+            if col in df.columns:
+                df[f"{col}_signed"] = df[col] * sign
+
+    return df
+
+
 def extract_payment_terms(
     client: OdooClient,
 ) -> pd.DataFrame:
