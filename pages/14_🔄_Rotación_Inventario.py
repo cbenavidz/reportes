@@ -155,11 +155,15 @@ show_mobile = st.checkbox(
     ),
 )
 
-# ── Carga base (en paralelo) ──
-# Todas las cargas son independientes entre sí, así que las disparamos en
-# paralelo con un ThreadPoolExecutor. Esto reduce drásticamente el tiempo
-# de primera carga (las funciones loader están cacheadas con @st.cache_data).
+# ── Carga base ──
+# 1) El plan de cuentas se carga PRIMERO porque lo necesitamos para
+#    identificar las cuentas de inventario antes de lanzar la serie
+#    mensual de inventario en la tanda paralela.
+# 2) Todo lo demás (ventas, compras, stock, balances Y la serie mensual
+#    de inventario) se descarga EN PARALELO. Antes la serie mensual
+#    corría sola DESPUÉS de la tanda paralela — ahora va dentro.
 from concurrent.futures import ThreadPoolExecutor as _TPbase  # noqa: E402
+from src.purchases_analyzer import get_inventory_account_ids  # noqa: E402
 
 with st.spinner("Cargando plan de cuentas, ventas, compras y balances..."):
     _cids = filters["company_ids"]
@@ -178,9 +182,13 @@ with st.spinner("Cargando plan de cuentas, ventas, compras y balances..."):
     fecha_antes = (fecha_desde - timedelta(days=1)).isoformat()
     fecha_antes_prev = (fecha_desde_prev - timedelta(days=1)).isoformat()
 
-    # Tareas independientes — cada lambda captura valores fijos.
+    # Paso 1: plan de cuentas + cuentas de inventario.
+    chart_df = load_chart_of_accounts(company_ids=_cids)
+    inv_acc_ids = get_inventory_account_ids(chart_df)
+    _inv_ids_tuple = tuple(sorted(inv_acc_ids)) if inv_acc_ids else ()
+
+    # Paso 2: el resto de descargas, todas independientes → en paralelo.
     _tasks = {
-        "chart": lambda: load_chart_of_accounts(company_ids=_cids),
         "sales": lambda: load_invoice_lines(
             company_ids=_cids, date_from=sales_date_from, date_to=sales_date_to,
         ),
@@ -200,6 +208,15 @@ with st.spinner("Cargando plan de cuentas, ventas, compras y balances..."):
         ),
         "bal_inicio_prev": lambda: load_account_balances_aggregated(
             date_to=fecha_antes_prev, company_ids=_cids,
+        ),
+        # Serie mensual de saldo de inventario (2 consultas internas).
+        "serie_mensual": lambda: (
+            load_inventory_balance_monthly_series(
+                date_from=fecha_desde.isoformat(),
+                date_to=fecha_hasta.isoformat(),
+                inventory_account_ids=_inv_ids_tuple,
+                company_ids=tuple(_cids) if _cids else None,
+            ) if _inv_ids_tuple else pd.DataFrame()
         ),
     }
     if show_mobile:
@@ -226,7 +243,6 @@ with st.spinner("Cargando plan de cuentas, ventas, compras y balances..."):
         for k, fut in _futs.items():
             _results[k] = fut.result()
 
-    chart_df = _results["chart"]
     sales_lines = _results["sales"]
     sales_365 = sales_lines  # alias
     purchases_lines = _results["purchases"]
@@ -235,6 +251,7 @@ with st.spinner("Cargando plan de cuentas, ventas, compras y balances..."):
     balances_inicio = _results["bal_inicio"]
     balances_corte_prev = _results["bal_corte_prev"]
     balances_inicio_prev = _results["bal_inicio_prev"]
+    serie_mensual_raw = _results["serie_mensual"]
 
     if show_mobile:
         balances_hoy = (
@@ -568,32 +585,19 @@ st.markdown("---")
 
 
 # ── Serie mensual: saldo cuenta 14 + ventas del mes ──
-# OPTIMIZACIÓN: en lugar de N consultas de balance (una por mes), que
-# escanean todo el libro contable repetidamente, identificamos las
-# cuentas de inventario una vez y usamos load_inventory_balance_monthly_series
-# que resuelve toda la serie con SOLO 2 consultas (saldo inicial + cumsum).
+# La serie de saldo de inventario ya se descargó EN PARALELO con el resto
+# de datos (variable serie_mensual_raw). Aquí solo se consume; si quedó
+# vacía/en cero se usa el fallback clásico (1 balance por mes).
 with st.spinner("Construyendo serie mensual..."):
-    from src.purchases_analyzer import (
-        _saldo_cuenta_14_from_balances,
-        get_inventory_account_ids,
-    )
-
-    inv_acc_ids = get_inventory_account_ids(chart_df)
+    from src.purchases_analyzer import _saldo_cuenta_14_from_balances
 
     saldo_mes = pd.DataFrame(columns=["mes", "saldo_inv_cierre"])
     _metodo_serie = "rápido (2 consultas)"
 
-    if inv_acc_ids:
-        serie = load_inventory_balance_monthly_series(
-            date_from=fecha_desde.isoformat(),
-            date_to=fecha_hasta.isoformat(),
-            inventory_account_ids=tuple(sorted(inv_acc_ids)),
-            company_ids=tuple(filters["company_ids"]) if filters["company_ids"] else None,
-        )
-        if serie is not None and not serie.empty:
-            saldo_mes = serie.rename(
-                columns={"saldo_cierre": "saldo_inv_cierre"}
-            )[["mes", "saldo_inv_cierre"]].copy()
+    if serie_mensual_raw is not None and not serie_mensual_raw.empty:
+        saldo_mes = serie_mensual_raw.rename(
+            columns={"saldo_cierre": "saldo_inv_cierre"}
+        )[["mes", "saldo_inv_cierre"]].copy()
 
     # FALLBACK: si no se pudieron identificar cuentas de inventario o la
     # serie quedó vacía/en cero, usar el método clásico (1 balance por mes).
