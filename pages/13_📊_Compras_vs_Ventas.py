@@ -131,10 +131,14 @@ with st.spinner("Cargando compras, ventas y stock..."):
     )
     # Stock actual
     stock_df = load_stock_quants(company_ids=filters["company_ids"])
-    # Plan de cuentas y saldo al corte (para rotación basada en cuenta 14)
+    # Plan de cuentas y saldos (inicial + corte) para rotación cuenta 14
     chart_df = load_chart_of_accounts(company_ids=filters["company_ids"])
     balances_corte = load_account_balances_aggregated(
         date_to=fecha_hasta.isoformat(),
+        company_ids=filters["company_ids"],
+    )
+    balances_inicio = load_account_balances_aggregated(
+        date_to=(fecha_desde - timedelta(days=1)).isoformat(),
         company_ids=filters["company_ids"],
     )
 
@@ -155,9 +159,10 @@ summary = compute_purchases_vs_sales_summary(
 summary_prev = compute_purchases_vs_sales_summary(
     purchases_lines, sales_lines, stock_df, fecha_desde_prev, fecha_hasta_prev,
 )
-# Rotación calculada con saldo cuenta 14 (PUC) y monto de ventas
+# Rotación calculada con saldo cuenta 14 (PUC), inventario promedio
 rot14 = compute_rotacion_cuenta_14(
-    balances_corte, chart_df, summary["total_ventas"],
+    balances_inicio, balances_corte, chart_df,
+    summary["total_ventas"], summary["costo_ventas"],
     fecha_desde, fecha_hasta,
 )
 
@@ -198,15 +203,15 @@ with k3:
 with k4:
     st.metric(
         "🔄 Rotación inv. (anual)",
-        f"{rot14['rotacion_anual']:.2f}x",
+        f"{rot14['rotacion_ventas_anual']:.2f}x",
         delta=(
-            f"{rot14['dias_inventario']:.0f} días inv."
-            if rot14["rotacion_anual"] > 0
+            f"{rot14['dias_ventas']:.0f} días inv."
+            if rot14["rotacion_ventas_anual"] > 0
             else "sin saldo en cuenta 14"
         ),
         delta_color="off",
         help=(
-            "Rotación = Ventas del período / Saldo cuenta 14 (Inventarios). "
+            "Rotación = Ventas del período / Inventario promedio cuenta 14. "
             "Anualizada según los días del período seleccionado."
         ),
     )
@@ -221,8 +226,12 @@ with k7:
 with k8:
     st.metric(
         "📒 Saldo cuenta 14",
-        _money(rot14["saldo_inventario"]),
-        help="Saldo contable de las cuentas que empiezan con 14 (Inventarios PUC) al corte del período.",
+        _money(rot14["saldo_final"]),
+        help=(
+            "Saldo contable de las cuentas que empiezan con 14 "
+            "(Inventarios PUC) al corte del período. "
+            f"Promedio del período: {_money(rot14['saldo_promedio'])}."
+        ),
     )
 
 # Botón para limpiar cache y recargar datos
