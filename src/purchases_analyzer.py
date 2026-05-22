@@ -1193,3 +1193,84 @@ def compute_rotacion_categoria_30d_historica(
     return pd.DataFrame(rows).sort_values(
         ["product_categ_name", "mes"]
     ).reset_index(drop=True)
+
+
+def compute_rotacion_30d_historica_consolidada(
+    sales_lines: pd.DataFrame,
+    denominador: float,
+    today: date | None = None,
+    meses: int = 12,
+    anualizar: bool = False,
+) -> pd.DataFrame:
+    """
+    Serie histórica mes a mes de la rotación a 30 días CONSOLIDADA para
+    toda la empresa (sin desglose por categoría).
+
+    Para cada mes se calcula la rotación con una ventana de 30 días que
+    termina el último día del mes (para el mes en curso, termina HOY):
+
+        rotacion_30d(mes) = ventas[30 días previos al cierre del mes]
+                            / denominador
+
+    El `denominador` es FIJO (típicamente el saldo actual de inventario,
+    cuenta 14). Así la variación mes a mes refleja la velocidad de venta.
+
+    Args:
+        sales_lines: líneas de facturas de venta (idealmente ≥ 365 días).
+        denominador: valor fijo del inventario (saldo cuenta 14).
+        today: fecha de referencia (default date.today()).
+        meses: cantidad de meses hacia atrás a calcular.
+        anualizar: si True multiplica la rotación de 30 días × 12.
+
+    Returns:
+        DataFrame con columnas:
+          - mes (timestamp del primer día del mes)
+          - mes_label (str 'YYYY-MM')
+          - ventas_30d
+          - rotacion_30d
+    """
+    import calendar as _cal
+
+    if today is None:
+        today = date.today()
+
+    sl = _apply_default_exclusions(_normalize_sales_signed(sales_lines))
+    if sl is None or sl.empty or "invoice_date" not in sl.columns:
+        return pd.DataFrame()
+
+    sl["_d"] = pd.to_datetime(sl["invoice_date"], errors="coerce").dt.date
+
+    # Fechas de cierre de cada mes (ancla de la ventana de 30 días)
+    anchors: list[tuple[pd.Timestamp, date]] = []
+    y, m = today.year, today.month
+    for _ in range(meses):
+        last_day = _cal.monthrange(y, m)[1]
+        if y == today.year and m == today.month:
+            anchor = today
+        else:
+            anchor = date(y, m, last_day)
+        anchors.append((pd.Timestamp(date(y, m, 1)), anchor))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    anchors.reverse()
+
+    factor = 12.0 if anualizar else 1.0
+    denom = float(denominador or 0.0)
+
+    rows = []
+    for mes_ts, anchor in anchors:
+        win_start = anchor - timedelta(days=30)
+        sl_v = sl[(sl["_d"] > win_start) & (sl["_d"] <= anchor)]
+        ventas = float(
+            sl_v["price_subtotal_signed"].sum()
+        ) if not sl_v.empty else 0.0
+        rot = (ventas / denom * factor) if denom > 0 else 0.0
+        rows.append({
+            "mes": mes_ts,
+            "mes_label": mes_ts.strftime("%Y-%m"),
+            "ventas_30d": ventas,
+            "rotacion_30d": rot,
+        })
+
+    return pd.DataFrame(rows)

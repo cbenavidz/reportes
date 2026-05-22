@@ -37,6 +37,7 @@ from src.purchases_analyzer import (
     compute_inventory_recommendations,
     compute_product_crosstab,
     compute_purchases_vs_sales_summary,
+    compute_rotacion_30d_historica_consolidada,
     compute_rotacion_categoria_30d_historica,
     compute_rotacion_categoria_multi_ventana,
     compute_rotacion_cuenta_14,
@@ -814,6 +815,106 @@ with t_evol:
                 },
                 use_container_width=True, hide_index=True,
             )
+
+    # ── Histórico consolidado: rotación a 30 días mes a mes ──
+    st.markdown("---")
+    st.markdown("### 📉 Histórico mes a mes — Rotación a 30 días (consolidado)")
+    st.caption(
+        "Rotación de toda la empresa: para cada mes, ventas de los últimos "
+        "30 días / saldo de inventario (cuenta 14). El denominador es fijo "
+        "(saldo actual), así la variación mes a mes refleja la velocidad "
+        "de venta."
+    )
+
+    _denom_30d = float(rot14_act.get("saldo_final", 0) or 0)
+    hist_30d_consol = compute_rotacion_30d_historica_consolidada(
+        sales_lines if sales_lines is not None else sales_365,
+        denominador=_denom_30d,
+        today=today,
+        meses=12,
+        anualizar=False,
+    )
+
+    if _denom_30d <= 0:
+        st.info(
+            "No hay saldo de inventario (cuenta 14) disponible para "
+            "calcular la rotación consolidada."
+        )
+    elif (
+        hist_30d_consol is None or hist_30d_consol.empty
+        or float(hist_30d_consol["ventas_30d"].abs().sum()) == 0
+    ):
+        st.info(
+            "No hay suficiente histórico de ventas para esta gráfica. "
+            "Activa el toggle **'Mostrar KPIs móviles 90/180/365'** arriba "
+            "para cargar las ventas de los últimos 365 días."
+        )
+    else:
+        fig_30d = go.Figure()
+        fig_30d.add_trace(go.Scatter(
+            x=hist_30d_consol["mes_label"],
+            y=hist_30d_consol["rotacion_30d"],
+            mode="lines+markers",
+            name="Rotación 30 días",
+            line=dict(color="#0ea5e9", width=3),
+            marker=dict(size=9),
+            hovertemplate="<b>%{x}</b><br>Rotación 30d: %{y:.2f}x<extra></extra>",
+        ))
+        # Línea de promedio del período
+        _rot_prom = float(hist_30d_consol["rotacion_30d"].mean())
+        fig_30d.add_hline(
+            y=_rot_prom, line_dash="dash", line_color="#94a3b8",
+            annotation_text=f"Promedio {_rot_prom:.2f}x",
+            annotation_position="top left",
+        )
+        fig_30d.update_layout(
+            height=400, margin=dict(l=0, r=0, t=20, b=0),
+            title="Rotación a 30 días — consolidado empresa",
+            yaxis=dict(title="Rotación (veces)"),
+            xaxis=dict(title="Mes"),
+        )
+        st.plotly_chart(fig_30d, use_container_width=True)
+
+        # KPIs rápidos
+        _ult = hist_30d_consol.iloc[-1]
+        kc1, kc2, kc3 = st.columns(3)
+        with kc1:
+            st.metric(
+                f"Rotación 30d — {_ult['mes_label']}",
+                f"{_ult['rotacion_30d']:.2f}x",
+            )
+        with kc2:
+            st.metric("Promedio 12 meses", f"{_rot_prom:.2f}x")
+        with kc3:
+            _maxr = hist_30d_consol.loc[
+                hist_30d_consol["rotacion_30d"].idxmax()
+            ]
+            st.metric(
+                "Mejor mes",
+                f"{_maxr['rotacion_30d']:.2f}x",
+                delta=str(_maxr["mes_label"]), delta_color="off",
+            )
+
+        with st.expander("📋 Tabla — rotación 30d consolidada por mes"):
+            st.dataframe(
+                hist_30d_consol[["mes_label", "ventas_30d", "rotacion_30d"]]
+                .rename(columns={"mes_label": "Mes"}),
+                column_config={
+                    "ventas_30d": st.column_config.NumberColumn(
+                        "Ventas 30 días", format="$%,.0f",
+                    ),
+                    "rotacion_30d": st.column_config.NumberColumn(
+                        "Rotación 30d", format="%.2fx",
+                    ),
+                },
+                use_container_width=True, hide_index=True,
+            )
+        st.caption(
+            f"Denominador (saldo cuenta 14 al corte): "
+            f"{_money(_denom_30d)}. "
+            "Una línea creciente indica que la empresa rota su inventario "
+            "cada vez más rápido."
+        )
 
 
 # ─── Tab Por categoría ───
