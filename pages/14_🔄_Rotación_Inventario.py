@@ -37,6 +37,7 @@ from src.purchases_analyzer import (
     compute_inventory_recommendations,
     compute_product_crosstab,
     compute_purchases_vs_sales_summary,
+    compute_rotacion_categoria_30d_historica,
     compute_rotacion_categoria_multi_ventana,
     compute_rotacion_cuenta_14,
 )
@@ -915,6 +916,89 @@ with t_cat:
                     "crecen naturalmente porque hay más tiempo. Activa el "
                     "toggle 'Anualizar' para comparar entre ventanas."
                 )
+
+    # ── Histórico mes a mes — rotación a 30 días por categoría ──
+    st.markdown("---")
+    st.markdown("### 📉 Histórico mes a mes — Rotación a 30 días")
+    st.caption(
+        "Para cada mes se calcula la rotación con una ventana de 30 días "
+        "(ventas de los últimos 30 días del mes / valor de stock actual). "
+        "Permite ver cómo varía la rotación a 30 días mes a mes."
+    )
+
+    hist_30d = compute_rotacion_categoria_30d_historica(
+        sales_lines if sales_lines is not None else sales_365,
+        stock_df,
+        today=today,
+        meses=12,
+        anualizar=False,
+    )
+
+    if hist_30d is None or hist_30d.empty:
+        st.info(
+            "No hay suficiente histórico de ventas para construir esta "
+            "gráfica. Activa el toggle **'Mostrar KPIs móviles 90/180/365'** "
+            "arriba para cargar las ventas de los últimos 365 días."
+        )
+    else:
+        # Selección de categorías — por defecto las de mayor venta total
+        ventas_por_cat = (
+            hist_30d.groupby("product_categ_name")["ventas_30d"]
+            .sum().sort_values(ascending=False)
+        )
+        cats_disponibles = ventas_por_cat.index.tolist()
+        default_cats = cats_disponibles[:6]
+
+        cats_sel = st.multiselect(
+            "Categorías a comparar",
+            options=cats_disponibles,
+            default=default_cats,
+            key="ri_hist30_cats",
+            help="Por defecto se muestran las 6 categorías de mayor venta.",
+        )
+
+        if not cats_sel:
+            st.info("Selecciona al menos una categoría para ver la gráfica.")
+        else:
+            hist_show = hist_30d[
+                hist_30d["product_categ_name"].isin(cats_sel)
+            ].copy()
+            fig_hist = px.line(
+                hist_show,
+                x="mes_label", y="rotacion_30d",
+                color="product_categ_name",
+                markers=True,
+                labels={
+                    "mes_label": "Mes",
+                    "rotacion_30d": "Rotación 30 días (veces)",
+                    "product_categ_name": "Categoría",
+                },
+            )
+            fig_hist.update_layout(
+                height=420, margin=dict(l=0, r=0, t=10, b=0),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                hovermode="x unified",
+            )
+            fig_hist.update_traces(
+                hovertemplate="%{y:.2f}x<extra>%{fullData.name}</extra>",
+            )
+            st.plotly_chart(fig_hist, use_container_width=True)
+
+            # Tabla pivote mes × categoría
+            with st.expander("📋 Tabla — rotación 30d por mes y categoría"):
+                pivot = hist_show.pivot_table(
+                    index="mes_label", columns="product_categ_name",
+                    values="rotacion_30d", aggfunc="sum",
+                ).reset_index().rename(columns={"mes_label": "Mes"})
+                st.dataframe(
+                    pivot, use_container_width=True, hide_index=True,
+                )
+            st.caption(
+                "💡 Una línea creciente indica que esa categoría está "
+                "rotando cada vez más rápido; una decreciente, que se está "
+                "frenando. El denominador (stock) es el mismo en todos los "
+                "meses, así que la variación refleja la velocidad de venta."
+            )
 
     st.markdown("---")
     st.markdown("### Rotación por categoría (período seleccionado)")

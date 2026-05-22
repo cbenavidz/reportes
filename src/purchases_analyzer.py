@@ -1073,3 +1073,123 @@ def compute_rotacion_categoria_multi_ventana(
     if sort_col in df.columns:
         df = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
     return df
+
+
+def compute_rotacion_categoria_30d_historica(
+    sales_lines: pd.DataFrame,
+    stock_df: pd.DataFrame,
+    today: date | None = None,
+    meses: int = 12,
+    anualizar: bool = False,
+) -> pd.DataFrame:
+    """
+    Serie histórica mes a mes de la rotación a 30 días por categoría.
+
+    Para cada mes del histórico se calcula la rotación usando una ventana
+    de 30 días que termina el último día de ese mes (para el mes en curso,
+    termina HOY):
+
+        rotacion_30d(mes) = ventas[30 días previos al cierre del mes]
+                            / stock_valor de la categoría
+
+    El denominador es el stock ACTUAL (snapshot de stock.quant) — igual que
+    en compute_rotacion_categoria_multi_ventana. Así, la variación mes a mes
+    refleja cambios en la velocidad de venta (numerador).
+
+    Args:
+        sales_lines: líneas de facturas de venta (deben cubrir el histórico
+            que se quiere graficar; idealmente ≥ 365 días).
+        stock_df: stock por producto (qty_available, stock_value).
+        today: fecha de referencia (default date.today()).
+        meses: cantidad de meses hacia atrás a calcular.
+        anualizar: si True multiplica la rotación de 30 días × 12.
+
+    Returns:
+        DataFrame en formato largo con columnas:
+          - mes (timestamp del primer día del mes)
+          - mes_label (str 'YYYY-MM')
+          - product_categ_name
+          - ventas_30d
+          - stock_valor
+          - rotacion_30d
+    """
+    import calendar as _cal
+
+    if today is None:
+        today = date.today()
+
+    sl = _apply_default_exclusions(_normalize_sales_signed(sales_lines))
+    if sl is None or sl.empty or "invoice_date" not in sl.columns:
+        return pd.DataFrame()
+
+    sl["_d"] = pd.to_datetime(sl["invoice_date"], errors="coerce").dt.date
+    if "product_categ_name" not in sl.columns:
+        sl["product_categ_name"] = "(Sin categoría)"
+    sl["product_categ_name"] = sl["product_categ_name"].fillna("(Sin categoría)")
+
+    # ── Construir las fechas de cierre de cada mes (ancla de la ventana) ──
+    anchors: list[tuple[pd.Timestamp, date]] = []
+    y, m = today.year, today.month
+    for _ in range(meses):
+        last_day = _cal.monthrange(y, m)[1]
+        if y == today.year and m == today.month:
+            anchor = today
+        else:
+            anchor = date(y, m, last_day)
+        anchors.append((pd.Timestamp(date(y, m, 1)), anchor))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    anchors.reverse()  # orden cronológico
+
+    # ── Stock por categoría (snapshot actual) ──
+    if stock_df is not None and not stock_df.empty:
+        prod_cat = (
+            sl[["product_id", "product_categ_name"]]
+            .drop_duplicates(subset="product_id")
+            .dropna(subset=["product_id"])
+        )
+        stock_join = stock_df.merge(prod_cat, on="product_id", how="left")
+        stock_join["product_categ_name"] = stock_join[
+            "product_categ_name"
+        ].fillna("(Sin categoría)")
+        stock_por_cat = stock_join.groupby("product_categ_name")[
+            "stock_value"
+        ].sum().to_dict()
+    else:
+        stock_por_cat = {}
+
+    factor = 12.0 if anualizar else 1.0
+
+    # ── Ventas de la ventana de 30 días por cada mes ──
+    rows = []
+    for mes_ts, anchor in anchors:
+        win_start = anchor - timedelta(days=30)
+        sl_v = sl[(sl["_d"] > win_start) & (sl["_d"] <= anchor)]
+        if sl_v.empty:
+            ventas_cat = pd.DataFrame(
+                columns=["product_categ_name", "price_subtotal_signed"]
+            )
+        else:
+            ventas_cat = sl_v.groupby(
+                "product_categ_name", as_index=False
+            )["price_subtotal_signed"].sum()
+        for _, r in ventas_cat.iterrows():
+            cat = r["product_categ_name"]
+            ventas = float(r["price_subtotal_signed"])
+            stock_val = float(stock_por_cat.get(cat, 0.0) or 0.0)
+            rot = (ventas / stock_val * factor) if stock_val > 0 else 0.0
+            rows.append({
+                "mes": mes_ts,
+                "mes_label": mes_ts.strftime("%Y-%m"),
+                "product_categ_name": cat,
+                "ventas_30d": ventas,
+                "stock_valor": stock_val,
+                "rotacion_30d": rot,
+            })
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(
+        ["product_categ_name", "mes"]
+    ).reset_index(drop=True)
