@@ -127,31 +127,87 @@ with st.spinner("Cargando plan de cuentas..."):
         )
         st.stop()
 
-# OPTIMIZACIÓN: usar read_group server-side para TODO en lugar de traer
-# líneas individuales. Esto reduce el tiempo de minutos a segundos.
-with st.spinner("Calculando saldos del período..."):
-    # Saldos del período actual (para P&L)
-    balances_periodo = load_account_balances_aggregated(
-        date_from=fecha_desde.isoformat(),
-        date_to=fecha_hasta.isoformat(),
-        company_ids=filters["company_ids"],
-    )
-    # Saldos del período anterior (para comparativa)
-    balances_periodo_prev = load_account_balances_aggregated(
-        date_from=fecha_desde_prev.isoformat(),
-        date_to=fecha_hasta_prev.isoformat(),
-        company_ids=filters["company_ids"],
-    )
-    # Saldos HISTÓRICOS acumulados (para Balance General)
-    balances_hist = load_account_balances_aggregated(
-        date_to=fecha_hasta.isoformat(),
-        company_ids=filters["company_ids"],
-    )
+# Identificar cuentas de caja/bancos (para Flujo) y de gasto (para
+# Análisis de Gastos) desde el plan de cuentas. Así podemos cargar SOLO
+# los movimientos de esas cuentas en vez de todo el libro mayor.
+_chart_e_ids = (
+    enrich_chart_with_puc(chart)
+    if (chart is not None and not chart.empty) else pd.DataFrame()
+)
+cash_account_ids: list[int] = []
+expense_account_ids: list[int] = []
+if not _chart_e_ids.empty and "id" in _chart_e_ids.columns:
+    if "puc_subgroup" in _chart_e_ids.columns:
+        _m = _chart_e_ids["puc_subgroup"].astype(str) == "11"
+        cash_account_ids += _chart_e_ids.loc[_m, "id"].dropna().astype(int).tolist()
+    if "account_type" in _chart_e_ids.columns:
+        _m = _chart_e_ids["account_type"] == "asset_cash"
+        cash_account_ids += _chart_e_ids.loc[_m, "id"].dropna().astype(int).tolist()
+    if "puc_group" in _chart_e_ids.columns:
+        _m = _chart_e_ids["puc_group"].astype(str) == "5"
+        expense_account_ids += _chart_e_ids.loc[_m, "id"].dropna().astype(int).tolist()
+cash_account_ids = sorted(set(cash_account_ids))
+expense_account_ids = sorted(set(expense_account_ids))
 
-# Para flujo de efectivo necesitamos líneas individuales, pero SOLO de
-# cuentas de caja/bancos. Las identificamos del chart (PUC 11xx o
-# account_type=asset_cash) y filtramos. `moves` queda vacío aquí — la
-# pestaña de Flujo lo carga bajo demanda.
+# OPTIMIZACIÓN: todas las descargas contables son independientes entre sí
+# → se cargan EN PARALELO. Antes los 3 balances iban en serie y los
+# movimientos de caja/gastos se descargaban (eager) dentro de cada
+# pestaña en cada render. Ahora una sola tanda paralela. Los loaders
+# están cacheados con @st.cache_data (read_group server-side).
+from concurrent.futures import ThreadPoolExecutor as _TPfin  # noqa: E402
+
+with st.spinner("Calculando saldos y movimientos contables..."):
+    _cids = filters["company_ids"]
+    _tasks = {
+        "bal_periodo": lambda: load_account_balances_aggregated(
+            date_from=fecha_desde.isoformat(),
+            date_to=fecha_hasta.isoformat(), company_ids=_cids,
+        ),
+        "bal_periodo_prev": lambda: load_account_balances_aggregated(
+            date_from=fecha_desde_prev.isoformat(),
+            date_to=fecha_hasta_prev.isoformat(), company_ids=_cids,
+        ),
+        "bal_hist": lambda: load_account_balances_aggregated(
+            date_to=fecha_hasta.isoformat(), company_ids=_cids,
+        ),
+        "cash_moves": lambda: load_cash_movements_only(
+            date_from=fecha_desde.isoformat(),
+            date_to=fecha_hasta.isoformat(), company_ids=_cids,
+            cash_account_ids=(
+                tuple(cash_account_ids) if cash_account_ids else None
+            ),
+        ),
+        "gastos": lambda: (
+            load_expense_movements(
+                date_from=fecha_desde.isoformat(),
+                date_to=fecha_hasta.isoformat(),
+                expense_account_ids=tuple(expense_account_ids),
+                company_ids=_cids,
+            ) if expense_account_ids else pd.DataFrame()
+        ),
+        "gastos_prev": lambda: (
+            load_expense_movements(
+                date_from=fecha_desde_prev.isoformat(),
+                date_to=fecha_hasta_prev.isoformat(),
+                expense_account_ids=tuple(expense_account_ids),
+                company_ids=_cids,
+            ) if expense_account_ids else pd.DataFrame()
+        ),
+    }
+    _res: dict = {}
+    with _TPfin(max_workers=6) as _pool:
+        _futs = {k: _pool.submit(fn) for k, fn in _tasks.items()}
+        for k, fut in _futs.items():
+            _res[k] = fut.result()
+
+balances_periodo = _res["bal_periodo"]
+balances_periodo_prev = _res["bal_periodo_prev"]
+balances_hist = _res["bal_hist"]
+cash_moves_all = _res["cash_moves"]
+moves_gastos = _res["gastos"]
+moves_gastos_prev = _res["gastos_prev"]
+
+# `moves` queda vacío: P&L y Balance se calculan desde balances agregados.
 moves = pd.DataFrame()
 
 # Validación: si no hay NI plan de cuentas NI balances, no hay datos.
@@ -534,28 +590,9 @@ with tab_flujo:
         f"{fecha_desde} y {fecha_hasta}."
     )
 
-    # OPTIMIZACIÓN: solo cargar líneas de cuentas de caja/bancos
-    # Identificamos esas cuentas del chart (account_type=asset_cash o PUC 11)
-    from src.financial_statements import enrich_chart_with_puc
-    chart_e = enrich_chart_with_puc(chart)
-    cash_account_ids: list[int] = []
-    if "puc_subgroup" in chart_e.columns:
-        mask = chart_e["puc_subgroup"].astype(str) == "11"
-        cash_account_ids = chart_e.loc[mask, "id"].dropna().astype(int).tolist()
-    if "account_type" in chart_e.columns:
-        mask = chart_e["account_type"] == "asset_cash"
-        cash_account_ids += chart_e.loc[mask, "id"].dropna().astype(int).tolist()
-    cash_account_ids = list(set(cash_account_ids))
-
-    with st.spinner(f"Cargando movimientos de {len(cash_account_ids)} cuentas de caja..."):
-        cash_moves = load_cash_movements_only(
-            date_from=fecha_desde.isoformat(),
-            date_to=fecha_hasta.isoformat(),
-            company_ids=filters["company_ids"],
-            cash_account_ids=tuple(cash_account_ids) if cash_account_ids else None,
-        )
-
-    cf = compute_cash_flow(cash_moves, chart, fecha_desde, fecha_hasta)
+    # Los movimientos de caja/bancos (cash_moves_all) ya se descargaron
+    # en paralelo al inicio de la página.
+    cf = compute_cash_flow(cash_moves_all, chart, fecha_desde, fecha_hasta)
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("📥 Entradas", _money(cf["entradas"]))
@@ -641,38 +678,15 @@ with tab_gastos:
         f"Comparativo: {fecha_desde_prev} → {fecha_hasta_prev}"
     )
 
-    # ── 1. Identificar cuentas de gasto del chart (grupo 5) para cargar
-    #       movimientos individuales SOLO de esas cuentas (rápido).
-    chart_e = enrich_chart_with_puc(chart) if not chart.empty else chart
-    if not chart_e.empty and "puc_group" in chart_e.columns:
-        expense_accounts = chart_e[chart_e["puc_group"].astype(str) == "5"]
-    else:
-        expense_accounts = pd.DataFrame()
-
-    expense_account_ids: tuple[int, ...] = tuple(
-        int(i) for i in expense_accounts["id"].dropna().unique()
-    ) if not expense_accounts.empty and "id" in expense_accounts.columns else ()
-
+    # Las cuentas de gasto (expense_account_ids) y sus movimientos
+    # (moves_gastos / moves_gastos_prev) ya se descargaron EN PARALELO
+    # al inicio de la página. Aquí solo se consumen.
     if not expense_account_ids:
         st.info(
             "No se encontraron cuentas clasificadas como gasto (grupo 5) "
             "en el plan de cuentas."
         )
     else:
-        with st.spinner("Cargando movimientos de gastos..."):
-            moves_gastos = load_expense_movements(
-                date_from=fecha_desde.isoformat(),
-                date_to=fecha_hasta.isoformat(),
-                expense_account_ids=expense_account_ids,
-                company_ids=filters["company_ids"],
-            )
-            moves_gastos_prev = load_expense_movements(
-                date_from=fecha_desde_prev.isoformat(),
-                date_to=fecha_hasta_prev.isoformat(),
-                expense_account_ids=expense_account_ids,
-                company_ids=filters["company_ids"],
-            )
-
         exp = compute_expenses_breakdown(
             moves_gastos, chart, fecha_desde, fecha_hasta,
         )
