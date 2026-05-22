@@ -24,7 +24,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.auth import logout_button, require_auth
-from src.data_loader import compute_full_analysis, load_invoice_lines
+from src.data_loader import load_invoice_lines, load_raw_data
 from src.sales_analyzer import (
     EXCLUDED_SALES_DEFAULT_CODES,
     compute_sales_by_partner,
@@ -72,24 +72,41 @@ if filters["company_ids"] is not None and len(filters["company_ids"]) == 0:
     st.warning("Selecciona al menos una empresa en el sidebar para ver datos.")
     st.stop()
 
-# Cargamos el análisis completo solo para reutilizar `raw_invoices`,
-# `raw_partners` y `companies` ya cacheados (mismo TTL que el resto del app).
-data = compute_full_analysis(
+# El Informe de Ventas solo necesita facturas, terceros y empresas.
+# Usamos load_raw_data (descarga ligera y cacheada) en lugar de
+# compute_full_analysis, que además corre TODO el pipeline de cartera
+# (scoring, alertas, plan de cobro, histórico mensual, DSO rolling con
+# matching FIFO factura↔pago) — cálculo costoso e innecesario aquí.
+raw = load_raw_data(
     months_back=filters["months_back"],
-    rotation_period_days=filters["period_days"],
     company_ids=filters["company_ids"],
-    exclude_cash_sales=filters["exclude_cash_sales"],
-    analysis_window_days=filters.get("analysis_window_days"),
 )
 
-render_company_context(data.get("companies"), filters["company_ids"])
+render_company_context(raw.get("companies"), filters["company_ids"])
 
-invoices_all = data.get("raw_invoices")
-partners_all = data.get("raw_partners")
+invoices_all = raw.get("invoices")
+partners_all = raw.get("partners")
+cutoff_date = raw.get("cutoff_date")
 
 if invoices_all is None or invoices_all.empty:
     st.info("No hay facturas disponibles en el rango cargado.")
     st.stop()
+
+# ---------------------------------------------------------------------------
+# Líneas de factura — se cargan ANTES del filtro de vendedor porque el
+# filtro también las recorta. (Cacheadas con @st.cache_data.)
+# ---------------------------------------------------------------------------
+try:
+    invoice_lines_all = load_invoice_lines(
+        months_back=filters["months_back"],
+        company_ids=filters["company_ids"],
+    )
+except Exception as exc:  # noqa: BLE001
+    st.warning(
+        f"No se pudieron cargar las líneas de factura: {exc}. "
+        "El informe NO descontará SOAT/papeles esta vez."
+    )
+    invoice_lines_all = pd.DataFrame()
 
 # ---------------------------------------------------------------------------
 # Filtro de vendedor (inline, arriba del contenido)
@@ -123,18 +140,6 @@ if vendedor_user_ids and partners_all is not None and not partners_all.empty:
     else:
         st.warning("Los vendedores seleccionados no tienen clientes asignados.")
         st.stop()
-
-try:
-    invoice_lines_all = load_invoice_lines(
-        months_back=filters["months_back"],
-        company_ids=filters["company_ids"],
-    )
-except Exception as exc:  # noqa: BLE001
-    st.warning(
-        f"No se pudieron cargar las líneas de factura: {exc}. "
-        "El informe NO descontará SOAT/papeles esta vez."
-    )
-    invoice_lines_all = pd.DataFrame()
 
 # Snapshot del total ANTES del recompute (para diagnóstico)
 _dbg_total_antes = (
@@ -212,7 +217,7 @@ with st.expander("🔍 Diagnóstico de datos", expanded=False):
 st.markdown("### 🗓️ Período del informe")
 col_p1, col_p2, col_p3 = st.columns([1, 1, 2])
 
-cutoff = data["cutoff_date"]
+cutoff = cutoff_date
 default_to = pd.Timestamp(cutoff).date() if cutoff else date.today()
 
 # Por defecto: mes actual completo
