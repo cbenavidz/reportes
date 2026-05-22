@@ -154,9 +154,14 @@ show_mobile = st.checkbox(
     ),
 )
 
-# ── Carga base ──
-with st.spinner("Cargando plan de cuentas, ventas y compras..."):
-    chart_df = load_chart_of_accounts(company_ids=filters["company_ids"])
+# ── Carga base (en paralelo) ──
+# Todas las cargas son independientes entre sí, así que las disparamos en
+# paralelo con un ThreadPoolExecutor. Esto reduce drásticamente el tiempo
+# de primera carga (las funciones loader están cacheadas con @st.cache_data).
+from concurrent.futures import ThreadPoolExecutor as _TPbase  # noqa: E402
+
+with st.spinner("Cargando plan de cuentas, ventas, compras y balances..."):
+    _cids = filters["company_ids"]
 
     # Ventas: si el toggle de móviles está ON, cargar 365d (cubre todo);
     # si está OFF, solo el rango del período + previo.
@@ -169,76 +174,82 @@ with st.spinner("Cargando plan de cuentas, ventas y compras..."):
         sales_date_from = fecha_desde_prev.isoformat()
         sales_date_to = fecha_hasta.isoformat()
 
-    sales_lines = load_invoice_lines(
-        company_ids=filters["company_ids"],
-        date_from=sales_date_from,
-        date_to=sales_date_to,
-    )
-    # sales_365 es alias del mismo DF (si toggle ON cubre 365d; si OFF, lo que haya)
-    sales_365 = sales_lines
-
-    purchases_lines = load_purchase_invoice_lines(
-        date_from=fecha_desde_prev.isoformat(),
-        date_to=fecha_hasta.isoformat(),
-        company_ids=filters["company_ids"],
-    )
-    stock_df = load_stock_quants(company_ids=filters["company_ids"])
-
-    # Balance al INICIO y al CIERRE del período actual (para promedio)
-    balances_corte = load_account_balances_aggregated(
-        date_to=fecha_hasta.isoformat(),
-        company_ids=filters["company_ids"],
-    )
     fecha_antes = (fecha_desde - timedelta(days=1)).isoformat()
-    balances_inicio = load_account_balances_aggregated(
-        date_to=fecha_antes,
-        company_ids=filters["company_ids"],
-    )
-    # Para comparativo con período anterior
-    balances_corte_prev = load_account_balances_aggregated(
-        date_to=fecha_hasta_prev.isoformat(),
-        company_ids=filters["company_ids"],
-    )
     fecha_antes_prev = (fecha_desde_prev - timedelta(days=1)).isoformat()
-    balances_inicio_prev = load_account_balances_aggregated(
-        date_to=fecha_antes_prev,
-        company_ids=filters["company_ids"],
-    )
 
-    # Balances para KPIs móviles — SOLO si el usuario los pidió
+    # Tareas independientes — cada lambda captura valores fijos.
+    _tasks = {
+        "chart": lambda: load_chart_of_accounts(company_ids=_cids),
+        "sales": lambda: load_invoice_lines(
+            company_ids=_cids, date_from=sales_date_from, date_to=sales_date_to,
+        ),
+        "purchases": lambda: load_purchase_invoice_lines(
+            date_from=fecha_desde_prev.isoformat(),
+            date_to=fecha_hasta.isoformat(), company_ids=_cids,
+        ),
+        "stock": lambda: load_stock_quants(company_ids=_cids),
+        "bal_corte": lambda: load_account_balances_aggregated(
+            date_to=fecha_hasta.isoformat(), company_ids=_cids,
+        ),
+        "bal_inicio": lambda: load_account_balances_aggregated(
+            date_to=fecha_antes, company_ids=_cids,
+        ),
+        "bal_corte_prev": lambda: load_account_balances_aggregated(
+            date_to=fecha_hasta_prev.isoformat(), company_ids=_cids,
+        ),
+        "bal_inicio_prev": lambda: load_account_balances_aggregated(
+            date_to=fecha_antes_prev, company_ids=_cids,
+        ),
+    }
     if show_mobile:
-        # Reusar balances_corte como balances_hoy si la fecha coincide
-        if fecha_hasta == today:
-            balances_hoy = balances_corte
-        else:
-            balances_hoy = load_account_balances_aggregated(
-                date_to=today.isoformat(),
-                company_ids=filters["company_ids"],
+        _tasks["bal_inicio_30"] = lambda: load_account_balances_aggregated(
+            date_to=(today - timedelta(days=31)).isoformat(), company_ids=_cids,
+        )
+        _tasks["bal_inicio_90"] = lambda: load_account_balances_aggregated(
+            date_to=(today - timedelta(days=91)).isoformat(), company_ids=_cids,
+        )
+        _tasks["bal_inicio_180"] = lambda: load_account_balances_aggregated(
+            date_to=(today - timedelta(days=181)).isoformat(), company_ids=_cids,
+        )
+        _tasks["bal_inicio_365"] = lambda: load_account_balances_aggregated(
+            date_to=(today - timedelta(days=366)).isoformat(), company_ids=_cids,
+        )
+        if fecha_hasta != today:
+            _tasks["bal_hoy"] = lambda: load_account_balances_aggregated(
+                date_to=today.isoformat(), company_ids=_cids,
             )
-        bal_inicio_30 = load_account_balances_aggregated(
-            date_to=(today - timedelta(days=31)).isoformat(),
-            company_ids=filters["company_ids"],
+
+    _results: dict = {}
+    with _TPbase(max_workers=8) as _pool:
+        _futs = {k: _pool.submit(fn) for k, fn in _tasks.items()}
+        for k, fut in _futs.items():
+            _results[k] = fut.result()
+
+    chart_df = _results["chart"]
+    sales_lines = _results["sales"]
+    sales_365 = sales_lines  # alias
+    purchases_lines = _results["purchases"]
+    stock_df = _results["stock"]
+    balances_corte = _results["bal_corte"]
+    balances_inicio = _results["bal_inicio"]
+    balances_corte_prev = _results["bal_corte_prev"]
+    balances_inicio_prev = _results["bal_inicio_prev"]
+
+    if show_mobile:
+        balances_hoy = (
+            balances_corte if fecha_hasta == today
+            else _results.get("bal_hoy", balances_corte)
         )
-        bal_inicio_90 = load_account_balances_aggregated(
-            date_to=(today - timedelta(days=91)).isoformat(),
-            company_ids=filters["company_ids"],
-        )
-        bal_inicio_180 = load_account_balances_aggregated(
-            date_to=(today - timedelta(days=181)).isoformat(),
-            company_ids=filters["company_ids"],
-        )
-        bal_inicio_365 = load_account_balances_aggregated(
-            date_to=(today - timedelta(days=366)).isoformat(),
-            company_ids=filters["company_ids"],
-        )
+        bal_inicio_30 = _results["bal_inicio_30"]
+        bal_inicio_90 = _results["bal_inicio_90"]
+        bal_inicio_180 = _results["bal_inicio_180"]
+        bal_inicio_365 = _results["bal_inicio_365"]
     else:
-        # Placeholders vacíos — no se usarán si show_mobile=False
-        import pandas as _pd
         balances_hoy = balances_corte
-        bal_inicio_30 = _pd.DataFrame()
-        bal_inicio_90 = _pd.DataFrame()
-        bal_inicio_180 = _pd.DataFrame()
-        bal_inicio_365 = _pd.DataFrame()
+        bal_inicio_30 = pd.DataFrame()
+        bal_inicio_90 = pd.DataFrame()
+        bal_inicio_180 = pd.DataFrame()
+        bal_inicio_365 = pd.DataFrame()
 
 if chart_df is None or chart_df.empty:
     st.error(
@@ -556,68 +567,88 @@ st.markdown("---")
 
 
 # ── Serie mensual: saldo cuenta 14 + ventas del mes ──
-# Usamos la MISMA lógica que el KPI cabecera (que funciona): cargar el
-# balance al cierre de cada mes con load_account_balances_aggregated y
-# aplicar _saldo_cuenta_14_from_balances. Esto garantiza consistencia.
+# OPTIMIZACIÓN: en lugar de N consultas de balance (una por mes), que
+# escanean todo el libro contable repetidamente, identificamos las
+# cuentas de inventario una vez y usamos load_inventory_balance_monthly_series
+# que resuelve toda la serie con SOLO 2 consultas (saldo inicial + cumsum).
 with st.spinner("Construyendo serie mensual..."):
-    from calendar import monthrange as _mr
-    from concurrent.futures import ThreadPoolExecutor as _TP3
-    from src.purchases_analyzer import _saldo_cuenta_14_from_balances
+    from src.purchases_analyzer import (
+        _saldo_cuenta_14_from_balances,
+        get_inventory_account_ids,
+    )
 
-    chart_e = enrich_chart_with_puc(chart_df)
+    inv_acc_ids = get_inventory_account_ids(chart_df)
 
-    # Lista de fechas de cierre de mes en el rango
-    eom_list: list[date] = []
-    y, m = fecha_desde.year, fecha_desde.month
-    while True:
-        first = date(y, m, 1)
-        if first > fecha_hasta:
-            break
-        last = date(y, m, _mr(y, m)[1])
-        cierre = min(last, fecha_hasta)
-        eom_list.append(cierre)
-        m += 1
-        if m > 12:
-            m = 1
-            y += 1
-        if y > fecha_hasta.year + 1:
-            break
+    saldo_mes = pd.DataFrame(columns=["mes", "saldo_inv_cierre"])
+    _metodo_serie = "rápido (2 consultas)"
 
-    def _saldo_at(d: date) -> tuple[date, float]:
-        bal = load_account_balances_aggregated(
-            date_to=d.isoformat(),
-            company_ids=filters["company_ids"],
+    if inv_acc_ids:
+        serie = load_inventory_balance_monthly_series(
+            date_from=fecha_desde.isoformat(),
+            date_to=fecha_hasta.isoformat(),
+            inventory_account_ids=tuple(sorted(inv_acc_ids)),
+            company_ids=tuple(filters["company_ids"]) if filters["company_ids"] else None,
         )
-        saldo, _ = _saldo_cuenta_14_from_balances(bal, chart_e)
-        return d, saldo
+        if serie is not None and not serie.empty:
+            saldo_mes = serie.rename(
+                columns={"saldo_cierre": "saldo_inv_cierre"}
+            )[["mes", "saldo_inv_cierre"]].copy()
 
-    saldos_por_mes: dict[date, float] = {}
-    with _TP3(max_workers=6) as pool:
-        for d, saldo in pool.map(_saldo_at, eom_list):
-            saldos_por_mes[d] = saldo
+    # FALLBACK: si no se pudieron identificar cuentas de inventario o la
+    # serie quedó vacía/en cero, usar el método clásico (1 balance por mes).
+    if saldo_mes.empty or float(saldo_mes["saldo_inv_cierre"].abs().sum()) == 0:
+        _metodo_serie = "clásico (1 consulta por mes)"
+        from calendar import monthrange as _mr
+        from concurrent.futures import ThreadPoolExecutor as _TP3
 
-    # Construir saldo_mes con la misma estructura que antes esperaba
-    saldo_mes = pd.DataFrame([
-        {
-            "mes": pd.Timestamp(d.replace(day=1)),
-            "saldo_inv_cierre": saldos_por_mes.get(d, 0),
-        }
-        for d in eom_list
-    ])
+        chart_e = enrich_chart_with_puc(chart_df)
+        eom_list: list[date] = []
+        y, m = fecha_desde.year, fecha_desde.month
+        while True:
+            first = date(y, m, 1)
+            if first > fecha_hasta:
+                break
+            last = date(y, m, _mr(y, m)[1])
+            eom_list.append(min(last, fecha_hasta))
+            m += 1
+            if m > 12:
+                m, y = 1, y + 1
+            if y > fecha_hasta.year + 1:
+                break
+
+        def _saldo_at(d: date) -> tuple[date, float]:
+            bal = load_account_balances_aggregated(
+                date_to=d.isoformat(), company_ids=filters["company_ids"],
+            )
+            saldo, _ = _saldo_cuenta_14_from_balances(bal, chart_e)
+            return d, saldo
+
+        saldos_por_mes: dict[date, float] = {}
+        with _TP3(max_workers=6) as pool:
+            for d, saldo in pool.map(_saldo_at, eom_list):
+                saldos_por_mes[d] = saldo
+        saldo_mes = pd.DataFrame([
+            {"mes": pd.Timestamp(d.replace(day=1)),
+             "saldo_inv_cierre": saldos_por_mes.get(d, 0)}
+            for d in eom_list
+        ])
 
     # Diagnóstico
     with st.expander("🔍 Diagnóstico de saldo cuenta 14 mensual", expanded=False):
-        st.write(f"**Meses calculados:** {len(eom_list)}")
+        st.write(f"**Método de cálculo de la serie:** {_metodo_serie}")
+        st.write(f"**Cuentas de inventario detectadas:** {len(inv_acc_ids)}")
+        st.write(f"**Meses calculados:** {len(saldo_mes)}")
         st.write(f"**Rango pedido:** {fecha_desde} → {fecha_hasta}")
         st.dataframe(saldo_mes, hide_index=True, use_container_width=True)
-        st.write(
-            f"**Suma de saldo_inv_cierre:** "
-            f"${saldo_mes['saldo_inv_cierre'].sum():,.0f}"
-        )
-        st.write(
-            f"**Max saldo_inv_cierre:** "
-            f"${saldo_mes['saldo_inv_cierre'].max():,.0f}"
-        )
+        if not saldo_mes.empty:
+            st.write(
+                f"**Suma de saldo_inv_cierre:** "
+                f"${saldo_mes['saldo_inv_cierre'].sum():,.0f}"
+            )
+            st.write(
+                f"**Max saldo_inv_cierre:** "
+                f"${saldo_mes['saldo_inv_cierre'].max():,.0f}"
+            )
 
     # Ventas del período mensualizadas (cálculo en memoria, ya tenemos las líneas)
     ventas_mes = pd.DataFrame()

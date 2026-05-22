@@ -563,6 +563,39 @@ def _saldo_cuenta_14_from_balances(
     return saldo, detalle
 
 
+def get_inventory_account_ids(chart: pd.DataFrame) -> list[int]:
+    """
+    Devuelve los IDs de las cuentas de inventario (cuenta 14 PUC).
+
+    Usa la misma cascada de detección que _saldo_cuenta_14_from_balances:
+      1) código que empieza por '14'
+      2) puc_subgroup == '14'
+      3) account_type que contenga 'stock'/'inventory'
+
+    Se usa para optimizar la serie mensual de saldo de inventario
+    (load_inventory_balance_monthly_series): en lugar de N consultas de
+    balance, se filtran los movimientos directamente por estas cuentas.
+    """
+    if chart is None or chart.empty:
+        return []
+    chart_e = enrich_chart_with_puc(chart)
+    if "id" not in chart_e.columns:
+        return []
+
+    mask = None
+    if "code" in chart_e.columns:
+        mask = chart_e["code"].astype(str).str.startswith("14")
+    if (mask is None or not mask.any()) and "puc_subgroup" in chart_e.columns:
+        mask = chart_e["puc_subgroup"].astype(str) == "14"
+    if (mask is None or not mask.any()) and "account_type" in chart_e.columns:
+        mask = chart_e["account_type"].astype(str).str.contains(
+            "stock|inventory", case=False, na=False,
+        )
+    if mask is None or not mask.any():
+        return []
+    return chart_e.loc[mask, "id"].dropna().astype(int).tolist()
+
+
 def compute_rotacion_cuenta_14(
     balances_inicial: pd.DataFrame,
     balances_final: pd.DataFrame,
