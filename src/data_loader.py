@@ -398,7 +398,7 @@ def load_invoice_lines(
 # Loaders para análisis de Compras vs Ventas
 # ---------------------------------------------------------------------------
 
-PURCHASE_LINES_CACHE_VERSION = 4  # v4: backfill code desde display_name
+PURCHASE_LINES_CACHE_VERSION = 5  # v5: product_type + product_is_storable
 STOCK_QUANTS_CACHE_VERSION = 1
 
 

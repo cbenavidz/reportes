@@ -591,12 +591,30 @@ with t_prod:
 with t_sin:
     st.markdown("### ❓ Productos comprados en el período sin ventas")
     st.caption(
-        "Referencias que entraron al inventario en este período pero no se "
-        "vendieron en él. Útil para revisar surtido y forecasting."
+        "Referencias **almacenables** que entraron al inventario en este "
+        "período pero no se vendieron en él. Los servicios se excluyen. "
+        "Útil para revisar surtido y forecasting."
     )
     sin = find_purchased_not_sold(crosstab)
+
+    # Filtro: solo productos almacenables (excluir servicios y no-almacenables)
+    n_excluidos_serv = 0
+    if not sin.empty and "product_is_storable" in sin.columns:
+        _storable = sin["product_is_storable"] == True  # noqa: E712
+        if _storable.any():
+            n_excluidos_serv = int((~_storable).sum())
+            sin = sin[_storable].copy()
+    if n_excluidos_serv > 0:
+        st.caption(
+            f"🔧 Se excluyeron **{n_excluidos_serv}** referencias que son "
+            "servicios o productos no almacenables."
+        )
+
     if sin.empty:
-        st.success("✅ Todos los productos comprados se vendieron en el período.")
+        st.success(
+            "✅ Todos los productos almacenables comprados se vendieron "
+            "en el período."
+        )
     else:
         st.metric(
             "💸 Capital comprado sin vender",

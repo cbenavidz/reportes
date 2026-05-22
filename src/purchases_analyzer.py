@@ -177,13 +177,21 @@ def compute_product_crosstab(
 
     # ---- Lado compras ----
     if not pc.empty:
+        _pc_agg = {
+            "qty_comprada": ("quantity_signed", "sum"),
+            "monto_compras": ("price_subtotal_signed", "sum"),
+            "product_default_code": ("product_default_code", "first"),
+            "product_name": ("product_name", "first"),
+            "product_categ_name": ("product_categ_name", "first"),
+            "costo_unit_compra": ("price_unit", "mean"),
+        }
+        # Tipo de producto (storable/service) — para poder filtrar servicios
+        if "product_type" in pc.columns:
+            _pc_agg["product_type"] = ("product_type", "first")
+        if "product_is_storable" in pc.columns:
+            _pc_agg["product_is_storable"] = ("product_is_storable", "first")
         gpc = pc.groupby("product_id", as_index=False, dropna=False).agg(
-            qty_comprada=("quantity_signed", "sum"),
-            monto_compras=("price_subtotal_signed", "sum"),
-            product_default_code=("product_default_code", "first"),
-            product_name=("product_name", "first"),
-            product_categ_name=("product_categ_name", "first"),
-            costo_unit_compra=("price_unit", "mean"),
+            **_pc_agg
         )
     else:
         gpc = pd.DataFrame(columns=[

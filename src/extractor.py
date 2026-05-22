@@ -1665,13 +1665,27 @@ def extract_purchase_invoice_lines(
                     "company_id": first_co,
                     "allowed_company_ids": list(company_ids),
                 })
+            # Campos base + tipo de producto. `type` existe en todas las
+            # versiones; `is_storable` solo en Odoo 17+. Pedimos is_storable
+            # de forma defensiva (si no existe, no lo incluimos).
+            base_fields = ["id", "categ_id", "default_code", "name",
+                           "standard_price", "type"]
+            try:
+                _pp_meta = client.fields_get(
+                    "product.product", attributes=["string"],
+                )
+                _has_storable = "is_storable" in _pp_meta
+            except Exception:  # noqa: BLE001
+                _has_storable = False
+            prod_fields = base_fields + (
+                ["is_storable"] if _has_storable else []
+            )
             # read() ignora active_test automáticamente y trae registros
             # por ID directamente, incluso si están archivados.
             prod_records = client.read(
                 "product.product",
                 ids=product_ids,
-                fields=["id", "categ_id", "default_code", "name",
-                        "standard_price"],
+                fields=prod_fields,
                 context=product_context,
             )
             # Fallback a product.template para productos eliminados con unlink
@@ -1682,8 +1696,7 @@ def extract_purchase_invoice_lines(
                     tmpl_records = client.read(
                         "product.template",
                         ids=missing_ids,
-                        fields=["id", "categ_id", "default_code", "name",
-                                "standard_price"],
+                        fields=prod_fields,
                         context=product_context,
                     )
                     for t in tmpl_records:
@@ -1693,12 +1706,16 @@ def extract_purchase_invoice_lines(
                             "default_code": t.get("default_code"),
                             "name": t.get("name"),
                             "standard_price": t.get("standard_price", 0),
+                            "type": t.get("type"),
+                            "is_storable": t.get("is_storable"),
                         })
                 except Exception:  # noqa: BLE001
                     pass
             cat_map: dict[int, tuple[int | None, str | None]] = {}
             code_map: dict[int, str | None] = {}
             cost_map: dict[int, float] = {}
+            type_map: dict[int, str] = {}
+            storable_map: dict[int, bool] = {}
             for p in prod_records:
                 cid, cname = _unpack_m2o(p.get("categ_id"))
                 cat_map[int(p["id"])] = (cid, cname)
@@ -1708,6 +1725,16 @@ def extract_purchase_invoice_lines(
                     cost_map[int(p["id"])] = float(cost) if cost else 0.0
                 except (TypeError, ValueError):
                     cost_map[int(p["id"])] = 0.0
+                ptype = p.get("type")
+                ptype_s = str(ptype).strip().lower() if ptype else ""
+                type_map[int(p["id"])] = ptype_s
+                # Almacenable: is_storable=True (Odoo 17+) o type='product'
+                # (Odoo ≤16). Un servicio nunca es almacenable.
+                is_stor = p.get("is_storable")
+                if is_stor in (True, False):
+                    storable_map[int(p["id"])] = bool(is_stor)
+                else:
+                    storable_map[int(p["id"])] = (ptype_s == "product")
 
             def _cat_id(i):
                 if pd.isna(i):
@@ -1729,10 +1756,22 @@ def extract_purchase_invoice_lines(
                     return 0.0
                 return cost_map.get(int(i), 0.0)
 
+            def _ptype(i):
+                if pd.isna(i):
+                    return None
+                return type_map.get(int(i))
+
+            def _storable(i):
+                if pd.isna(i):
+                    return None
+                return storable_map.get(int(i))
+
             df["product_categ_id"] = df["product_id"].map(_cat_id)
             df["product_categ_name"] = df["product_id"].map(_cat_name)
             df["product_default_code"] = df["product_id"].map(_code)
             df["product_standard_price"] = df["product_id"].map(_cost)
+            df["product_type"] = df["product_id"].map(_ptype)
+            df["product_is_storable"] = df["product_id"].map(_storable)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "No se pudo enriquecer productos en compras: %s", exc,
@@ -1741,11 +1780,15 @@ def extract_purchase_invoice_lines(
             df["product_categ_name"] = None
             df["product_default_code"] = None
             df["product_standard_price"] = 0.0
+            df["product_type"] = None
+            df["product_is_storable"] = None
     else:
         df["product_categ_id"] = None
         df["product_categ_name"] = None
         df["product_default_code"] = None
         df["product_standard_price"] = 0.0
+        df["product_type"] = None
+        df["product_is_storable"] = None
 
     df["invoice_date"] = df["date"]
     # Backfill del código desde el display_name cuando el lookup falla
