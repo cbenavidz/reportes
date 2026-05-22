@@ -593,8 +593,15 @@ if "mm_formatos" in st.session_state:
                         use_container_width=True, hide_index=True, height=500,
                     )
 
-                    # Botón de descarga del detalle
-                    csv_data = det_show.to_csv(index=False).encode("utf-8")
+                    # Botón de descarga del detalle.
+                    # CSV con separador ';' y decimales con ',' — formato que
+                    # Excel en configuración regional de Colombia interpreta
+                    # correctamente (evita confundir comas decimales con
+                    # separadores de columna). utf-8-sig añade BOM para que
+                    # Excel muestre bien las tildes.
+                    csv_data = det_show.to_csv(
+                        index=False, sep=";", decimal=",",
+                    ).encode("utf-8-sig")
                     st.download_button(
                         label="⬇️ Descargar detalle en CSV",
                         data=csv_data,
