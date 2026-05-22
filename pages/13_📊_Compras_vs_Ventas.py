@@ -112,35 +112,53 @@ fecha_desde_prev = fecha_desde - timedelta(days=periodo_dias)
 fecha_hasta_prev = fecha_desde - timedelta(days=1)
 
 
-# ── Carga de datos ──
-companies_df = load_companies()
-render_company_context(companies_df, filters["company_ids"])
+# ── Carga de datos (en paralelo) ──
+# Las 7 descargas son independientes entre sí → se cargan en paralelo
+# con un ThreadPoolExecutor. Antes iban en serie. Los loaders están
+# cacheados con @st.cache_data.
+from concurrent.futures import ThreadPoolExecutor as _TPcv  # noqa: E402
 
-with st.spinner("Cargando compras, ventas y stock..."):
-    # Ventas: rango exacto = período previo → período actual (no más)
-    sales_lines = load_invoice_lines(
-        company_ids=filters["company_ids"],
-        date_from=fecha_desde_prev.isoformat(),
-        date_to=fecha_hasta.isoformat(),
-    )
-    # Compras del período + previo (mismo rango exacto)
-    purchases_lines = load_purchase_invoice_lines(
-        date_from=fecha_desde_prev.isoformat(),
-        date_to=fecha_hasta.isoformat(),
-        company_ids=filters["company_ids"],
-    )
-    # Stock actual
-    stock_df = load_stock_quants(company_ids=filters["company_ids"])
-    # Plan de cuentas y saldos (inicial + corte) para rotación cuenta 14
-    chart_df = load_chart_of_accounts(company_ids=filters["company_ids"])
-    balances_corte = load_account_balances_aggregated(
-        date_to=fecha_hasta.isoformat(),
-        company_ids=filters["company_ids"],
-    )
-    balances_inicio = load_account_balances_aggregated(
-        date_to=(fecha_desde - timedelta(days=1)).isoformat(),
-        company_ids=filters["company_ids"],
-    )
+with st.spinner("Cargando compras, ventas, stock y saldos..."):
+    _cids = filters["company_ids"]
+    _tasks = {
+        "companies": lambda: load_companies(),
+        # Ventas: rango exacto = período previo → período actual
+        "sales": lambda: load_invoice_lines(
+            company_ids=_cids,
+            date_from=fecha_desde_prev.isoformat(),
+            date_to=fecha_hasta.isoformat(),
+        ),
+        # Compras del período + previo (mismo rango exacto)
+        "purchases": lambda: load_purchase_invoice_lines(
+            date_from=fecha_desde_prev.isoformat(),
+            date_to=fecha_hasta.isoformat(), company_ids=_cids,
+        ),
+        "stock": lambda: load_stock_quants(company_ids=_cids),
+        "chart": lambda: load_chart_of_accounts(company_ids=_cids),
+        # Saldos cuenta 14: inicial y corte (para rotación inv. promedio)
+        "bal_corte": lambda: load_account_balances_aggregated(
+            date_to=fecha_hasta.isoformat(), company_ids=_cids,
+        ),
+        "bal_inicio": lambda: load_account_balances_aggregated(
+            date_to=(fecha_desde - timedelta(days=1)).isoformat(),
+            company_ids=_cids,
+        ),
+    }
+    _res: dict = {}
+    with _TPcv(max_workers=7) as _pool:
+        _futs = {k: _pool.submit(fn) for k, fn in _tasks.items()}
+        for k, fut in _futs.items():
+            _res[k] = fut.result()
+
+companies_df = _res["companies"]
+sales_lines = _res["sales"]
+purchases_lines = _res["purchases"]
+stock_df = _res["stock"]
+chart_df = _res["chart"]
+balances_corte = _res["bal_corte"]
+balances_inicio = _res["bal_inicio"]
+
+render_company_context(companies_df, filters["company_ids"])
 
 if (
     (sales_lines is None or sales_lines.empty)
