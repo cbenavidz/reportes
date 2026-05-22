@@ -228,13 +228,13 @@ else:
                 "Días restantes", format="%d",
             ),
             "saldo": st.column_config.NumberColumn(
-                "Saldo", format="$%.0f",
+                "Saldo", format="localized",
             ),
             "dto_porcentaje": st.column_config.NumberColumn(
                 "% Dto.", format="%.1f%%",
             ),
             "monto_descuento": st.column_config.NumberColumn(
-                "Ahorro", format="$%.0f",
+                "Ahorro", format="localized",
             ),
             "estado_dto": "Estado",
         },
@@ -270,10 +270,10 @@ else:
                                 "Venció el", format="YYYY-MM-DD",
                             ),
                             "saldo": st.column_config.NumberColumn(
-                                "Saldo", format="$%.0f",
+                                "Saldo", format="localized",
                             ),
                             "monto_descuento": st.column_config.NumberColumn(
-                                "Descuento perdido", format="$%.0f",
+                                "Descuento perdido", format="localized",
                             ),
                         },
                         use_container_width=True, hide_index=True,
@@ -587,7 +587,7 @@ with col_ag:
             aging,
             column_config={
                 "bucket": "Antigüedad",
-                "monto": st.column_config.NumberColumn("Monto", format="$%.0f"),
+                "monto": st.column_config.NumberColumn("Monto", format="localized"),
                 "n_facturas": st.column_config.NumberColumn("# Facturas", format="%d"),
                 "pct": st.column_config.NumberColumn("% del total", format="%.1f%%"),
             },
@@ -686,10 +686,10 @@ if top_prov is not None and not top_prov.empty:
         column_config={
             "partner_name": "Proveedor",
             "saldo_total": st.column_config.NumberColumn(
-                "Saldo total", format="$%.0f",
+                "Saldo total", format="localized",
             ),
             "saldo_vencido": st.column_config.NumberColumn(
-                "Saldo vencido", format="$%.0f",
+                "Saldo vencido", format="localized",
             ),
             "n_facturas": st.column_config.NumberColumn(
                 "# Facturas", format="%d",
@@ -754,10 +754,10 @@ if detalle is not None and not detalle.empty:
             ),
             "estado": "Estado",
             "total_factura": st.column_config.NumberColumn(
-                "Total", format="$%.0f",
+                "Total", format="localized",
             ),
             "saldo": st.column_config.NumberColumn(
-                "Saldo", format="$%.0f",
+                "Saldo", format="localized",
             ),
             "bucket_aging": "Antigüedad",
             "payment_term_name": "Término pago",
@@ -772,7 +772,7 @@ if detalle is not None and not detalle.empty:
                 "% Dto.", format="%.1f%%",
             ),
             "monto_descuento": st.column_config.NumberColumn(
-                "Ahorro dto.", format="$%.0f",
+                "Ahorro dto.", format="localized",
             ),
             "estado_dto": "Estado dto.",
             "company_id_name": "Empresa",

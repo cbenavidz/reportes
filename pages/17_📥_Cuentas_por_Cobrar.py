@@ -195,10 +195,10 @@ else:
             "Gravedad": st.column_config.TextColumn("Gravedad", width="small"),
             "partner_name": "Cliente",
             "saldo_vencido": st.column_config.NumberColumn(
-                "Saldo vencido", format="$%.0f",
+                "Saldo vencido", format="localized",
             ),
             "saldo_total": st.column_config.NumberColumn(
-                "Saldo total", format="$%.0f",
+                "Saldo total", format="localized",
             ),
             "n_facturas_vencidas": st.column_config.NumberColumn(
                 "# Facturas vencidas", format="%d",
@@ -460,7 +460,7 @@ with col_ag:
             aging,
             column_config={
                 "bucket": "Antigüedad",
-                "monto": st.column_config.NumberColumn("Monto", format="$%.0f"),
+                "monto": st.column_config.NumberColumn("Monto", format="localized"),
                 "n_facturas": st.column_config.NumberColumn("# Facturas", format="%d"),
                 "pct": st.column_config.NumberColumn("% del total", format="%.1f%%"),
             },
@@ -554,10 +554,10 @@ if top_cli is not None and not top_cli.empty:
         column_config={
             "partner_name": "Cliente",
             "saldo_total": st.column_config.NumberColumn(
-                "Saldo total", format="$%.0f",
+                "Saldo total", format="localized",
             ),
             "saldo_vencido": st.column_config.NumberColumn(
-                "Saldo vencido", format="$%.0f",
+                "Saldo vencido", format="localized",
             ),
             "n_facturas": st.column_config.NumberColumn(
                 "# Facturas", format="%d",
@@ -620,10 +620,10 @@ if detalle is not None and not detalle.empty:
             ),
             "estado": "Estado",
             "total_factura": st.column_config.NumberColumn(
-                "Total", format="$%.0f",
+                "Total", format="localized",
             ),
             "saldo": st.column_config.NumberColumn(
-                "Saldo", format="$%.0f",
+                "Saldo", format="localized",
             ),
             "bucket_aging": "Antigüedad",
             "payment_term_name": "Término pago",
