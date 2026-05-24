@@ -72,15 +72,41 @@ if filters["company_ids"] is not None and len(filters["company_ids"]) == 0:
     st.warning("Selecciona al menos una empresa en el sidebar para ver datos.")
     st.stop()
 
-# El Informe de Ventas solo necesita facturas, terceros y empresas.
-# Usamos load_raw_data (descarga ligera y cacheada) en lugar de
-# compute_full_analysis, que además corre TODO el pipeline de cartera
-# (scoring, alertas, plan de cobro, histórico mensual, DSO rolling con
-# matching FIFO factura↔pago) — cálculo costoso e innecesario aquí.
-raw = load_raw_data(
-    months_back=filters["months_back"],
-    company_ids=filters["company_ids"],
-)
+# El Informe de Ventas necesita dos descargas independientes:
+#   - load_raw_data: facturas, terceros y empresas (no usa compute_full_analysis
+#     porque ese corre todo el pipeline de cartera — innecesario aquí).
+#   - load_invoice_lines: líneas de factura con producto (descarga grande).
+# Se cargan EN PARALELO para reducir el tiempo de primera carga. Las dos
+# funciones están cacheadas con @st.cache_data.
+from concurrent.futures import ThreadPoolExecutor as _TPv  # noqa: E402
+
+with st.spinner("Cargando facturas y líneas de venta..."):
+    _cids = filters["company_ids"]
+    _mb = filters["months_back"]
+
+    def _cargar_lineas():
+        """Carga líneas; devuelve la excepción si falla (se maneja abajo)."""
+        try:
+            return load_invoice_lines(months_back=_mb, company_ids=_cids)
+        except Exception as exc:  # noqa: BLE001
+            return exc
+
+    with _TPv(max_workers=2) as _pool:
+        _f_raw = _pool.submit(
+            load_raw_data, months_back=_mb, company_ids=_cids,
+        )
+        _f_lines = _pool.submit(_cargar_lineas)
+        raw = _f_raw.result()
+        _lines_result = _f_lines.result()
+
+if isinstance(_lines_result, Exception):
+    st.warning(
+        f"No se pudieron cargar las líneas de factura: {_lines_result}. "
+        "El informe NO descontará SOAT/papeles esta vez."
+    )
+    invoice_lines_all = pd.DataFrame()
+else:
+    invoice_lines_all = _lines_result
 
 render_company_context(raw.get("companies"), filters["company_ids"])
 
@@ -91,22 +117,6 @@ cutoff_date = raw.get("cutoff_date")
 if invoices_all is None or invoices_all.empty:
     st.info("No hay facturas disponibles en el rango cargado.")
     st.stop()
-
-# ---------------------------------------------------------------------------
-# Líneas de factura — se cargan ANTES del filtro de vendedor porque el
-# filtro también las recorta. (Cacheadas con @st.cache_data.)
-# ---------------------------------------------------------------------------
-try:
-    invoice_lines_all = load_invoice_lines(
-        months_back=filters["months_back"],
-        company_ids=filters["company_ids"],
-    )
-except Exception as exc:  # noqa: BLE001
-    st.warning(
-        f"No se pudieron cargar las líneas de factura: {exc}. "
-        "El informe NO descontará SOAT/papeles esta vez."
-    )
-    invoice_lines_all = pd.DataFrame()
 
 # ---------------------------------------------------------------------------
 # Filtro de vendedor (inline, arriba del contenido)
