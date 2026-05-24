@@ -389,6 +389,39 @@ col8.metric(
     help="% de notas crédito sobre ventas brutas. Indicador de calidad.",
 )
 
+# ── Margen ──
+_var_margen = None
+if kpis_prev.margen:
+    _var_margen = (kpis.margen - kpis_prev.margen) / abs(kpis_prev.margen) * 100
+col9, col10, col11 = st.columns(3)
+col9.metric(
+    "📦 Costo de ventas",
+    _fmt_money(kpis.costo_ventas),
+    help=(
+        "Suma del costo de las líneas vendidas. Usa el costo histórico de "
+        "la factura (purchase_price) si Odoo lo registra; si no, el costo "
+        "actual del producto (standard_price).\n\n"
+        f"Anterior: {_fmt_money(kpis_prev.costo_ventas)}"
+    ),
+)
+col10.metric(
+    "💵 Margen bruto",
+    _fmt_money(kpis.margen),
+    _fmt_pct(_var_margen),
+    help=(
+        "Ventas netas − costo de ventas.\n\n"
+        f"Anterior: {_fmt_money(kpis_prev.margen)}"
+    ),
+)
+col11.metric(
+    "📈 Margen %",
+    f"{kpis.margen_pct:.1f}%",
+    help=(
+        "Margen bruto como % de las ventas netas.\n\n"
+        f"Anterior: {kpis_prev.margen_pct:.1f}%"
+    ),
+)
+
 # ---------------------------------------------------------------------------
 # Tendencia mensual con comparativo
 # ---------------------------------------------------------------------------
@@ -442,6 +475,16 @@ if not monthly.empty:
         marker=dict(size=8),
         hovertemplate="<b>%{x}</b><br>Netas: $%{y:,.0f}<extra></extra>",
     ))
+    if "margen" in monthly.columns:
+        fig.add_trace(go.Scatter(
+            x=monthly["mes_label"],
+            y=monthly["margen"],
+            name="Margen bruto",
+            mode="lines+markers",
+            line=dict(color="#a855f7", width=2, dash="dot"),
+            marker=dict(size=6),
+            hovertemplate="<b>%{x}</b><br>Margen: $%{y:,.0f}<extra></extra>",
+        ))
     fig.update_layout(
         barmode="relative",
         height=420,
@@ -456,27 +499,38 @@ if not monthly.empty:
     show = monthly.copy()
     show["var_mom_str"] = show["var_mom"].apply(_fmt_pct)
     show["var_yoy_str"] = show["var_yoy"].apply(_fmt_pct)
+    _tiene_margen = "margen" in show.columns
+
+    _cols_mes = ["mes_label", "ventas_brutas", "notas_credito", "ventas_netas"]
+    if _tiene_margen:
+        _cols_mes += ["costo", "margen", "margen_pct"]
+    _cols_mes += ["n_facturas", "ticket_promedio", "var_mom_str", "var_yoy_str"]
+
+    _renames = {
+        "mes_label": "Mes",
+        "ventas_brutas": "Brutas",
+        "notas_credito": "NC",
+        "ventas_netas": "Netas",
+        "costo": "Costo",
+        "margen": "Margen",
+        "margen_pct": "Margen %",
+        "n_facturas": "# Fact.",
+        "ticket_promedio": "Ticket prom.",
+        "var_mom_str": "% vs mes ant.",
+        "var_yoy_str": "% vs año ant.",
+    }
+    _colcfg = {
+        "Brutas": st.column_config.NumberColumn(format="$ %,.0f"),
+        "NC": st.column_config.NumberColumn(format="$ %,.0f"),
+        "Netas": st.column_config.NumberColumn(format="$ %,.0f"),
+        "Costo": st.column_config.NumberColumn(format="$ %,.0f"),
+        "Margen": st.column_config.NumberColumn(format="$ %,.0f"),
+        "Margen %": st.column_config.NumberColumn(format="%.1f%%"),
+        "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
+    }
     st.dataframe(
-        show[[
-            "mes_label", "ventas_brutas", "notas_credito",
-            "ventas_netas", "n_facturas", "ticket_promedio",
-            "var_mom_str", "var_yoy_str",
-        ]].rename(columns={
-            "mes_label": "Mes",
-            "ventas_brutas": "Brutas",
-            "notas_credito": "NC",
-            "ventas_netas": "Netas",
-            "n_facturas": "# Fact.",
-            "ticket_promedio": "Ticket prom.",
-            "var_mom_str": "% vs mes ant.",
-            "var_yoy_str": "% vs año ant.",
-        }),
-        column_config={
-            "Brutas": st.column_config.NumberColumn(format="$ %,.0f"),
-            "NC": st.column_config.NumberColumn(format="$ %,.0f"),
-            "Netas": st.column_config.NumberColumn(format="$ %,.0f"),
-            "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
-        },
+        show[_cols_mes].rename(columns=_renames),
+        column_config=_colcfg,
         use_container_width=True, hide_index=True,
     )
 
@@ -548,6 +602,9 @@ with tab_vend:
                 "ventas_netas": "Ventas netas",
                 "ventas_brutas": "Ventas brutas",
                 "notas_credito": "NC",
+                "costo": "Costo",
+                "margen": "Margen",
+                "margen_pct": "Margen %",
                 "n_facturas": "# Fact.",
                 "ticket_promedio": "Ticket prom.",
                 "n_clientes": "# Clientes",
@@ -557,6 +614,9 @@ with tab_vend:
                 "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
                 "Ventas brutas": st.column_config.NumberColumn(format="$ %,.0f"),
                 "NC": st.column_config.NumberColumn(format="$ %,.0f"),
+                "Costo": st.column_config.NumberColumn(format="$ %,.0f"),
+                "Margen": st.column_config.NumberColumn(format="$ %,.0f"),
+                "Margen %": st.column_config.NumberColumn(format="%.1f%%"),
                 "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
                 "% del total": st.column_config.NumberColumn(format="%.1f %%"),
             },
@@ -630,6 +690,9 @@ with tab_clientes:
                 "ventas_netas": "Ventas netas",
                 "ventas_brutas": "Ventas brutas",
                 "notas_credito": "NC",
+                "costo": "Costo",
+                "margen": "Margen",
+                "margen_pct": "Margen %",
                 "n_facturas": "# Fact.",
                 "ticket_promedio": "Ticket prom.",
                 "participacion_pct": "% del total",
@@ -640,6 +703,9 @@ with tab_clientes:
                 "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
                 "Ventas brutas": st.column_config.NumberColumn(format="$ %,.0f"),
                 "NC": st.column_config.NumberColumn(format="$ %,.0f"),
+                "Costo": st.column_config.NumberColumn(format="$ %,.0f"),
+                "Margen": st.column_config.NumberColumn(format="$ %,.0f"),
+                "Margen %": st.column_config.NumberColumn(format="%.1f%%"),
                 "Ticket prom.": st.column_config.NumberColumn(format="$ %,.0f"),
                 "% del total": st.column_config.NumberColumn(format="%.1f %%"),
                 "% acum.": st.column_config.NumberColumn(format="%.1f %%"),
@@ -700,11 +766,17 @@ with tab_prod:
                         "product_nombre": "Producto",
                         "cantidad": "Cantidad",
                         "ventas_netas": "Ventas netas",
+                        "costo": "Costo",
+                        "margen": "Margen",
+                        "margen_pct": "Margen %",
                         "n_facturas": "# Fact.",
                         "participacion_pct": "% del total",
                     }),
                     column_config={
                         "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
+                        "Costo": st.column_config.NumberColumn(format="$ %,.0f"),
+                        "Margen": st.column_config.NumberColumn(format="$ %,.0f"),
+                        "Margen %": st.column_config.NumberColumn(format="%.1f%%"),
                         "% del total": st.column_config.NumberColumn(format="%.1f %%"),
                     },
                     use_container_width=True, hide_index=True,
@@ -752,11 +824,17 @@ with tab_cat:
                         "categoria_nombre": "Categoría",
                         "cantidad": "Cantidad",
                         "ventas_netas": "Ventas netas",
+                        "costo": "Costo",
+                        "margen": "Margen",
+                        "margen_pct": "Margen %",
                         "n_facturas": "# Fact.",
                         "participacion_pct": "% del total",
                     }),
                     column_config={
                         "Ventas netas": st.column_config.NumberColumn(format="$ %,.0f"),
+                        "Costo": st.column_config.NumberColumn(format="$ %,.0f"),
+                        "Margen": st.column_config.NumberColumn(format="$ %,.0f"),
+                        "Margen %": st.column_config.NumberColumn(format="%.1f%%"),
                         "% del total": st.column_config.NumberColumn(format="%.1f %%"),
                     },
                     use_container_width=True, hide_index=True,
@@ -777,6 +855,9 @@ if st.button("Generar Excel del informe", type="primary"):
             "Ventas netas": kpis.ventas_netas,
             "Ventas brutas": kpis.ventas_brutas,
             "Notas crédito": kpis.notas_credito,
+            "Costo de ventas": kpis.costo_ventas,
+            "Margen bruto": kpis.margen,
+            "Margen %": kpis.margen_pct,
             "# Facturas": kpis.n_facturas,
             "# NC": kpis.n_notas_credito,
             "Ticket promedio": kpis.ticket_promedio,

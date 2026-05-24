@@ -367,6 +367,16 @@ class SalesKPIs:
     n_clientes_unicos: int         # partner_id distintos
     fecha_desde: pd.Timestamp | None
     fecha_hasta: pd.Timestamp | None
+    costo_ventas: float = 0.0      # suma de line_cost del período
+    margen: float = 0.0            # ventas_netas − costo_ventas
+
+    @property
+    def margen_pct(self) -> float:
+        """Margen bruto como % de las ventas netas."""
+        return (
+            (self.margen / self.ventas_netas * 100.0)
+            if self.ventas_netas else 0.0
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -377,6 +387,9 @@ class SalesKPIs:
             "n_notas_credito": self.n_notas_credito,
             "ticket_promedio": self.ticket_promedio,
             "n_clientes_unicos": self.n_clientes_unicos,
+            "costo_ventas": self.costo_ventas,
+            "margen": self.margen,
+            "margen_pct": self.margen_pct,
             "fecha_desde": self.fecha_desde,
             "fecha_hasta": self.fecha_hasta,
         }
@@ -442,6 +455,12 @@ def compute_sales_kpis_from_lines(
     nc_total = float(pd.to_numeric(nc["price_subtotal_signed"], errors="coerce").sum())  # ya negativo
     ventas_netas = ventas_brutas + nc_total
 
+    # Costo y margen — line_cost ya viene con signo (NC restan)
+    costo = 0.0
+    if "line_cost" in df.columns:
+        costo = float(pd.to_numeric(df["line_cost"], errors="coerce").sum())
+    margen = ventas_netas - costo
+
     n_fac = int(fac["move_id"].nunique()) if "move_id" in fac.columns and not fac.empty else 0
     n_nc = int(nc["move_id"].nunique()) if "move_id" in nc.columns and not nc.empty else 0
     # Clientes únicos = solo los con VENTA NETA > 0 en el período.
@@ -471,6 +490,8 @@ def compute_sales_kpis_from_lines(
         n_clientes_unicos=n_clientes,
         fecha_desde=pd.Timestamp(date_from) if date_from else None,
         fecha_hasta=pd.Timestamp(date_to) if date_to else None,
+        costo_ventas=costo,
+        margen=margen,
     )
 
 
@@ -536,24 +557,36 @@ def compute_sales_monthly_from_lines(
         out = base.assign(
             ventas_netas=0.0, ventas_brutas=0.0, notas_credito=0.0,
             n_facturas=0, ticket_promedio=0.0,
+            costo=0.0, margen=0.0, margen_pct=0.0,
         ).reset_index()
     else:
         df["mes"] = df["_d"].dt.to_period("M")
         is_fac = df["move_type"] == "out_invoice"
         is_nc = df["move_type"] == "out_refund"
 
-        agg = pd.DataFrame({
+        agg_cols = {
             "ventas_netas": df.groupby("mes")["price_subtotal_signed"].sum(),
             "ventas_brutas": df.loc[is_fac].groupby("mes")["price_subtotal_signed"].sum(),
             "nc_signed": df.loc[is_nc].groupby("mes")["price_subtotal_signed"].sum(),
             "n_facturas": df.loc[is_fac].groupby("mes")["move_id"].nunique(),
-        })
+        }
+        if "line_cost" in df.columns:
+            agg_cols["costo"] = df.groupby("mes")["line_cost"].sum()
+        agg = pd.DataFrame(agg_cols)
         agg = base.join(agg, how="left").fillna(0.0)
         agg["notas_credito"] = agg["nc_signed"].abs()
         agg["n_facturas"] = agg["n_facturas"].astype(int)
         agg["ticket_promedio"] = np.where(
             agg["n_facturas"] > 0,
             agg["ventas_brutas"] / agg["n_facturas"].replace(0, np.nan),
+            0.0,
+        )
+        if "costo" not in agg.columns:
+            agg["costo"] = 0.0
+        agg["margen"] = agg["ventas_netas"] - agg["costo"]
+        agg["margen_pct"] = np.where(
+            agg["ventas_netas"] != 0,
+            agg["margen"] / agg["ventas_netas"].replace(0, np.nan) * 100.0,
             0.0,
         )
         agg = agg.drop(columns=["nc_signed"])
@@ -582,6 +615,7 @@ def compute_sales_by_partner_from_lines(
         return pd.DataFrame(columns=[
             "partner_id", "partner_nombre", "ventas_netas", "ventas_brutas",
             "notas_credito", "n_facturas", "ticket_promedio",
+            "costo", "margen", "margen_pct",
             "participacion_pct", "participacion_acum_pct", "es_pareto_80",
         ])
 
@@ -591,17 +625,28 @@ def compute_sales_by_partner_from_lines(
     is_nc = df["move_type"] == "out_refund"
 
     grp = df.groupby("partner_id")
-    res = pd.DataFrame({
+    res_cols = {
         "ventas_netas": grp["price_subtotal_signed"].sum(),
         "ventas_brutas": df.loc[is_fac].groupby("partner_id")["price_subtotal_signed"].sum(),
         "nc_signed": df.loc[is_nc].groupby("partner_id")["price_subtotal_signed"].sum(),
         "n_facturas": df.loc[is_fac].groupby("partner_id")["move_id"].nunique(),
-    }).fillna(0.0)
+    }
+    if "line_cost" in df.columns:
+        res_cols["costo"] = grp["line_cost"].sum()
+    res = pd.DataFrame(res_cols).fillna(0.0)
     res["notas_credito"] = res["nc_signed"].abs()
     res["n_facturas"] = res["n_facturas"].astype(int)
     res["ticket_promedio"] = np.where(
         res["n_facturas"] > 0,
         res["ventas_brutas"] / res["n_facturas"].replace(0, np.nan),
+        0.0,
+    )
+    if "costo" not in res.columns:
+        res["costo"] = 0.0
+    res["margen"] = res["ventas_netas"] - res["costo"]
+    res["margen_pct"] = np.where(
+        res["ventas_netas"] != 0,
+        res["margen"] / res["ventas_netas"].replace(0, np.nan) * 100.0,
         0.0,
     )
 
@@ -631,6 +676,7 @@ def compute_sales_by_partner_from_lines(
     return res[[
         "partner_id", "partner_nombre", "ventas_netas", "ventas_brutas",
         "notas_credito", "n_facturas", "ticket_promedio",
+        "costo", "margen", "margen_pct",
         "participacion_pct", "participacion_acum_pct", "es_pareto_80",
     ]]
 
@@ -653,7 +699,7 @@ def compute_sales_by_vendedor_from_lines(
         return pd.DataFrame(columns=[
             "vendedor_id", "vendedor_nombre", "ventas_netas", "ventas_brutas",
             "notas_credito", "n_facturas", "ticket_promedio", "n_clientes",
-            "participacion_pct",
+            "costo", "margen", "margen_pct", "participacion_pct",
         ])
 
     # Cruzar con cabecera para obtener vendedor (invoice_user_id / user_id)
@@ -681,19 +727,30 @@ def compute_sales_by_vendedor_from_lines(
     is_nc = df["move_type"] == "out_refund"
 
     grp = df.groupby("vendedor_id")
-    res = pd.DataFrame({
+    res_cols = {
         "ventas_netas": grp["price_subtotal_signed"].sum(),
         "ventas_brutas": df.loc[is_fac].groupby("vendedor_id")["price_subtotal_signed"].sum(),
         "nc_signed": df.loc[is_nc].groupby("vendedor_id")["price_subtotal_signed"].sum(),
         "n_facturas": df.loc[is_fac].groupby("vendedor_id")["move_id"].nunique(),
         "n_clientes": grp["partner_id"].nunique(),
-    }).fillna(0.0)
+    }
+    if "line_cost" in df.columns:
+        res_cols["costo"] = grp["line_cost"].sum()
+    res = pd.DataFrame(res_cols).fillna(0.0)
     res["notas_credito"] = res["nc_signed"].abs()
     res["n_facturas"] = res["n_facturas"].astype(int)
     res["n_clientes"] = res["n_clientes"].astype(int)
     res["ticket_promedio"] = np.where(
         res["n_facturas"] > 0,
         res["ventas_brutas"] / res["n_facturas"].replace(0, np.nan),
+        0.0,
+    )
+    if "costo" not in res.columns:
+        res["costo"] = 0.0
+    res["margen"] = res["ventas_netas"] - res["costo"]
+    res["margen_pct"] = np.where(
+        res["ventas_netas"] != 0,
+        res["margen"] / res["ventas_netas"].replace(0, np.nan) * 100.0,
         0.0,
     )
     total = float(res["ventas_netas"].sum())
@@ -710,7 +767,7 @@ def compute_sales_by_vendedor_from_lines(
     return res.sort_values("ventas_netas", ascending=False).reset_index(drop=True)[[
         "vendedor_id", "vendedor_nombre", "ventas_netas", "ventas_brutas",
         "notas_credito", "n_facturas", "ticket_promedio", "n_clientes",
-        "participacion_pct",
+        "costo", "margen", "margen_pct", "participacion_pct",
     ]]
 
 
@@ -1197,7 +1254,8 @@ def compute_sales_by_product(
             else ["product_categ_id", "categoria_nombre"]
         )
         return pd.DataFrame(columns=cols + [
-            "cantidad", "ventas_netas", "n_facturas", "participacion_pct"
+            "cantidad", "ventas_netas", "costo", "margen", "margen_pct",
+            "n_facturas", "participacion_pct"
         ])
 
     # Excluye SOAT, PAPELES MOTOS y otros recaudos a terceros que no son
@@ -1211,7 +1269,8 @@ def compute_sales_by_product(
             else ["product_categ_id", "categoria_nombre"]
         )
         return pd.DataFrame(columns=cols + [
-            "cantidad", "ventas_netas", "n_facturas", "participacion_pct"
+            "cantidad", "ventas_netas", "costo", "margen", "margen_pct",
+            "n_facturas", "participacion_pct"
         ])
 
     # Filtro por move_type / state (deben venir heredados del move)
@@ -1250,7 +1309,8 @@ def compute_sales_by_product(
             else ["product_categ_id", "categoria_nombre"]
         )
         return pd.DataFrame(columns=cols + [
-            "cantidad", "ventas_netas", "n_facturas", "participacion_pct"
+            "cantidad", "ventas_netas", "costo", "margen", "margen_pct",
+            "n_facturas", "participacion_pct"
         ])
 
     if group_by == "product":
@@ -1266,11 +1326,22 @@ def compute_sales_by_product(
 
     df[id_col] = pd.to_numeric(df[id_col], errors="coerce").fillna(-1).astype(int)
     grp = df.groupby(id_col)
-    res = pd.DataFrame({
+    _res_cols = {
         "cantidad": grp["quantity"].sum() if "quantity" in df.columns else 0,
         "ventas_netas": grp["price_subtotal_signed"].sum(),
         "n_facturas": grp["move_id"].nunique(),
-    }).reset_index().rename(columns={id_col: out_id})
+    }
+    if "line_cost" in df.columns:
+        _res_cols["costo"] = grp["line_cost"].sum()
+    res = pd.DataFrame(_res_cols).reset_index().rename(columns={id_col: out_id})
+    if "costo" not in res.columns:
+        res["costo"] = 0.0
+    res["margen"] = res["ventas_netas"] - res["costo"]
+    res["margen_pct"] = np.where(
+        res["ventas_netas"] != 0,
+        res["margen"] / res["ventas_netas"].replace(0, np.nan) * 100.0,
+        0.0,
+    )
 
     # Nombre legible: tomamos el primer no-vacío del grupo
     if name_col in df.columns:
@@ -1293,4 +1364,5 @@ def compute_sales_by_product(
         res = res.head(top_n)
 
     return res[[out_id, out_name, "cantidad", "ventas_netas",
+                "costo", "margen", "margen_pct",
                 "n_facturas", "participacion_pct"]]
