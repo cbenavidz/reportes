@@ -341,6 +341,17 @@ def enrich_chart_with_puc(chart: pd.DataFrame) -> pd.DataFrame:
     """
     if chart is None or chart.empty:
         return chart
+
+    # Memoización: enrich_chart_with_puc es puro pero costoso (apply fila a
+    # fila). Dentro de un mismo render se llama muchas veces con el MISMO
+    # objeto `chart`. Guardamos el resultado en chart.attrs para reusarlo.
+    try:
+        _cached = chart.attrs.get("_puc_enriched")
+        if _cached is not None and len(_cached) == len(chart):
+            return _cached
+    except Exception:  # noqa: BLE001
+        pass
+
     out = chart.copy()
 
     def _classify_row(row):
@@ -396,6 +407,12 @@ def enrich_chart_with_puc(chart: pd.DataFrame) -> pd.DataFrame:
     out["subgrupo"] = cls.apply(lambda d: d["subgrupo"])
     out["puc_group"] = cls.apply(lambda d: d.get("puc_group", ""))
     out["puc_subgroup"] = cls.apply(lambda d: d.get("puc_subgroup", ""))
+
+    # Guardar en el memo del objeto chart de entrada.
+    try:
+        chart.attrs["_puc_enriched"] = out
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 

@@ -52,6 +52,36 @@ st.set_page_config(
     layout="wide",
 )
 
+
+# ── Wrappers cacheados de los cálculos pesados ──
+# Streamlit re-ejecuta toda la página en cada interacción con un widget.
+# Cachear estos cálculos hace que las interacciones que NO cambian los
+# datos ni el período (toggles, filtros, sliders) sean instantáneas.
+@st.cache_data(ttl=900, show_spinner=False)
+def _cx_crosstab(purchases, sales, stock, d_from, d_to):
+    return compute_product_crosstab(purchases, sales, stock, d_from, d_to)
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cx_multi_ventana(sales, stock, ref_today, anualizar):
+    return compute_rotacion_categoria_multi_ventana(
+        sales, stock, today=ref_today, anualizar=anualizar,
+    )
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cx_hist_cat(sales, stock, ref_today, meses, anualizar):
+    return compute_rotacion_categoria_30d_historica(
+        sales, stock, today=ref_today, meses=meses, anualizar=anualizar,
+    )
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def _cx_hist_consol(sales, denominador, ref_today, meses):
+    return compute_rotacion_30d_historica_consolidada(
+        sales, denominador=denominador, today=ref_today, meses=meses,
+    )
+
 require_auth()
 logout_button()
 
@@ -298,7 +328,7 @@ rot14_prev = compute_rotacion_cuenta_14(
 
 # Crosstab por producto y categoría (lo necesitamos antes de los KPIs
 # para poder obtener el valor de stock por categoría cuando hay filtro)
-crosstab = compute_product_crosstab(
+crosstab = _cx_crosstab(
     purchases_lines, sales_lines, stock_df, fecha_desde, fecha_hasta,
 )
 cat_tab = compute_category_crosstab(crosstab)
@@ -827,12 +857,9 @@ with t_evol:
     )
 
     _denom_30d = float(rot14_act.get("saldo_final", 0) or 0)
-    hist_30d_consol = compute_rotacion_30d_historica_consolidada(
+    hist_30d_consol = _cx_hist_consol(
         sales_lines if sales_lines is not None else sales_365,
-        denominador=_denom_30d,
-        today=today,
-        meses=12,
-        anualizar=False,
+        _denom_30d, today, 12,
     )
 
     if _denom_30d <= 0:
@@ -940,11 +967,9 @@ with t_cat:
             key="ri_anualizar_multi",
         )
 
-    multi_rot = compute_rotacion_categoria_multi_ventana(
+    multi_rot = _cx_multi_ventana(
         sales_lines if sales_lines is not None else sales_365,
-        stock_df,
-        today=today,
-        anualizar=anualizar_rot,
+        stock_df, today, anualizar_rot,
     )
     if multi_rot is None or multi_rot.empty:
         st.info(
