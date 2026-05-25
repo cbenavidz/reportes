@@ -207,3 +207,47 @@ def compute_audit_kpis(df_lines: pd.DataFrame) -> dict:
         "n_criticas": n_criticas,
         "pct_ordenes_ok": round(pct_ok, 1),
     }
+
+
+def audit_by_month(df_lines: pd.DataFrame) -> pd.DataFrame:
+    """
+    Evolución mensual de la auditoría: por cada mes (según fecha de la
+    orden) el total de líneas, las que tienen discrepancia y las críticas.
+    """
+    cols = ["mes", "mes_label", "lineas",
+            "lineas_discrepancia", "lineas_criticas"]
+    if df_lines is None or df_lines.empty:
+        return pd.DataFrame(columns=cols)
+    d = df_lines.copy()
+    d["_mes"] = (
+        pd.to_datetime(d["fecha"], errors="coerce")
+        .dt.to_period("M").dt.to_timestamp()
+    )
+    d = d.dropna(subset=["_mes"])
+    if d.empty:
+        return pd.DataFrame(columns=cols)
+    d["_disc"] = d["tiene_discrepancia"].astype(int)
+    d["_crit"] = (d["severidad"] == "Crítica").astype(int)
+    g = d.groupby("_mes", as_index=False).agg(
+        lineas=("linea_id", "count"),
+        lineas_discrepancia=("_disc", "sum"),
+        lineas_criticas=("_crit", "sum"),
+    ).rename(columns={"_mes": "mes"}).sort_values("mes")
+    g["mes_label"] = g["mes"].dt.strftime("%Y-%m")
+    return g[cols].reset_index(drop=True)
+
+
+def explode_problem_types(df_lines: pd.DataFrame) -> pd.DataFrame:
+    """
+    Devuelve un DataFrame con una fila por (línea × tipo de problema
+    individual). Solo considera líneas con discrepancia. Agrega la
+    columna `problema` con cada etiqueta suelta (una línea con dos
+    problemas aparece en dos filas).
+    """
+    if df_lines is None or df_lines.empty:
+        return pd.DataFrame()
+    d = df_lines[df_lines["tiene_discrepancia"]].copy()
+    if d.empty:
+        return d
+    d["problema"] = d["tipo_discrepancia"].str.split(" · ")
+    return d.explode("problema").reset_index(drop=True)
