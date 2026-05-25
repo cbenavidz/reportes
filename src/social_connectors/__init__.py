@@ -12,7 +12,11 @@ from .meta import (
     fetch_meta_instagram_top_posts,
     is_meta_configured,
 )
-from .tiktok import is_tiktok_configured, fetch_tiktok_data
+from .tiktok import (
+    is_tiktok_configured,
+    fetch_tiktok_data,
+    fetch_tiktok_account_stats,
+)
 
 __all__ = [
     "is_ga4_configured", "fetch_ga4_data",
@@ -26,4 +30,5 @@ __all__ = [
     "fetch_meta_instagram_monthly_evolution",
     "fetch_meta_instagram_top_posts",
     "is_tiktok_configured", "fetch_tiktok_data",
+    "fetch_tiktok_account_stats",
 ]

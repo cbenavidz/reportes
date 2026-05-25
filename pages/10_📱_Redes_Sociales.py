@@ -32,6 +32,8 @@ from src.social_connectors import (
     is_ga4_configured,
     is_meta_configured,
     is_tiktok_configured,
+    fetch_tiktok_data,
+    fetch_tiktok_account_stats,
 )
 # Importar funciones extras directamente del módulo (los Stories no están
 # necesariamente exportados en __init__)
@@ -1137,12 +1139,13 @@ with tab_ig:
 
 
 # ---------------------------------------------------------------------------
-# TikTok (sin cambios — pendiente de App Review)
+# TikTok (Display API — Sandbox "CDM Reportes")
 # ---------------------------------------------------------------------------
 with tab_tt:
     st.markdown("### 🎵 TikTok")
-    if is_tiktok_configured():
-        st.warning("⏳ API en proceso de aprobación.")
+    tt_api = is_tiktok_configured()
+    if tt_api:
+        st.success("✅ API conectada.")
     else:
         st.info("ℹ️ API no configurada. Sube CSV manual.")
     with st.expander("📥 Cómo obtener CSV de TikTok", expanded=False):
@@ -1155,6 +1158,22 @@ with tab_tt:
 5. **Descargar datos** → **CSV**.
 6. Sube aquí.
 """)
+
+    if tt_api:
+        if st.button("🔄 Descargar datos TikTok", key="refresh_tiktok"):
+            try:
+                with st.spinner("Descargando de TikTok..."):
+                    tt_stats_new = fetch_tiktok_account_stats()
+                    df_api = fetch_tiktok_data(fecha_desde, fecha_hasta)
+                st.session_state["social_data"]["tiktok_stats"] = tt_stats_new
+                st.session_state["social_data"]["tiktok"] = df_api
+                st.success(
+                    f"✅ Perfil actualizado · {len(df_api):,} días con "
+                    f"publicaciones en el rango."
+                )
+            except Exception as exc:
+                st.error(f"Error al descargar de TikTok: {exc}")
+
     uploaded = st.file_uploader("Sube CSV de TikTok", type=["csv", "xlsx"], key="upload_tiktok")
     if uploaded is not None:
         try:
@@ -1167,14 +1186,36 @@ with tab_tt:
             st.success(f"✅ {len(df):,} filas")
         except Exception as exc:
             st.error(f"Error: {exc}")
+
+    # Snapshot del perfil (seguidores, likes totales, # de videos)
+    tt_stats = st.session_state["social_data"].get("tiktok_stats")
+    if tt_stats:
+        _nombre = tt_stats.get("display_name", "")
+        st.markdown(f"#### 👤 Perfil{' — @' + _nombre if _nombre else ''}")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Seguidores", f"{int(tt_stats.get('seguidores', 0)):,}")
+        s2.metric("Likes totales", f"{int(tt_stats.get('likes_totales', 0)):,}")
+        s3.metric("Videos", f"{int(tt_stats.get('n_videos', 0)):,}")
+        s4.metric("Siguiendo", f"{int(tt_stats.get('siguiendo', 0)):,}")
+
+    # Métricas del período (videos agregados por día de publicación)
     df_tt = st.session_state["social_data"].get("tiktok")
     if df_tt is not None and not df_tt.empty:
+        st.markdown("#### 📊 Métricas del período")
         k = compute_period_kpis(df_tt, fecha_desde, fecha_hasta)
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("Alcance", f"{int(k['alcance']):,}")
         c2.metric("Impresiones", f"{int(k['impresiones']):,}")
         c3.metric("Engagement", f"{int(k['engagement']):,}")
         c4.metric("Engagement rate", f"{k['engagement_rate']:.2f}%")
+        st.dataframe(df_tt, use_container_width=True, hide_index=True, height=360)
+    elif tt_api and tt_stats:
+        st.caption(
+            "No hay videos publicados dentro del rango de fechas elegido. "
+            "Prueba con «Últimos 12 meses» arriba."
+        )
+    elif tt_api:
+        st.caption("Pulsa «🔄 Descargar datos TikTok» para traer las métricas por API.")
 
 
 # ---------------------------------------------------------------------------
