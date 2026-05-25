@@ -426,6 +426,45 @@ def load_purchase_invoice_lines(
     )
 
 
+# ---------------------------------------------------------------------------
+# Loaders para Auditoría de Órdenes (venta y compra)
+# ---------------------------------------------------------------------------
+
+ORDER_AUDIT_CACHE_VERSION = 1
+
+
+@st.cache_data(ttl=900, show_spinner="Descargando órdenes de venta para auditoría...")
+def load_sale_order_audit(
+    company_ids: tuple[int, ...] | None = None,
+    only_storable: bool = True,
+    _cache_v: int = ORDER_AUDIT_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """Líneas de órdenes de venta confirmadas para la auditoría de cantidades."""
+    from .extractor import extract_sale_order_audit
+    client = get_odoo_client()
+    return extract_sale_order_audit(
+        client,
+        company_ids=list(company_ids) if company_ids else None,
+        only_storable=only_storable,
+    )
+
+
+@st.cache_data(ttl=900, show_spinner="Descargando órdenes de compra para auditoría...")
+def load_purchase_order_audit(
+    company_ids: tuple[int, ...] | None = None,
+    only_storable: bool = True,
+    _cache_v: int = ORDER_AUDIT_CACHE_VERSION,
+) -> "pd.DataFrame":
+    """Líneas de órdenes de compra confirmadas para la auditoría de cantidades."""
+    from .extractor import extract_purchase_order_audit
+    client = get_odoo_client()
+    return extract_purchase_order_audit(
+        client,
+        company_ids=list(company_ids) if company_ids else None,
+        only_storable=only_storable,
+    )
+
+
 @st.cache_data(ttl=900, show_spinner="Cargando serie mensual de inventario...")
 def load_inventory_balance_monthly_series(
     date_from: str,

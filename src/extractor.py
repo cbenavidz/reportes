@@ -2105,3 +2105,232 @@ def extract_payment_terms(
         df["discount_days"], errors="coerce"
     ).fillna(0).astype(int)
     return df
+
+
+# ---------------------------------------------------------------------------
+# Auditoría de órdenes de venta y compra
+# (cantidad ordenada vs entregada/recibida vs facturada)
+# ---------------------------------------------------------------------------
+
+_SALE_OL_AUDIT_FIELDS = [
+    "id", "order_id", "product_id", "name", "display_type",
+    "product_uom_qty", "qty_delivered", "qty_invoiced", "qty_to_invoice",
+    "company_id",
+]
+_PURCHASE_OL_AUDIT_FIELDS = [
+    "id", "order_id", "product_id", "name", "display_type",
+    "product_qty", "qty_received", "qty_invoiced", "qty_to_invoice",
+    "company_id",
+]
+_AUDIT_OUT_COLS = [
+    "linea_id", "tipo", "order_id", "orden", "fecha", "socio", "empresa",
+    "producto", "codigo", "descripcion", "categoria",
+    "cant_ordenada", "cant_entregada", "cant_facturada", "cant_por_facturar",
+    "estado_orden", "invoice_status", "is_storable",
+]
+
+
+def _audit_product_meta(
+    client: OdooClient,
+    product_ids: list[int],
+    company_ids: list[int] | tuple[int, ...] | None,
+) -> dict[int, dict]:
+    """Devuelve {product_id: {codigo, categoria, type, is_storable}}."""
+    meta: dict[int, dict] = {}
+    if not product_ids:
+        return meta
+    product_context: dict = {"active_test": False}
+    if company_ids:
+        first_co = list(company_ids)[0]
+        product_context.update({
+            "company_id": first_co,
+            "allowed_company_ids": list(company_ids),
+        })
+    base_fields = ["id", "categ_id", "default_code", "type"]
+    try:
+        _pp_meta = client.fields_get("product.product", attributes=["string"])
+        has_storable = "is_storable" in _pp_meta
+    except Exception:  # noqa: BLE001
+        has_storable = False
+    prod_fields = base_fields + (["is_storable"] if has_storable else [])
+    try:
+        prod_records = client.read(
+            "product.product", ids=product_ids,
+            fields=prod_fields, context=product_context,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_audit_product_meta falló: %s", exc)
+        return meta
+    for p in prod_records:
+        pid = int(p["id"])
+        _, cname = _unpack_m2o(p.get("categ_id"))
+        ptype = str(p.get("type") or "").strip().lower()
+        is_stor = p.get("is_storable")
+        if is_stor in (True, False):
+            storable = bool(is_stor)
+        else:
+            storable = (ptype == "product")
+        meta[pid] = {
+            "codigo": p.get("default_code") or None,
+            "categoria": cname,
+            "type": ptype,
+            "is_storable": storable,
+        }
+    return meta
+
+
+def _assemble_audit_df(
+    client: OdooClient,
+    line_records: list[dict],
+    order_model: str,
+    tipo: str,
+    qty_fields: dict[str, str],
+    company_ids: list[int] | tuple[int, ...] | None,
+    only_storable: bool,
+) -> pd.DataFrame:
+    """Normaliza líneas de orden (venta o compra) al esquema de auditoría."""
+    if not line_records:
+        return pd.DataFrame(columns=_AUDIT_OUT_COLS)
+
+    # --- Cabeceras de las órdenes ---
+    order_ids = sorted({
+        _unpack_m2o(r.get("order_id"))[0]
+        for r in line_records
+        if _unpack_m2o(r.get("order_id"))[0] is not None
+    })
+    order_map: dict[int, dict] = {}
+    if order_ids:
+        try:
+            order_recs = client.read(
+                order_model, ids=order_ids,
+                fields=["id", "name", "partner_id", "date_order",
+                        "state", "invoice_status"],
+            )
+            for o in order_recs:
+                _, pname = _unpack_m2o(o.get("partner_id"))
+                order_map[int(o["id"])] = {
+                    "orden": o.get("name") or "",
+                    "socio": pname or "",
+                    "fecha": o.get("date_order"),
+                    "estado_orden": o.get("state") or "",
+                    "invoice_status": o.get("invoice_status") or "",
+                }
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Lectura de %s en auditoría falló: %s", order_model, exc,
+            )
+
+    # --- Metadatos de producto ---
+    product_ids = sorted({
+        _unpack_m2o(r.get("product_id"))[0]
+        for r in line_records
+        if _unpack_m2o(r.get("product_id"))[0] is not None
+    })
+    prod_meta = _audit_product_meta(client, product_ids, company_ids)
+
+    f_ord = qty_fields["ordenada"]
+    f_ent = qty_fields["entregada"]
+    f_fac = qty_fields["facturada"]
+    f_inv = qty_fields["por_facturar"]
+
+    rows = []
+    for r in line_records:
+        oid, oname = _unpack_m2o(r.get("order_id"))
+        prid, prname = _unpack_m2o(r.get("product_id"))
+        _, cname = _unpack_m2o(r.get("company_id"))
+        ometa = order_map.get(int(oid), {}) if oid is not None else {}
+        pmeta = prod_meta.get(int(prid), {}) if prid is not None else {}
+        rows.append({
+            "linea_id": r.get("id"),
+            "tipo": tipo,
+            "order_id": oid,
+            "orden": ometa.get("orden") or oname or "",
+            "fecha": ometa.get("fecha"),
+            "socio": ometa.get("socio") or "",
+            "empresa": cname or "",
+            "producto": prname or "",
+            "codigo": pmeta.get("codigo"),
+            "descripcion": (r.get("name") or "").strip(),
+            "categoria": pmeta.get("categoria"),
+            "cant_ordenada": r.get(f_ord) or 0.0,
+            "cant_entregada": r.get(f_ent) or 0.0,
+            "cant_facturada": r.get(f_fac) or 0.0,
+            "cant_por_facturar": r.get(f_inv) or 0.0,
+            "estado_orden": ometa.get("estado_orden") or "",
+            "invoice_status": ometa.get("invoice_status") or "",
+            "is_storable": pmeta.get("is_storable"),
+        })
+
+    df = pd.DataFrame(rows, columns=_AUDIT_OUT_COLS)
+    if df.empty:
+        return df
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    for c in ("cant_ordenada", "cant_entregada",
+              "cant_facturada", "cant_por_facturar"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    if only_storable:
+        # Conservamos almacenables (True) y los no resueltos (None).
+        df = df[df["is_storable"] != False].reset_index(drop=True)  # noqa: E712
+    return df
+
+
+def extract_sale_order_audit(
+    client: OdooClient,
+    company_ids: list[int] | tuple[int, ...] | None = None,
+    only_storable: bool = True,
+) -> pd.DataFrame:
+    """
+    Líneas de órdenes de venta CONFIRMADAS (state='sale') para auditoría
+    de cantidades: ordenada vs entregada vs facturada.
+
+    Devuelve un DataFrame con el esquema `_AUDIT_OUT_COLS`.
+    """
+    domain: list = [
+        ("display_type", "=", False),
+        ("order_id.state", "=", "sale"),
+    ]
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
+    logger.info("Descargando sale.order.line para auditoría: %s", domain)
+    records = client.search_read(
+        "sale.order.line", domain=domain,
+        fields=_SALE_OL_AUDIT_FIELDS, order="id desc",
+    )
+    logger.info("Líneas de venta para auditoría: %s", len(records))
+    return _assemble_audit_df(
+        client, records, "sale.order", "Venta",
+        {"ordenada": "product_uom_qty", "entregada": "qty_delivered",
+         "facturada": "qty_invoiced", "por_facturar": "qty_to_invoice"},
+        company_ids, only_storable,
+    )
+
+
+def extract_purchase_order_audit(
+    client: OdooClient,
+    company_ids: list[int] | tuple[int, ...] | None = None,
+    only_storable: bool = True,
+) -> pd.DataFrame:
+    """
+    Líneas de órdenes de compra CONFIRMADAS (state in purchase/done) para
+    auditoría de cantidades: ordenada vs recibida vs facturada.
+
+    Devuelve un DataFrame con el esquema `_AUDIT_OUT_COLS`.
+    """
+    domain: list = [
+        ("display_type", "=", False),
+        ("order_id.state", "in", ["purchase", "done"]),
+    ]
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
+    logger.info("Descargando purchase.order.line para auditoría: %s", domain)
+    records = client.search_read(
+        "purchase.order.line", domain=domain,
+        fields=_PURCHASE_OL_AUDIT_FIELDS, order="id desc",
+    )
+    logger.info("Líneas de compra para auditoría: %s", len(records))
+    return _assemble_audit_df(
+        client, records, "purchase.order", "Compra",
+        {"ordenada": "product_qty", "entregada": "qty_received",
+         "facturada": "qty_invoiced", "por_facturar": "qty_to_invoice"},
+        company_ids, only_storable,
+    )
