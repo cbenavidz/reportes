@@ -34,6 +34,7 @@ from src.social_connectors import (
     is_tiktok_configured,
     fetch_tiktok_data,
     fetch_tiktok_account_stats,
+    fetch_tiktok_videos,
 )
 # Importar funciones extras directamente del módulo (los Stories no están
 # necesariamente exportados en __init__)
@@ -1164,12 +1165,14 @@ with tab_tt:
             try:
                 with st.spinner("Descargando de TikTok..."):
                     tt_stats_new = fetch_tiktok_account_stats()
+                    df_vid_new = fetch_tiktok_videos()
                     df_api = fetch_tiktok_data(fecha_desde, fecha_hasta)
                 st.session_state["social_data"]["tiktok_stats"] = tt_stats_new
+                st.session_state["social_data"]["tiktok_videos"] = df_vid_new
                 st.session_state["social_data"]["tiktok"] = df_api
                 st.success(
-                    f"✅ Perfil actualizado · {len(df_api):,} días con "
-                    f"publicaciones en el rango."
+                    f"✅ Perfil actualizado · {len(df_vid_new):,} videos "
+                    f"descargados."
                 )
             except Exception as exc:
                 st.error(f"Error al descargar de TikTok: {exc}")
@@ -1216,6 +1219,145 @@ with tab_tt:
         )
     elif tt_api:
         st.caption("Pulsa «🔄 Descargar datos TikTok» para traer las métricas por API.")
+
+    # ===== Secciones detalladas por video =====
+    df_vid = st.session_state["social_data"].get("tiktok_videos")
+    if df_vid is not None and not df_vid.empty:
+        TT_COLOR = "#FE2C55"
+        dv = df_vid.copy()
+        dv["fecha"] = pd.to_datetime(dv["fecha"], errors="coerce")
+
+        # ---- Resumen mensual ----
+        st.markdown("#### 📅 Resumen mensual")
+        dvm = dv.dropna(subset=["fecha"]).copy()
+        if not dvm.empty:
+            dvm["mes"] = dvm["fecha"].dt.to_period("M").dt.to_timestamp()
+            mensual = dvm.groupby("mes", as_index=False).agg(
+                videos=("id", "count"),
+                vistas=("vistas", "sum"),
+                likes=("likes", "sum"),
+                comentarios=("comentarios", "sum"),
+                compartidos=("compartidos", "sum"),
+                engagement=("engagement", "sum"),
+            ).sort_values("mes")
+            mensual["engagement_rate"] = (
+                (mensual["engagement"]
+                 / mensual["vistas"].where(mensual["vistas"] > 0)) * 100
+            ).fillna(0.0)
+            mensual["mes_label"] = mensual["mes"].dt.strftime("%Y-%m")
+            st.dataframe(
+                mensual[["mes_label", "videos", "vistas", "likes",
+                         "comentarios", "compartidos", "engagement",
+                         "engagement_rate"]],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "mes_label": st.column_config.TextColumn("Mes"),
+                    "videos": st.column_config.NumberColumn("Videos", format="%d"),
+                    "vistas": st.column_config.NumberColumn("Vistas", format="%,d"),
+                    "likes": st.column_config.NumberColumn("Likes", format="%,d"),
+                    "comentarios": st.column_config.NumberColumn("Coment.", format="%,d"),
+                    "compartidos": st.column_config.NumberColumn("Compart.", format="%,d"),
+                    "engagement": st.column_config.NumberColumn("Engagement", format="%,d"),
+                    "engagement_rate": st.column_config.NumberColumn("Eng. rate (%)", format="%.2f"),
+                },
+            )
+        else:
+            st.caption("Sin fechas válidas en los videos.")
+
+        # ---- Ranking de top videos ----
+        st.markdown("#### 🏆 Top videos")
+        dv_disp = dv.copy()
+        dv_disp["video"] = (
+            dv_disp["titulo"].fillna("")
+            .str.replace("\n", " ", regex=False).str.strip()
+        )
+        dv_disp["video"] = dv_disp["video"].apply(
+            lambda t: t if len(t) <= 60 else t[:60] + "…"
+        )
+        dv_disp["fecha_str"] = dv_disp["fecha"].dt.strftime("%d/%m/%Y")
+        rk1, rk2 = st.columns(2)
+        with rk1:
+            st.caption("Más vistas")
+            st.dataframe(
+                dv_disp.nlargest(5, "vistas")[
+                    ["video", "fecha_str", "vistas", "engagement_rate"]],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "video": st.column_config.TextColumn("Video", width="large"),
+                    "fecha_str": st.column_config.TextColumn("Fecha"),
+                    "vistas": st.column_config.NumberColumn("Vistas", format="%,d"),
+                    "engagement_rate": st.column_config.NumberColumn("Eng. rate (%)", format="%.2f"),
+                },
+            )
+        with rk2:
+            st.caption("Mejor engagement rate")
+            st.dataframe(
+                dv_disp.nlargest(5, "engagement_rate")[
+                    ["video", "fecha_str", "engagement_rate", "vistas"]],
+                use_container_width=True, hide_index=True,
+                column_config={
+                    "video": st.column_config.TextColumn("Video", width="large"),
+                    "fecha_str": st.column_config.TextColumn("Fecha"),
+                    "engagement_rate": st.column_config.NumberColumn("Eng. rate (%)", format="%.2f"),
+                    "vistas": st.column_config.NumberColumn("Vistas", format="%,d"),
+                },
+            )
+
+        # ---- Gráficas ----
+        st.markdown("#### 📈 Gráficas")
+        dv_chart = dv.dropna(subset=["fecha"]).sort_values("fecha").copy()
+        dv_chart["etiqueta"] = dv_chart["fecha"].dt.strftime("%d/%m")
+        if dv_chart["etiqueta"].duplicated().any():
+            dv_chart["etiqueta"] = [
+                f"{e} #{i + 1}" for i, e in enumerate(dv_chart["etiqueta"])
+            ]
+        gc1, gc2 = st.columns(2)
+        with gc1:
+            fig = px.bar(
+                dv_chart, x="etiqueta", y="vistas",
+                color_discrete_sequence=[TT_COLOR],
+                labels={"etiqueta": "Video", "vistas": "Vistas"},
+                title="Vistas por video", hover_data=["titulo"],
+            )
+            fig.update_layout(height=320, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+        with gc2:
+            fig = px.bar(
+                dv_chart, x="etiqueta", y="engagement_rate",
+                color_discrete_sequence=[TT_COLOR],
+                labels={"etiqueta": "Video", "engagement_rate": "Eng. rate (%)"},
+                title="Engagement rate por video", hover_data=["titulo"],
+            )
+            fig.update_layout(height=320, margin=dict(l=0, r=0, t=40, b=0))
+            st.plotly_chart(fig, use_container_width=True)
+        fig = px.line(
+            dv_chart, x="fecha", y="vistas", markers=True,
+            color_discrete_sequence=[TT_COLOR],
+            labels={"fecha": "Fecha de publicación", "vistas": "Vistas"},
+            title="Vistas en el tiempo", hover_data=["titulo"],
+        )
+        fig.update_layout(height=300, margin=dict(l=0, r=0, t=40, b=0))
+        st.plotly_chart(fig, use_container_width=True)
+
+        # ---- Detalle por video ----
+        st.markdown("#### 📋 Detalle por video")
+        det = dv.copy()
+        det["fecha"] = det["fecha"].dt.strftime("%d/%m/%Y")
+        st.dataframe(
+            det[["fecha", "titulo", "vistas", "likes", "comentarios",
+                 "compartidos", "engagement", "engagement_rate"]],
+            use_container_width=True, hide_index=True, height=380,
+            column_config={
+                "fecha": st.column_config.TextColumn("Fecha"),
+                "titulo": st.column_config.TextColumn("Título", width="large"),
+                "vistas": st.column_config.NumberColumn("Vistas", format="%,d"),
+                "likes": st.column_config.NumberColumn("Likes", format="%,d"),
+                "comentarios": st.column_config.NumberColumn("Coment.", format="%,d"),
+                "compartidos": st.column_config.NumberColumn("Compart.", format="%,d"),
+                "engagement": st.column_config.NumberColumn("Engagement", format="%,d"),
+                "engagement_rate": st.column_config.NumberColumn("Eng. rate (%)", format="%.2f"),
+            },
+        )
 
 
 # ---------------------------------------------------------------------------

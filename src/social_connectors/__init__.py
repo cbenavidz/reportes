@@ -16,6 +16,7 @@ from .tiktok import (
     is_tiktok_configured,
     fetch_tiktok_data,
     fetch_tiktok_account_stats,
+    fetch_tiktok_videos,
 )
 
 __all__ = [
@@ -30,5 +31,5 @@ __all__ = [
     "fetch_meta_instagram_monthly_evolution",
     "fetch_meta_instagram_top_posts",
     "is_tiktok_configured", "fetch_tiktok_data",
-    "fetch_tiktok_account_stats",
+    "fetch_tiktok_account_stats", "fetch_tiktok_videos",
 ]

@@ -238,3 +238,58 @@ def fetch_tiktok_data(date_from: date, date_to: date) -> pd.DataFrame:
         0,
     )
     return diario.sort_values("fecha").reset_index(drop=True)
+
+
+def fetch_tiktok_videos(max_videos: int = 200) -> pd.DataFrame:
+    """
+    Lista los videos de la cuenta con sus métricas, UNA FILA POR VIDEO
+    (sin agregar por día). Ideal para tablas de detalle, rankings y
+    resúmenes mensuales.
+
+    Devuelve un DataFrame con columnas:
+      id, fecha, titulo, vistas, likes, comentarios, compartidos,
+      engagement, engagement_rate
+    Vacío si TikTok no está configurado o si la API falla.
+    """
+    cols = ["id", "fecha", "titulo", "vistas", "likes", "comentarios",
+            "compartidos", "engagement", "engagement_rate"]
+    cfg = get_secret_dict("tiktok")
+    if not cfg:
+        return pd.DataFrame(columns=cols)
+    try:
+        token = _get_access_token(cfg)
+        videos = _fetch_all_videos(token, max_videos=max_videos)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("fetch_tiktok_videos falló: %s", exc)
+        return pd.DataFrame(columns=cols)
+
+    if not videos:
+        return pd.DataFrame(columns=cols)
+
+    rows = []
+    for v in videos:
+        ts = v.get("create_time")
+        try:
+            fecha = datetime.utcfromtimestamp(int(ts)) if ts else None
+        except (TypeError, ValueError, OSError):
+            fecha = None
+        vistas = int(v.get("view_count", 0) or 0)
+        likes = int(v.get("like_count", 0) or 0)
+        coment = int(v.get("comment_count", 0) or 0)
+        comp = int(v.get("share_count", 0) or 0)
+        eng = likes + coment + comp
+        rows.append({
+            "id": str(v.get("id", "")),
+            "fecha": fecha,
+            "titulo": (v.get("title") or "").strip(),
+            "vistas": vistas,
+            "likes": likes,
+            "comentarios": coment,
+            "compartidos": comp,
+            "engagement": eng,
+            "engagement_rate": (eng / vistas * 100.0) if vistas > 0 else 0.0,
+        })
+
+    df = pd.DataFrame(rows, columns=cols)
+    df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
+    return df.sort_values("fecha", ascending=False).reset_index(drop=True)
