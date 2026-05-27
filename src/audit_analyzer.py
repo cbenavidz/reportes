@@ -41,16 +41,22 @@ ESTADO_ORDEN_LABELS = {
 }
 
 
-def _clasificar(tipo: str, a_facturar: float, por_recibir: float) -> str:
-    """Devuelve la etiqueta de discrepancia según los dos saldos."""
-    es_compra = str(tipo).strip().lower() == "compra"
-    verbo = "recibir" if es_compra else "entregar"
-    flags: list[str] = []
-    if abs(a_facturar) > TOL:
-        flags.append("Por facturar")
-    if abs(por_recibir) > TOL:
-        flags.append(f"Por {verbo}")
-    return " · ".join(flags) if flags else "OK"
+def _label_a_facturar(af: float) -> str:
+    """Etiqueta según signo del saldo `cant a facturar`."""
+    if af > TOL:
+        return "Por facturar"
+    if af < -TOL:
+        return "Facturado de más"
+    return ""
+
+
+def _label_por_recibir(pr: float, es_compra: bool) -> str:
+    """Etiqueta según signo del saldo `cant por recibir/entregar`."""
+    if pr > TOL:
+        return "Por recibir" if es_compra else "Por entregar"
+    if pr < -TOL:
+        return "Recibido de más" if es_compra else "Entregado de más"
+    return ""
 
 
 def audit_order_lines(df: pd.DataFrame) -> pd.DataFrame:
@@ -58,7 +64,10 @@ def audit_order_lines(df: pd.DataFrame) -> pd.DataFrame:
     Agrega las columnas de auditoría al DataFrame de líneas de orden:
       cant_a_facturar   = cant_ordenada  − cant_facturada
       cant_por_recibir  = cant_facturada − cant_entregada
-      tipo_discrepancia = "Por facturar" / "Por recibir" / combinación / "OK"
+      tipo_discrepancia = combinación de hasta 4 etiquetas según signo:
+        - "Por facturar" / "Facturado de más"
+        - "Por recibir"  / "Recibido de más"  (en compras)
+        - "Por entregar" / "Entregado de más" (en ventas)
       tiene_discrepancia
     """
     if df is None or df.empty:
@@ -81,12 +90,27 @@ def audit_order_lines(df: pd.DataFrame) -> pd.DataFrame:
         d["cant_facturada"] - d["cant_entregada"]
     ).round(3)
 
-    d["tipo_discrepancia"] = d.apply(
-        lambda r: _clasificar(
-            r.get("tipo"), r["cant_a_facturar"], r["cant_por_recibir"],
-        ),
-        axis=1,
+    # Clasificación vectorizada con sensibilidad de signo. Mucho más rápido
+    # que un `.apply(axis=1)`: una list comprehension con arrays numpy.
+    af_arr = d["cant_a_facturar"].to_numpy()
+    pr_arr = d["cant_por_recibir"].to_numpy()
+    ec_arr = (
+        d["tipo"].astype(str).str.strip().str.lower().eq("compra").to_numpy()
     )
+
+    def _row_label(af, pr, ec):
+        parts: list[str] = []
+        lf = _label_a_facturar(af)
+        if lf:
+            parts.append(lf)
+        lr = _label_por_recibir(pr, bool(ec))
+        if lr:
+            parts.append(lr)
+        return " · ".join(parts) if parts else "OK"
+
+    d["tipo_discrepancia"] = [
+        _row_label(af, pr, ec) for af, pr, ec in zip(af_arr, pr_arr, ec_arr)
+    ]
     d["tiene_discrepancia"] = d["tipo_discrepancia"] != "OK"
     return d
 

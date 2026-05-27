@@ -2113,19 +2113,21 @@ def extract_payment_terms(
 # ---------------------------------------------------------------------------
 
 _SALE_OL_AUDIT_FIELDS = [
-    "id", "order_id", "product_id", "name", "display_type",
-    "product_uom_qty", "qty_delivered", "qty_invoiced", "qty_to_invoice",
+    "id", "order_id", "product_id",
+    "product_uom_qty", "qty_delivered", "qty_invoiced",
     "company_id",
 ]
 _PURCHASE_OL_AUDIT_FIELDS = [
-    "id", "order_id", "product_id", "name", "display_type",
-    "product_qty", "qty_received", "qty_invoiced", "qty_to_invoice",
+    "id", "order_id", "product_id",
+    "product_qty", "qty_received", "qty_invoiced",
     "company_id",
 ]
+# Nota: `qty_to_invoice`, `name` y `display_type` no se piden a Odoo
+# (qty_to_invoice es un campo computado pesado; los otros no se usan).
 _AUDIT_OUT_COLS = [
     "linea_id", "tipo", "order_id", "orden", "fecha", "socio", "empresa",
-    "producto", "codigo", "descripcion", "categoria",
-    "cant_ordenada", "cant_entregada", "cant_facturada", "cant_por_facturar",
+    "producto", "codigo", "categoria",
+    "cant_ordenada", "cant_entregada", "cant_facturada",
     "estado_orden", "invoice_status", "is_storable",
 ]
 
@@ -2231,7 +2233,6 @@ def _assemble_audit_df(
     f_ord = qty_fields["ordenada"]
     f_ent = qty_fields["entregada"]
     f_fac = qty_fields["facturada"]
-    f_inv = qty_fields["por_facturar"]
 
     rows = []
     for r in line_records:
@@ -2250,12 +2251,10 @@ def _assemble_audit_df(
             "empresa": cname or "",
             "producto": prname or "",
             "codigo": pmeta.get("codigo"),
-            "descripcion": (r.get("name") or "").strip(),
             "categoria": pmeta.get("categoria"),
             "cant_ordenada": r.get(f_ord) or 0.0,
             "cant_entregada": r.get(f_ent) or 0.0,
             "cant_facturada": r.get(f_fac) or 0.0,
-            "cant_por_facturar": r.get(f_inv) or 0.0,
             "estado_orden": ometa.get("estado_orden") or "",
             "invoice_status": ometa.get("invoice_status") or "",
             "is_storable": pmeta.get("is_storable"),
@@ -2265,8 +2264,7 @@ def _assemble_audit_df(
     if df.empty:
         return df
     df["fecha"] = pd.to_datetime(df["fecha"], errors="coerce")
-    for c in ("cant_ordenada", "cant_entregada",
-              "cant_facturada", "cant_por_facturar"):
+    for c in ("cant_ordenada", "cant_entregada", "cant_facturada"):
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
     if only_storable:
         # Conservamos almacenables (True) y los no resueltos (None).
@@ -2300,7 +2298,7 @@ def extract_sale_order_audit(
     return _assemble_audit_df(
         client, records, "sale.order", "Venta",
         {"ordenada": "product_uom_qty", "entregada": "qty_delivered",
-         "facturada": "qty_invoiced", "por_facturar": "qty_to_invoice"},
+         "facturada": "qty_invoiced"},
         company_ids, only_storable,
     )
 
@@ -2331,6 +2329,6 @@ def extract_purchase_order_audit(
     return _assemble_audit_df(
         client, records, "purchase.order", "Compra",
         {"ordenada": "product_qty", "entregada": "qty_received",
-         "facturada": "qty_invoiced", "por_facturar": "qty_to_invoice"},
+         "facturada": "qty_invoiced"},
         company_ids, only_storable,
     )

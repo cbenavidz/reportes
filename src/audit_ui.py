@@ -12,6 +12,7 @@ El informe se enfoca en dos saldos calculados (Carlos) que deben ser cero:
 from __future__ import annotations
 
 import io
+import re
 
 import pandas as pd
 import plotly.express as px
@@ -289,8 +290,11 @@ def render_audit_page(tipo: str) -> None:
     tset = set(tipos_sel)
 
     lineas_disc = df_aud[df_aud["tiene_discrepancia"]].copy()
-    mask = lineas_disc["tipo_discrepancia"].apply(
-        lambda td: bool(set(str(td).split(" · ")) & tset)
+    # Filtro vectorizado: regex con todos los tipos seleccionados (mucho
+    # más rápido que un `.apply` por fila).
+    pat = "|".join(re.escape(t) for t in tipos_sel)
+    mask = lineas_disc["tipo_discrepancia"].astype(str).str.contains(
+        pat, regex=True, na=False,
     )
     # Orden: fecha más reciente primero (se propaga al detalle y a las
     # tablas agrupadas por tipo de problema).

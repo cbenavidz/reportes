@@ -430,7 +430,7 @@ def load_purchase_invoice_lines(
 # Loaders para Auditoría de Órdenes (venta y compra)
 # ---------------------------------------------------------------------------
 
-ORDER_AUDIT_CACHE_VERSION = 1
+ORDER_AUDIT_CACHE_VERSION = 2  # v2: extractor sin qty_to_invoice / name / display_type
 
 
 @st.cache_data(ttl=900, show_spinner="Descargando órdenes de venta para auditoría...")
