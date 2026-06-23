@@ -158,13 +158,17 @@ for cta in estado["cuentas"]:
                 "comprobante": st.column_config.TextColumn(
                     "Comprobante", width="small",
                 ),
-                "detalle": st.column_config.TextColumn(
-                    "Detalle", width="large",
+                "contacto": st.column_config.TextColumn(
+                    "Contacto", width="medium",
+                ),
+                "referencia": st.column_config.TextColumn(
+                    "Referencia / etiqueta", width="large",
                 ),
                 "valor": st.column_config.NumberColumn(
-                    "Valor", format="$ %.2f",
+                    "Valor", format="localized",
                 ),
             },
+            column_order=["comprobante", "contacto", "referencia", "valor"],
         )
         st.caption(f"Subtotal {g['journal_name']}: **{fmt_money(g['subtotal'])}**")
 
@@ -183,16 +187,16 @@ if not estado["resumen_cuentas"].empty:
             "code": st.column_config.TextColumn("Cuenta"),
             "name": st.column_config.TextColumn("Nombre", width="large"),
             "saldo_inicial": st.column_config.NumberColumn(
-                "Saldo inicial", format="$ %.2f",
+                "Saldo inicial", format="localized",
             ),
             "debitos": st.column_config.NumberColumn(
-                "Débitos", format="$ %.2f",
+                "Débitos", format="localized",
             ),
             "creditos": st.column_config.NumberColumn(
-                "Créditos", format="$ %.2f",
+                "Créditos", format="localized",
             ),
             "saldo_final": st.column_config.NumberColumn(
-                "Saldo final", format="$ %.2f",
+                "Saldo final", format="localized",
             ),
         },
     )
@@ -208,7 +212,7 @@ if not estado["resumen_formas_pago"].empty:
                 "Detalle", width="large",
             ),
             "valor": st.column_config.NumberColumn(
-                "Valor", format="$ %.2f",
+                "Valor", format="localized",
             ),
         },
     )

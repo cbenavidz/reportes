@@ -34,13 +34,11 @@ def get_cash_accounts(chart_df: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-def _detalle_linea(ln) -> str:
-    """Une partner + descripción de la línea en un string legible."""
+def _partner_y_referencia(ln) -> tuple[str, str]:
+    """Devuelve (contacto, referencia) por separado para cada línea."""
     partner = (ln.get("partner_id_name") or "").strip()
     desc = (ln.get("name") or ln.get("ref") or "").strip()
-    if partner and desc:
-        return f"{partner} {desc}"
-    return partner or desc or ""
+    return partner, desc
 
 
 def compute_estado_caja(
@@ -127,9 +125,11 @@ def compute_estado_caja(
                         - float(ln.get("credit", 0) or 0)
                     )
                     subtotal += valor
+                    contacto, referencia = _partner_y_referencia(ln)
                     lineas.append({
                         "comprobante": str(ln.get("move_id_name") or ""),
-                        "detalle": _detalle_linea(ln),
+                        "contacto": contacto,
+                        "referencia": referencia,
                         "valor": valor,
                     })
                 grupos.append({

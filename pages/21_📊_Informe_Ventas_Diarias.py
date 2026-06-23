@@ -121,18 +121,18 @@ else:
             "categoria_nombre": st.column_config.TextColumn(
                 "Categoría", width="large",
             ),
-            "cantidad": st.column_config.NumberColumn("Cant.", format="%.2f"),
+            "cantidad": st.column_config.NumberColumn("Cant.", format="localized"),
             "ventas_netas": st.column_config.NumberColumn(
-                "Ventas netas", format="$ %.0f",
+                "Ventas netas", format="localized",
             ),
-            "costo": st.column_config.NumberColumn("Costo", format="$ %.0f"),
-            "margen": st.column_config.NumberColumn("Margen", format="$ %.0f"),
+            "costo": st.column_config.NumberColumn("Costo", format="localized"),
+            "margen": st.column_config.NumberColumn("Margen", format="localized"),
             "margen_pct": st.column_config.NumberColumn(
-                "Margen %", format="%.1f %%",
+                "Margen %", format="%.2f %%",
             ),
             "n_facturas": st.column_config.NumberColumn("# Fact.", format="%d"),
             "participacion_pct": st.column_config.NumberColumn(
-                "% Particip.", format="%.1f %%",
+                "% Particip.", format="%.2f %%",
             ),
         },
     )
@@ -159,18 +159,18 @@ else:
             "product_nombre": st.column_config.TextColumn(
                 "Producto", width="large",
             ),
-            "cantidad": st.column_config.NumberColumn("Cant.", format="%.2f"),
+            "cantidad": st.column_config.NumberColumn("Cant.", format="localized"),
             "ventas_netas": st.column_config.NumberColumn(
-                "Ventas netas", format="$ %.0f",
+                "Ventas netas", format="localized",
             ),
-            "costo": st.column_config.NumberColumn("Costo", format="$ %.0f"),
-            "margen": st.column_config.NumberColumn("Margen", format="$ %.0f"),
+            "costo": st.column_config.NumberColumn("Costo", format="localized"),
+            "margen": st.column_config.NumberColumn("Margen", format="localized"),
             "margen_pct": st.column_config.NumberColumn(
-                "Margen %", format="%.1f %%",
+                "Margen %", format="%.2f %%",
             ),
             "n_facturas": st.column_config.NumberColumn("# Fact.", format="%d"),
             "participacion_pct": st.column_config.NumberColumn(
-                "% Particip.", format="%.1f %%",
+                "% Particip.", format="%.2f %%",
             ),
         },
     )
