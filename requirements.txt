@@ -7,6 +7,7 @@ plotly>=5.17
 python-dotenv>=1.0
 openpyxl>=3.1
 xlsxwriter>=3.1
+reportlab>=4.0  # PDF del informe diario (Caja + Ventas)
 PyYAML>=6.0
 bcrypt>=4.0
 

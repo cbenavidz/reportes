@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from src.auth import logout_button, require_auth
+from src.daily_actions import render_daily_actions
 from src.data_loader import load_companies, load_invoice_lines
 from src.sales_analyzer import (
     compute_sales_by_product,
@@ -175,17 +176,5 @@ else:
         },
     )
 
-# ── Acciones (PDF + correo) ──
-st.markdown("---")
-st.markdown("### 📤 Enviar / Descargar")
-st.caption(
-    "El PDF combinado (Caja + Ventas Diarias) y el envío por correo se "
-    "habilitan en una siguiente fase."
-)
-a1, a2 = st.columns(2)
-with a1:
-    st.button("⬇️ Descargar PDF (próximamente)", disabled=True,
-              use_container_width=True)
-with a2:
-    st.button("✉️ Enviar por correo (próximamente)", disabled=True,
-              use_container_width=True)
+# ── Acciones (PDF combinado + correo) ──
+render_daily_actions(fecha, company_ids, key_prefix="ventas")

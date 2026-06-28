@@ -23,6 +23,7 @@ from src.cash_report import (
     compute_estado_caja,
     get_cash_accounts,
 )
+from src.daily_actions import render_daily_actions
 from src.data_loader import (
     load_account_balances_aggregated,
     load_cash_movements_only,
@@ -221,17 +222,5 @@ st.markdown(
     f"### 💰 Total flujo del día: {fmt_money(estado['total_flujo'])}"
 )
 
-# ── Acciones (PDF + correo) ──
-st.markdown("---")
-st.markdown("### 📤 Enviar / Descargar")
-st.caption(
-    "El PDF combinado (Caja + Ventas Diarias) y el envío por correo se "
-    "habilitan en una siguiente fase."
-)
-a1, a2 = st.columns(2)
-with a1:
-    st.button("⬇️ Descargar PDF (próximamente)", disabled=True,
-              use_container_width=True)
-with a2:
-    st.button("✉️ Enviar por correo (próximamente)", disabled=True,
-              use_container_width=True)
+# ── Acciones (PDF combinado + correo) ──
+render_daily_actions(fecha, company_ids, key_prefix="caja")

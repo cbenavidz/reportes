@@ -1,0 +1,41 @@
+name: Informe Diario CDM
+
+on:
+  schedule:
+    # 23:05 UTC = 18:05 Bogotá (UTC-5). Cierre de operación 6:05 PM.
+    - cron: '5 23 * * *'
+  workflow_dispatch: {}  # permite ejecutarlo manualmente desde la UI
+
+jobs:
+  send-daily-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Instalar dependencias
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install reportlab
+
+      - name: Generar y enviar informe
+        env:
+          ODOO_URL:        ${{ secrets.ODOO_URL }}
+          ODOO_DB:         ${{ secrets.ODOO_DB }}
+          ODOO_USERNAME:   ${{ secrets.ODOO_USERNAME }}
+          ODOO_API_KEY:    ${{ secrets.ODOO_API_KEY }}
+          SMTP_HOST:       ${{ secrets.SMTP_HOST }}
+          SMTP_PORT:       ${{ secrets.SMTP_PORT }}
+          SMTP_USER:       ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD:   ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM:       ${{ secrets.SMTP_FROM }}
+          DAILY_REPORT_TO: ${{ secrets.DAILY_REPORT_TO }}
+        run: python scripts/send_daily_report.py
