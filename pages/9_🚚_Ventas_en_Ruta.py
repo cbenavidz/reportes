@@ -378,16 +378,16 @@ if monthly.empty:
 else:
     fig_m = go.Figure()
     fig_m.add_trace(go.Bar(
-        x=monthly["mes_label"], y=monthly["n_clientes_atendidos"],
-        name="Clientes atendidos", marker_color="#3b82f6", yaxis="y",
-        hovertemplate="<b>%{x}</b><br>%{y} clientes<extra></extra>",
+        x=monthly["mes_label"], y=monthly["ventas_netas"],
+        name="Ventas netas $", marker_color="#3b82f6", yaxis="y",
+        hovertemplate="<b>%{x}</b><br>$%{y:,.0f}<extra></extra>",
     ))
     fig_m.add_trace(go.Scatter(
-        x=monthly["mes_label"], y=monthly["ventas_netas"],
-        name="Ventas netas $", mode="lines+markers",
+        x=monthly["mes_label"], y=monthly["n_clientes_atendidos"],
+        name="Clientes atendidos", mode="lines+markers",
         line=dict(color="#10b981", width=3), marker=dict(size=8),
         yaxis="y2",
-        hovertemplate="<b>%{x}</b><br>$%{y:,.0f}<extra></extra>",
+        hovertemplate="<b>%{x}</b><br>%{y} clientes<extra></extra>",
     ))
     fig_m.add_trace(go.Scatter(
         x=monthly["mes_label"], y=monthly["volumen"],
@@ -399,8 +399,8 @@ else:
     ))
     fig_m.update_layout(
         height=440, margin=dict(l=0, r=80, t=10, b=0),
-        yaxis=dict(title="# Clientes", side="left"),
-        yaxis2=dict(title="Ventas $", overlaying="y", side="right",
+        yaxis=dict(title="Ventas $", side="left"),
+        yaxis2=dict(title="# Clientes", overlaying="y", side="right",
                     showgrid=False),
         yaxis3=dict(title="Volumen", overlaying="y", side="right",
                     position=0.96, showgrid=False, anchor="free"),
