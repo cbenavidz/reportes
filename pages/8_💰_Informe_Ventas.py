@@ -495,6 +495,41 @@ if not monthly.empty:
     )
     st.plotly_chart(fig, use_container_width=True)
 
+    # Gráfica dedicada: Margen bruto mes a mes ($ + %).
+    if "margen" in monthly.columns:
+        st.markdown("#### 💚 Margen bruto mes a mes")
+        fig_m = go.Figure()
+        fig_m.add_trace(go.Bar(
+            x=monthly["mes_label"],
+            y=monthly["margen"],
+            name="Margen bruto ($)",
+            marker_color="#a855f7",
+            hovertemplate="<b>%{x}</b><br>Margen: $%{y:,.0f}<extra></extra>",
+        ))
+        if "margen_pct" in monthly.columns:
+            fig_m.add_trace(go.Scatter(
+                x=monthly["mes_label"],
+                y=monthly["margen_pct"],
+                name="Margen %",
+                mode="lines+markers",
+                line=dict(color="#f59e0b", width=2),
+                marker=dict(size=7),
+                yaxis="y2",
+                hovertemplate="<b>%{x}</b><br>Margen %: %{y:.1f}%<extra></extra>",
+            ))
+        fig_m.update_layout(
+            height=380,
+            margin=dict(l=0, r=0, t=10, b=0),
+            yaxis=dict(title="Margen bruto ($ COP)"),
+            yaxis2=dict(
+                title="Margen %", overlaying="y", side="right",
+                showgrid=False, ticksuffix="%",
+            ),
+            legend=dict(orientation="h", y=-0.15),
+            hovermode="x unified",
+        )
+        st.plotly_chart(fig_m, use_container_width=True)
+
     # Tabla resumen con var_mom y var_yoy
     show = monthly.copy()
     show["var_mom_str"] = show["var_mom"].apply(_fmt_pct)
