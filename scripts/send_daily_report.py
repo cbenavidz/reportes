@@ -100,14 +100,20 @@ def generar_pdf_dia(fecha: date) -> tuple[bytes, str, str]:
     nit = ""
     company_ids: list[int] | None = None
     if not companies_df.empty:
-        row = companies_df.iloc[0]
+        # El informe diario es SOLO para Casa de los Mineros. Seleccionamos esa
+        # empresa por nombre (mismo criterio que el filtro de la app Streamlit).
+        # Esto es crítico para el COSTO: `standard_price` depende de la empresa,
+        # así que hay que leerlo en el contexto de Casa de los Mineros. Si se
+        # usara otra empresa (p.ej. la aseguradora), el costo llegaría en 0.
+        mask = companies_df["name"].str.lower().str.contains(
+            "casa de los mineros", na=False,
+        )
+        match = companies_df[mask]
+        row = match.iloc[0] if not match.empty else companies_df.iloc[0]
         empresa = str(row.get("name", empresa))
         nit = str(row.get("vat", "") or "")
-        # IMPORTANTE: el costo (`standard_price`) es dependiente de empresa.
-        # Sin `company_ids` en el contexto, Odoo devuelve costo 0 y el margen
-        # queda inflado. Pasamos las empresas igual que la app de Streamlit.
         if "id" in companies_df.columns:
-            company_ids = [int(x) for x in companies_df["id"].tolist()]
+            company_ids = [int(row["id"])]
 
     # --- Caja ---
     print("✓ Cargando plan de cuentas y movimientos del día...")
