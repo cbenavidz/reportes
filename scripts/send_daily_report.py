@@ -98,10 +98,16 @@ def generar_pdf_dia(fecha: date) -> tuple[bytes, str, str]:
     companies_df = extract_companies(client)
     empresa = "Casa de los Mineros"
     nit = ""
+    company_ids: list[int] | None = None
     if not companies_df.empty:
         row = companies_df.iloc[0]
         empresa = str(row.get("name", empresa))
         nit = str(row.get("vat", "") or "")
+        # IMPORTANTE: el costo (`standard_price`) es dependiente de empresa.
+        # Sin `company_ids` en el contexto, Odoo devuelve costo 0 y el margen
+        # queda inflado. Pasamos las empresas igual que la app de Streamlit.
+        if "id" in companies_df.columns:
+            company_ids = [int(x) for x in companies_df["id"].tolist()]
 
     # --- Caja ---
     print("✓ Cargando plan de cuentas y movimientos del día...")
@@ -127,6 +133,7 @@ def generar_pdf_dia(fecha: date) -> tuple[bytes, str, str]:
     print("✓ Cargando facturas del día...")
     lineas = extract_invoice_lines(
         client, date_from=fecha, date_to=fecha,
+        company_ids=company_ids,
     )
     ventas_kpis = None
     por_cat = pd.DataFrame()
@@ -134,14 +141,17 @@ def generar_pdf_dia(fecha: date) -> tuple[bytes, str, str]:
     if lineas is not None and not lineas.empty:
         ventas_kpis = compute_sales_kpis_from_lines(
             lineas, date_from=fecha, date_to=fecha,
+            company_ids=company_ids,
         )
         por_cat = compute_sales_by_product(
             lineas, group_by="category",
             date_from=fecha, date_to=fecha,
+            company_ids=company_ids,
         )
         por_prod = compute_sales_by_product(
             lineas, group_by="product",
             date_from=fecha, date_to=fecha,
+            company_ids=company_ids,
         )
         print(f"  · {len(lineas)} líneas / {ventas_kpis.n_facturas} facturas")
 

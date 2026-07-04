@@ -154,30 +154,27 @@ def _make_page_decorator(empresa: str, nit: str, fecha: _date):
 
     def _decorator(canv, doc):
         canv.saveState()
-        # Header
+        # --- Línea 1: empresa (izquierda) + fecha (derecha) ---
         canv.setFont("Helvetica-Bold", 9)
         canv.setFillColor(_CDM_NAVY)
-        canv.drawString(1.5 * cm, letter[1] - 1.2 * cm, empresa.upper())
+        canv.drawString(1.5 * cm, letter[1] - 1.0 * cm, empresa.upper())
+        canv.drawRightString(
+            letter[0] - 1.5 * cm, letter[1] - 1.0 * cm, f"Fecha: {fecha_str}",
+        )
+        # --- Línea 2: NIT (izquierda) + título del documento (centrado) ---
         canv.setFont("Helvetica", 8)
         canv.setFillColor(colors.HexColor("#444444"))
-        canv.drawString(1.5 * cm, letter[1] - 1.6 * cm, f"NIT: {nit}")
-        # Centrado: título
-        canv.setFont("Helvetica-Bold", 10)
+        canv.drawString(1.5 * cm, letter[1] - 1.5 * cm, f"NIT: {nit}")
+        canv.setFont("Helvetica-Bold", 11)
         canv.setFillColor(_CDM_RED)
         canv.drawCentredString(
-            letter[0] / 2, letter[1] - 1.2 * cm, titulo_doc,
-        )
-        # Derecha: fecha
-        canv.setFont("Helvetica-Bold", 9)
-        canv.setFillColor(_CDM_NAVY)
-        canv.drawRightString(
-            letter[0] - 1.5 * cm, letter[1] - 1.2 * cm, f"Fecha: {fecha_str}",
+            letter[0] / 2, letter[1] - 1.5 * cm, titulo_doc,
         )
         # Línea horizontal bajo el header
         canv.setStrokeColor(_CDM_RED)
         canv.setLineWidth(0.8)
-        canv.line(1.5 * cm, letter[1] - 1.9 * cm,
-                  letter[0] - 1.5 * cm, letter[1] - 1.9 * cm)
+        canv.line(1.5 * cm, letter[1] - 1.85 * cm,
+                  letter[0] - 1.5 * cm, letter[1] - 1.85 * cm)
         # Footer
         canv.setFont("Helvetica", 7)
         canv.setFillColor(colors.HexColor("#888888"))
@@ -252,7 +249,7 @@ def _section_estado_caja(estado: dict, st: dict) -> list:
             rows = [["Comprobante", "Contacto", "Referencia / etiqueta", "Valor"]]
             for ln in g["lineas"]:
                 rows.append([
-                    ln["comprobante"],
+                    Paragraph(str(ln["comprobante"]), st["body"]),
                     Paragraph(ln["contacto"], st["body"]),
                     Paragraph(ln["referencia"], st["body"]),
                     _fmt_money(ln["valor"]),
@@ -266,7 +263,7 @@ def _section_estado_caja(estado: dict, st: dict) -> list:
             ])
             tbl = Table(
                 rows,
-                colWidths=[2.5 * cm, 4.5 * cm, 7.5 * cm, 2.5 * cm],
+                colWidths=[3.4 * cm, 4.4 * cm, 6.7 * cm, 2.5 * cm],
                 repeatRows=1,
             )
             base = _data_table_style(numeric_cols=[3])
