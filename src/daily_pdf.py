@@ -33,12 +33,19 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
+from reportlab.graphics.shapes import Drawing, String
+from reportlab.graphics.charts.barcharts import (
+    HorizontalBarChart,
+    VerticalBarChart,
+)
 
 # Paleta CDM
 _CDM_RED = colors.HexColor("#C8102E")
 _CDM_NAVY = colors.HexColor("#102A43")
 _LIGHT_GREY = colors.HexColor("#F2F2F2")
 _BORDER = colors.HexColor("#CCCCCC")
+_CDM_GREEN = colors.HexColor("#1B7A3D")   # ingresos
+_CDM_ORANGE = colors.HexColor("#B3261E")  # egresos
 
 
 # ── Helpers de formato ──
@@ -70,6 +77,85 @@ def _fmt_qty(n) -> str:
         return f"{float(n):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
     except (TypeError, ValueError):
         return "0,00"
+
+
+def _fmt_millones(v) -> str:
+    """Etiqueta compacta en millones para ejes de gráficas."""
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return ""
+    if abs(v) >= 1_000_000:
+        return f"{v / 1_000_000:.1f}M"
+    if abs(v) >= 1_000:
+        return f"{v / 1_000:.0f}K"
+    return f"{v:.0f}"
+
+
+# ── Gráficas (reportlab.graphics, sin dependencias extra) ──
+def _chart_ingresos_egresos(total_ing: float, total_egr: float) -> Drawing:
+    """Barra vertical: Ingresos vs Egresos (magnitud)."""
+    d = Drawing(240, 165)
+    bc = VerticalBarChart()
+    bc.x = 35
+    bc.y = 25
+    bc.height = 115
+    bc.width = 175
+    bc.data = [[abs(float(total_ing)), abs(float(total_egr))]]
+    bc.categoryAxis.categoryNames = ["Ingresos", "Egresos"]
+    bc.bars[(0, 0)].fillColor = _CDM_GREEN
+    bc.bars[(0, 1)].fillColor = _CDM_ORANGE
+    bc.valueAxis.valueMin = 0
+    bc.valueAxis.labelTextFormat = _fmt_millones
+    bc.valueAxis.labels.fontSize = 7
+    bc.categoryAxis.labels.fontSize = 8
+    bc.barLabelFormat = _fmt_millones
+    bc.barLabels.fontSize = 7
+    bc.barLabels.nudge = 8
+    d.add(bc)
+    return d
+
+
+def _chart_ventas_costo(por_cat, top: int = 8) -> Drawing | None:
+    """Barras horizontales: Ventas netas vs Costo por categoría (top N)."""
+    if por_cat is None or por_cat.empty or "ventas_netas" not in por_cat.columns:
+        return None
+    df = por_cat.copy()
+    df = df.sort_values("ventas_netas", ascending=False).head(top)
+    cats = [str(x)[:24] for x in df.get("categoria_nombre", "").tolist()]
+    ventas = [float(x) for x in df["ventas_netas"].tolist()]
+    if "costo" in df.columns:
+        costos = [float(x) for x in df["costo"].tolist()]
+    else:
+        costos = [0.0] * len(df)
+    # Invertir para que la categoría mayor quede arriba.
+    cats = cats[::-1]
+    ventas = ventas[::-1]
+    costos = costos[::-1]
+    n = max(1, len(cats))
+    d = Drawing(470, 40 + 24 * n)
+    bc = HorizontalBarChart()
+    bc.x = 135
+    bc.y = 25
+    bc.width = 290
+    bc.height = 24 * n
+    bc.data = [ventas, costos]
+    bc.categoryAxis.categoryNames = cats
+    bc.bars[0].fillColor = _CDM_NAVY
+    bc.bars[1].fillColor = _CDM_ORANGE
+    bc.valueAxis.valueMin = 0
+    bc.valueAxis.labelTextFormat = _fmt_millones
+    bc.valueAxis.labels.fontSize = 6
+    bc.categoryAxis.labels.fontSize = 7
+    bc.groupSpacing = 4
+    bc.barSpacing = 0.5
+    d.add(bc)
+    # Leyenda manual
+    d.add(String(135, 40 + 24 * n - 2, "Ventas netas",
+                 fontSize=7, fillColor=_CDM_NAVY))
+    d.add(String(230, 40 + 24 * n - 2, "Costo",
+                 fontSize=7, fillColor=_CDM_ORANGE))
+    return d
 
 
 # ── Estilos de párrafo ──
@@ -193,6 +279,48 @@ def _make_page_decorator(empresa: str, nit: str, fecha: _date):
 
 
 # ── Construcción de secciones ──
+def _tabla_movimientos(lineas: list, titulo_markup: str,
+                       header_color, st: dict) -> tuple[list, float]:
+    """
+    Renderiza una tabla de movimientos (Ingresos o Egresos) con subtotal.
+    Devuelve (flowables, subtotal).
+    """
+    flow: list = []
+    flow.append(Paragraph(titulo_markup, st["h3"]))
+    rows = [["Comprobante", "Contacto", "Referencia / etiqueta", "Valor"]]
+    subtotal = 0.0
+    for ln in lineas:
+        subtotal += float(ln["valor"])
+        rows.append([
+            Paragraph(str(ln["comprobante"]), st["body"]),
+            Paragraph(ln["contacto"], st["body"]),
+            Paragraph(ln["referencia"], st["body"]),
+            _fmt_money(ln["valor"]),
+        ])
+    rows.append([
+        "", "",
+        Paragraph("<b>Subtotal</b>", st["right"]),
+        _fmt_money(subtotal),
+    ])
+    tbl = Table(
+        rows,
+        colWidths=[3.4 * cm, 4.4 * cm, 6.7 * cm, 2.5 * cm],
+        repeatRows=1,
+    )
+    base = _data_table_style(numeric_cols=[3])
+    base.add("BACKGROUND", (0, 0), (-1, 0), header_color)  # header verde/rojo
+    base.add("LINEABOVE", (0, len(rows) - 1), (-1, len(rows) - 1),
+             0.5, _CDM_NAVY)
+    base.add("FONTNAME", (0, len(rows) - 1), (-1, len(rows) - 1),
+             "Helvetica-Bold")
+    base.add("BACKGROUND", (0, len(rows) - 1), (-1, len(rows) - 1),
+             colors.HexColor("#E8EEF7"))
+    tbl.setStyle(base)
+    flow.append(tbl)
+    flow.append(Spacer(1, 6))
+    return flow, subtotal
+
+
 def _section_estado_caja(estado: dict, st: dict) -> list:
     story: list = []
     story.append(Paragraph("ESTADO DE CAJA", st["h1"]))
@@ -204,6 +332,8 @@ def _section_estado_caja(estado: dict, st: dict) -> list:
         ))
         return story
 
+    grand_ing = 0.0
+    grand_egr = 0.0
     for cta in estado["cuentas"]:
         # Header de cuenta
         story.append(Paragraph(
@@ -243,39 +373,40 @@ def _section_estado_caja(estado: dict, st: dict) -> list:
             story.append(Spacer(1, 8))
             continue
 
-        # Grupos por tipo de comprobante
+        # Separar movimientos en Ingresos (valor > 0) y Egresos (valor < 0),
+        # aplanando todos los comprobantes de la cuenta.
+        todas_lineas: list = []
         for g in cta["grupos"]:
-            story.append(Paragraph(g["journal_name"], st["h3"]))
-            rows = [["Comprobante", "Contacto", "Referencia / etiqueta", "Valor"]]
-            for ln in g["lineas"]:
-                rows.append([
-                    Paragraph(str(ln["comprobante"]), st["body"]),
-                    Paragraph(ln["contacto"], st["body"]),
-                    Paragraph(ln["referencia"], st["body"]),
-                    _fmt_money(ln["valor"]),
-                ])
-            rows.append([
-                "", "",
-                Paragraph(
-                    f"<b>Subtotal {g['journal_name']}</b>", st["right"],
-                ),
-                _fmt_money(g["subtotal"]),
-            ])
-            tbl = Table(
-                rows,
-                colWidths=[3.4 * cm, 4.4 * cm, 6.7 * cm, 2.5 * cm],
-                repeatRows=1,
+            todas_lineas.extend(g["lineas"])
+        ingresos = [ln for ln in todas_lineas if float(ln["valor"]) > 0]
+        egresos = [ln for ln in todas_lineas if float(ln["valor"]) < 0]
+
+        total_ing = 0.0
+        total_egr = 0.0
+        if ingresos:
+            flow, total_ing = _tabla_movimientos(
+                ingresos,
+                "<font color='#1B7A3D'><b>Ingresos (+)</b></font>",
+                _CDM_GREEN, st,
             )
-            base = _data_table_style(numeric_cols=[3])
-            base.add("LINEABOVE", (0, len(rows) - 1), (-1, len(rows) - 1),
-                     0.5, _CDM_NAVY)
-            base.add("FONTNAME", (0, len(rows) - 1), (-1, len(rows) - 1),
-                     "Helvetica-Bold")
-            base.add("BACKGROUND", (0, len(rows) - 1), (-1, len(rows) - 1),
-                     colors.HexColor("#E8EEF7"))
-            tbl.setStyle(base)
-            story.append(tbl)
-            story.append(Spacer(1, 6))
+            story.extend(flow)
+        if egresos:
+            flow, total_egr = _tabla_movimientos(
+                egresos,
+                "<font color='#B3261E'><b>Egresos (−)</b></font>",
+                _CDM_ORANGE, st,
+            )
+            story.extend(flow)
+
+        # Resumen Ingresos / Egresos / Neto de la cuenta
+        grand_ing += total_ing
+        grand_egr += total_egr
+        story.append(Paragraph(
+            f"<b>Ingresos:</b> <font color='#1B7A3D'>{_fmt_money(total_ing)}</font>"
+            f" &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"<b>Egresos:</b> <font color='#B3261E'>{_fmt_money(total_egr)}</font>",
+            st["body"],
+        ))
 
         # Total flujo de la cuenta
         story.append(Paragraph(
@@ -330,6 +461,12 @@ def _section_estado_caja(estado: dict, st: dict) -> list:
         f"{_fmt_money(estado.get('total_flujo', 0))}</b></font>",
         st["body"],
     ))
+
+    # Gráfica Ingresos vs Egresos
+    if abs(grand_ing) > 0.01 or abs(grand_egr) > 0.01:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph("Ingresos vs Egresos del día", st["h2"]))
+        story.append(_chart_ingresos_egresos(grand_ing, grand_egr))
 
     return story
 
@@ -428,7 +565,16 @@ def _section_ventas_diarias(
         )
         tbl.setStyle(_data_table_style(numeric_cols=[1, 2, 3, 4, 5, 6, 7]))
         story.append(tbl)
-        story.append(Spacer(1, 10))
+        story.append(Spacer(1, 8))
+
+        # Gráfica: Ventas netas vs Costo por categoría
+        chart = _chart_ventas_costo(por_categoria, top=8)
+        if chart is not None:
+            story.append(Paragraph(
+                "Ventas netas vs Costo por categoría (top 8)", st["h3"],
+            ))
+            story.append(chart)
+            story.append(Spacer(1, 10))
 
     # Por producto (top N)
     story.append(Paragraph(

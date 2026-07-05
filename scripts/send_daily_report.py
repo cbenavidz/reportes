@@ -55,6 +55,7 @@ DEFAULT_RECIPIENTS = "carlos@casadelosmineros.com.co,mlzorag@gmail.com"
 
 def _saldos_iniciales(
     client: OdooClient, ant_iso: str, cash_ids: list[int],
+    company_ids: list[int] | None = None,
 ) -> dict[int, float]:
     """Calcula saldo a `ant_iso` para cada cuenta de caja con read_group."""
     if not cash_ids:
@@ -64,6 +65,8 @@ def _saldos_iniciales(
         ("date", "<=", ant_iso),
         ("account_id", "in", cash_ids),
     ]
+    if company_ids:
+        domain.append(("company_id", "in", list(company_ids)))
     try:
         groups = client.execute_kw(
             "account.move.line", "read_group",
@@ -115,14 +118,14 @@ def generar_pdf_dia(fecha: date) -> tuple[bytes, str, str]:
         if "id" in companies_df.columns:
             company_ids = [int(row["id"])]
 
-    # --- Caja ---
+    # --- Caja (solo cuentas de Casa de los Mineros) ---
     print("✓ Cargando plan de cuentas y movimientos del día...")
-    chart = extract_chart_of_accounts(client)
+    chart = extract_chart_of_accounts(client, company_ids=company_ids)
     cash_accs = get_cash_accounts(chart)
     cash_ids = [int(x) for x in cash_accs["id"].tolist()] if not cash_accs.empty else []
 
     moves_dia = extract_account_movements(
-        client, date_from=fecha, date_to=fecha,
+        client, date_from=fecha, date_to=fecha, company_ids=company_ids,
     )
     if not moves_dia.empty and cash_ids and "account_id" in moves_dia.columns:
         moves_dia["account_id"] = pd.to_numeric(
@@ -131,7 +134,7 @@ def generar_pdf_dia(fecha: date) -> tuple[bytes, str, str]:
         moves_dia = moves_dia[moves_dia["account_id"].isin(cash_ids)]
 
     ant_iso = (fecha - timedelta(days=1)).isoformat()
-    saldo_ini = _saldos_iniciales(client, ant_iso, cash_ids)
+    saldo_ini = _saldos_iniciales(client, ant_iso, cash_ids, company_ids=company_ids)
     estado_caja = compute_estado_caja(chart, moves_dia, saldo_ini, fecha)
     print(f"  · {len(estado_caja.get('cuentas') or [])} cuentas de caja con saldo/movimientos")
 
