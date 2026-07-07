@@ -17,7 +17,7 @@ Función principal:
 from __future__ import annotations
 
 import io
-from datetime import date as _date, datetime
+from datetime import date as _date, datetime, timedelta, timezone
 
 import pandas as pd
 from reportlab.lib import colors
@@ -266,7 +266,7 @@ def _make_page_decorator(empresa: str, nit: str, fecha: _date):
         canv.setFillColor(colors.HexColor("#888888"))
         canv.drawString(
             1.5 * cm, 1 * cm,
-            f"Generado: {datetime.now().strftime('%Y-%m-%d %H:%M')} · "
+            f"Generado: {datetime.now(timezone(timedelta(hours=-5))).strftime('%Y-%m-%d %H:%M')} · "
             "Casa de los Mineros · Informe diario automático",
         )
         canv.drawRightString(

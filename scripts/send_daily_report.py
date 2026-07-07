@@ -21,7 +21,7 @@ from __future__ import annotations
 import os
 import smtplib
 import sys
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
 
 # Agregar el root del repo al path para importar src.*
@@ -211,7 +211,12 @@ def enviar_pdf_correo(
 
 
 def main():
-    fecha = date.today()
+    # GitHub Actions corre en UTC. Colombia es UTC-5 (sin horario de verano),
+    # así que la fecha del informe se calcula en hora de Bogotá. De lo
+    # contrario, al correr al final de la tarde (ya de madrugada en UTC) el
+    # informe saldría con la fecha del día siguiente.
+    bogota = timezone(timedelta(hours=-5))
+    fecha = datetime.now(bogota).date()
     if len(sys.argv) > 1:
         fecha = date.fromisoformat(sys.argv[1])
     print(f"=== Informe Diario CDM — {fecha.isoformat()} ===")
