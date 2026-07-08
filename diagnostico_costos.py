@@ -116,12 +116,13 @@ def main():
 
     # 6) Muestra de las primeras líneas
     cols = [c for c in [
-        "product_default_code", "product_id", "quantity",
-        "price_subtotal_signed", "purchase_price",
-        "product_standard_price", "line_cost", "line_margin",
+        "product_default_code", "product_uom_name", "quantity",
+        "uom_factor", "quantity_base", "product_standard_price",
+        "line_cost", "price_subtotal_signed", "line_margin",
     ] if c in df.columns]
-    print("6) Muestra (primeras 12 líneas):")
-    print(df[cols].head(12).to_string(index=False))
+    print("6) Muestra (primeras 15 líneas) — revisa que line_cost = "
+          "standard_price × quantity_base:")
+    print(df[cols].head(15).to_string(index=False))
 
 
 if __name__ == "__main__":

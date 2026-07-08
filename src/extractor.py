@@ -708,6 +708,43 @@ def extract_invoice_lines(
     if df.empty:
         return df
 
+    # --- Factor de Unidad de Medida (UoM) ---
+    # El costo (`standard_price`) está expresado por la UoM de referencia del
+    # producto (p.ej. "Unidades"), pero la línea puede facturarse en otra UoM
+    # (p.ej. "Caja x 24"). Si no convertimos, el costo se subvalora tantas
+    # veces como unidades tenga el embalaje (1 caja x 24 = 24 unidades).
+    # `quantity_base` = cantidad convertida a la UoM de referencia.
+    df["uom_factor"] = 1.0
+    try:
+        uom_ids = (
+            pd.to_numeric(df.get("product_uom_id"), errors="coerce")
+            .dropna().astype(int).unique().tolist()
+        )
+        if uom_ids:
+            uom_recs = client.read(
+                "uom.uom", ids=uom_ids, fields=["id", "factor", "factor_inv"],
+            )
+            fmap: dict[int, float] = {}
+            for u in uom_recs:
+                fi = u.get("factor_inv") or 0
+                f = u.get("factor") or 0
+                if fi and float(fi) > 0:
+                    fmap[int(u["id"])] = float(fi)          # unidades por UoM
+                elif f and float(f) > 0:
+                    fmap[int(u["id"])] = 1.0 / float(f)
+                else:
+                    fmap[int(u["id"])] = 1.0
+            df["uom_factor"] = (
+                pd.to_numeric(df["product_uom_id"], errors="coerce")
+                .map(fmap).fillna(1.0)
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("No se pudieron leer factores de UoM (uom.uom): %s", exc)
+        df["uom_factor"] = 1.0
+    df["quantity_base"] = (
+        pd.to_numeric(df["quantity"], errors="coerce").fillna(0) * df["uom_factor"]
+    )
+
     # Enriquecer con categoría de producto (un solo round-trip por todos los
     # product_id distintos). Defensa contra NaN: algunas líneas pueden no
     # tener product_id (descuentos, líneas manuales) y `int(NaN)` lanza error.
@@ -862,8 +899,13 @@ def extract_invoice_lines(
                 {"out_invoice": 1, "out_refund": -1}
             ).fillna(1)
 
+            qty_base = pd.to_numeric(
+                df.get("quantity_base"), errors="coerce"
+            ).fillna(0)
             if "purchase_price" in df.columns:
-                # Costo histórico de Enterprise — mucho más preciso
+                # Costo histórico de Enterprise. `purchase_price` está en la
+                # UoM de la línea, así que se multiplica por la cantidad tal
+                # cual (Odoo ya consideró el embalaje).
                 df["line_cost"] = (
                     pd.to_numeric(df["purchase_price"], errors="coerce").fillna(0)
                     * df["quantity"].fillna(0)
@@ -871,13 +913,15 @@ def extract_invoice_lines(
                 )
                 df["cost_source"] = "purchase_price (Enterprise, histórico)"
             else:
-                # Fallback: snapshot actual del costo del producto
+                # Fallback: costo actual del producto. `standard_price` está en
+                # la UoM de referencia, por eso usamos `quantity_base` (cantidad
+                # convertida a unidades base) para respetar el embalaje.
                 df["line_cost"] = (
                     df["product_standard_price"].fillna(0)
-                    * df["quantity"].fillna(0)
+                    * qty_base
                     * sign_series
                 )
-                df["cost_source"] = "standard_price (actual)"
+                df["cost_source"] = "standard_price × UoM base (actual)"
 
             if "margin_signed" in df.columns:
                 df["line_margin"] = pd.to_numeric(

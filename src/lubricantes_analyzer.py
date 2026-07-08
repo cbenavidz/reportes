@@ -57,7 +57,12 @@ def enriquecer(
     sign = df.get("move_type", pd.Series(index=df.index)).map(
         {"out_invoice": 1, "out_refund": -1}
     ).fillna(1)
-    qty = pd.to_numeric(df.get("quantity", 0), errors="coerce").fillna(0)
+    # `quantity_base` = cantidad convertida a unidades base (respeta embalajes
+    # como "Caja x 24"). Si no viene, se usa la cantidad de la línea.
+    if "quantity_base" in df.columns:
+        qty = pd.to_numeric(df["quantity_base"], errors="coerce").fillna(0)
+    else:
+        qty = pd.to_numeric(df.get("quantity", 0), errors="coerce").fillna(0)
     vol_unit = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
 
     df["ventas"] = pd.to_numeric(
