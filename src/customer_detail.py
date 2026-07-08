@@ -23,6 +23,13 @@ from .sales_analyzer import _filter_lines_for_sales, filter_excluded_products
 logger = logging.getLogger(__name__)
 
 
+def _qty_base(df: pd.DataFrame) -> pd.Series:
+    """Cantidad en unidades base (respeta embalajes como 'Caja x 24').
+    Usa `quantity_base` si viene del extractor; si no, cae a `quantity`."""
+    col = "quantity_base" if "quantity_base" in df.columns else "quantity"
+    return pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+
 # =============================================================================
 # KPIs de ventas del cliente
 # =============================================================================
@@ -66,7 +73,7 @@ def compute_customer_sales_kpis(
     sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
     qty = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
     unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
-    df["_vol_signed"] = qty * unit_vol * sign
+    df["_vol_signed"] = _qty_base(df) * unit_vol * sign
 
     is_fac = df["move_type"] == "out_invoice"
     ventas_netas = float(df["price_subtotal_signed"].sum())
@@ -125,7 +132,7 @@ def compute_customer_top_products(
     sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
     qty = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
     unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
-    df["_vol_signed"] = qty * unit_vol * sign
+    df["_vol_signed"] = _qty_base(df) * unit_vol * sign
     df["_qty_signed"] = qty * sign
 
     df["product_id"] = pd.to_numeric(df["product_id"], errors="coerce").fillna(-1).astype(int)
@@ -193,7 +200,7 @@ def compute_customer_by_category(
     sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
     qty = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
     unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
-    df["_vol_signed"] = qty * unit_vol * sign
+    df["_vol_signed"] = _qty_base(df) * unit_vol * sign
     df["_qty_signed"] = qty * sign
     df["product_categ_name"] = (
         df["product_categ_name"].fillna("Sin categoría").replace("", "Sin categoría")
@@ -400,7 +407,7 @@ def compute_customer_monthly_sales(
             sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
             qty = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
             unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
-            df["_vol_signed"] = qty * unit_vol * sign
+            df["_vol_signed"] = _qty_base(df) * unit_vol * sign
             is_fac = df["move_type"] == "out_invoice"
             agg = pd.DataFrame({
                 "ventas_netas": df.groupby("mes")["price_subtotal_signed"].sum(),

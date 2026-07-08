@@ -31,6 +31,16 @@ from .sales_analyzer import _filter_lines_for_sales
 logger = logging.getLogger(__name__)
 
 
+def _qty_base(df: pd.DataFrame) -> pd.Series:
+    """
+    Cantidad en unidades base (respeta embalajes como 'Caja x 24').
+    Usa `quantity_base` (calculada en el extractor con el factor de UoM);
+    si no viene, cae a `quantity`.
+    """
+    col = "quantity_base" if "quantity_base" in df.columns else "quantity"
+    return pd.to_numeric(df[col], errors="coerce").fillna(0)
+
+
 def get_partners_for_sellers(
     partners: pd.DataFrame,
     invoices: pd.DataFrame | None,
@@ -124,7 +134,7 @@ def compute_monthly_clients_kpi(
         # `product_volume` viene del extractor (campo `volume` de product.product).
         # Para Casa de los Mineros, esto da el volumen en galones.
         sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
-        qty = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
+        qty = _qty_base(df)
         unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
         df["_qty_signed"] = qty * unit_vol * sign
         is_fac = df["move_type"] == "out_invoice"
@@ -210,7 +220,7 @@ def compute_sales_by_city(
     # Volumen físico = quantity × product.volume × signo
     sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
     df = df.copy()
-    qty = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
+    qty = _qty_base(df)
     unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
     df["_qty_signed"] = qty * unit_vol * sign
     grp_cols = ["city"] + (["state_name"] if "state_name" in df.columns else [])
@@ -302,7 +312,7 @@ def compute_visit_frequency(
     # Volumen físico = quantity × product.volume × signo
     sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
     df = df.copy()
-    qty = pd.to_numeric(df["quantity"], errors="coerce").fillna(0)
+    qty = _qty_base(df)
     unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
     df["_qty_signed"] = qty * unit_vol * sign
     volumen_pid = df.groupby("partner_id")["_qty_signed"].sum().to_dict()
