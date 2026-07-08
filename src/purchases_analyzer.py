@@ -185,6 +185,12 @@ def compute_product_crosstab(
             "product_categ_name": ("product_categ_name", "first"),
             "costo_unit_compra": ("price_unit", "mean"),
         }
+        # Costo por UNIDAD BASE (standard_price), consistente con el stock
+        # (que está en unidades base). `costo_unit_compra` viene de price_unit,
+        # que puede estar por embalaje (p.ej. por caja), así que no sirve para
+        # valorar stock en unidades base.
+        if "product_standard_price" in pc.columns:
+            _pc_agg["avg_cost_base"] = ("product_standard_price", "first")
         # Tipo de producto (storable/service) — para poder filtrar servicios
         if "product_type" in pc.columns:
             _pc_agg["product_type"] = ("product_type", "first")
@@ -269,9 +275,23 @@ def compute_product_crosstab(
     df["stock_qty"] = df["stock_qty"].fillna(0)
     df["stock_valor"] = df["stock_valor"].fillna(0)
 
-    # Si stock_valor es 0 pero hay costo_unit_compra, estimar
-    if "costo_unit_compra" in df.columns:
-        mask = (df["stock_valor"] == 0) & (df["stock_qty"] > 0)
+    # Si stock_valor es 0 (Odoo no lo entrega), estimarlo. Preferimos el
+    # costo por unidad base (`avg_cost_base` = standard_price), que es
+    # consistente con `stock_qty` (unidades base). Solo si no existe se cae a
+    # `costo_unit_compra` (price_unit), que puede estar por embalaje.
+    mask = (df["stock_valor"] == 0) & (df["stock_qty"] > 0)
+    if "avg_cost_base" in df.columns:
+        _cb = pd.to_numeric(df["avg_cost_base"], errors="coerce").fillna(0)
+        df.loc[mask, "stock_valor"] = df.loc[mask, "stock_qty"] * _cb[mask]
+        # Respaldo con price_unit para los que aún quedaron en 0 (sin
+        # standard_price). Puede estar por embalaje, pero es el último recurso.
+        if "costo_unit_compra" in df.columns:
+            mask2 = (df["stock_valor"] == 0) & (df["stock_qty"] > 0)
+            df.loc[mask2, "stock_valor"] = (
+                df.loc[mask2, "stock_qty"]
+                * df.loc[mask2, "costo_unit_compra"].fillna(0)
+            )
+    elif "costo_unit_compra" in df.columns:
         df.loc[mask, "stock_valor"] = (
             df.loc[mask, "stock_qty"] * df.loc[mask, "costo_unit_compra"].fillna(0)
         )
