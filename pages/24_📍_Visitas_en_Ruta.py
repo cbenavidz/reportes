@@ -52,9 +52,9 @@ if f_desde > f_hasta:
 
 visits = load_sr_visits(f_desde.isoformat(), f_hasta.isoformat())
 routes = load_sr_routes()
-partners = load_route_partners(
-    company_ids=tuple(company_ids) if company_ids else None
-)
+# Clientes ACTIVOS EN RUTA (sin filtrar por empresa: los contactos suelen ser
+# compartidos y el filtro los dejaría fuera). Son la base de la agenda.
+partners = load_route_partners(solo_activos=True)
 
 if visits is None or visits.empty:
     st.info(

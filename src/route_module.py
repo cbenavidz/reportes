@@ -96,6 +96,11 @@ def extract_route_partners(
     """
     Clientes con su configuración de ruta (sr_*): rutero, secuencia, días,
     frecuencia configurada, GPS y estado en ruta.
+
+    ⚠️ `company_ids`: úsalo con cuidado. En Odoo los contactos suelen ser
+    COMPARTIDOS entre compañías (`company_id` vacío), así que filtrar por
+    empresa deja fuera a la mayoría de los clientes. Para el universo de ruta
+    usa `solo_activos=True` y NO pases `company_ids`.
     """
     fields = [
         "id", "name", "city", "state_id", "user_id",

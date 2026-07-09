@@ -66,9 +66,11 @@ if routes is None or routes.empty:
     )
     st.stop()
 
-partners = load_route_partners(
-    company_ids=tuple(company_ids) if company_ids else None,
-)
+# Universo del rutero = clientes ACTIVOS EN RUTA en la app móvil
+# (`sr_active_in_route`). NO se filtra por empresa: en Odoo los contactos
+# suelen ser compartidos entre compañías (company_id vacío) y ese filtro
+# dejaría fuera a la mayoría. El filtro de empresa sí aplica a las ventas.
+partners = load_route_partners(solo_activos=True)
 lines = load_invoice_lines(
     company_ids=tuple(company_ids) if company_ids else None,
     date_from=desde.isoformat(), date_to=hoy.isoformat(),
@@ -100,19 +102,28 @@ with st.expander("📋 Ruteros configurados en Odoo", expanded=False):
                        "dia": "Día", "partner_count": "# Clientes"},
     )
 
-# ── Universo de ruta: activos con GPS ──
+# ── Universo de ruta: clientes ACTIVOS EN RUTA ──
 p = partners.copy()
 for c in ["sr_active_in_route", "sr_has_geo"]:
     if c not in p.columns:
         p[c] = False
     p[c] = p[c].fillna(False).astype(bool)
 
-activos = p[p["sr_active_in_route"]]
-en_ruta = activos[activos["sr_has_geo"]].copy()
-sin_gps = activos[~activos["sr_has_geo"]].copy()
+activos = p[p["sr_active_in_route"]]          # el universo real
+en_ruta = activos[activos["sr_has_geo"]].copy()   # entran al plan
+sin_gps = activos[~activos["sr_has_geo"]].copy()  # quedan fuera, lista aparte
 
+if activos.empty:
+    st.warning(
+        "No hay clientes marcados como **activos en ruta** en la app. "
+        "En Odoo: Contactos → marcar «Activo en ruta»."
+    )
+    st.stop()
 if en_ruta.empty:
-    st.warning("No hay clientes activos en ruta con GPS válido.")
+    st.warning(
+        f"Hay {len(activos):,} clientes activos en ruta, pero ninguno tiene "
+        "coordenadas GPS, así que no se puede optimizar."
+    )
     st.stop()
 
 # Vendedor y día actual del cliente (desde su rutero)
@@ -139,11 +150,12 @@ en_ruta["semanas"] = en_ruta["semanas"].fillna("1")
 en_ruta["lat"] = pd.to_numeric(en_ruta["partner_latitude"], errors="coerce")
 en_ruta["lon"] = pd.to_numeric(en_ruta["partner_longitude"], errors="coerce")
 
-m = st.columns(4)
-m[0].metric("Clientes en ruta (con GPS)", f"{len(en_ruta):,}")
-m[1].metric("Activos sin GPS", f"{len(sin_gps):,}")
-m[2].metric("Vendedores", f"{en_ruta['vendedor'].nunique():,}")
-m[3].metric("Ventas 12m", fmt_money(en_ruta["ventas"].sum()))
+m = st.columns(5)
+m[0].metric("Activos en ruta", f"{len(activos):,}")
+m[1].metric("En el plan (con GPS)", f"{len(en_ruta):,}")
+m[2].metric("Sin GPS (fuera del plan)", f"{len(sin_gps):,}")
+m[3].metric("Vendedores", f"{en_ruta['vendedor'].nunique():,}")
+m[4].metric("Ventas 12m", fmt_money(en_ruta["ventas"].sum()))
 
 st.divider()
 
