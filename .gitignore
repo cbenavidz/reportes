@@ -63,3 +63,11 @@ logs/
 
 # Excel temporales
 ~$*.xlsx
+
+# Archivos temporales y salidas generadas localmente
+*.tmp
+rutero_vendedores.xlsx
+rutero_propuesta.xlsx
+plan_ruteros_2zonas.xlsx
+revision_ruteros_app.xlsx
+visitas_en_ruta.xlsx
