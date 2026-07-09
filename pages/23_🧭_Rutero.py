@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-Página: Rutero (sobre los datos reales del módulo `sales_route_mobile`).
+Página: Rutero — rebalanceo sobre los datos reales de `sales_route_mobile`.
 
-Lee los ruteros reales de Odoo (sr.route) y los clientes activos en ruta con
-GPS, calcula la frecuencia sugerida (ventas + facturas/mes), propone una
-zonificación en 5 días (Lun-Vie, zona de menor venta el lunes) y una secuencia
-optimizada por cercanía.
+Universo: los clientes ACTIVOS EN RUTA en la app móvil (`sr_active_in_route`).
 
-SOLO LECTURA: cada vendedor conserva sus clientes (no se reasignan entre
-vendedores) y la propuesta se entrega en Excel para cargarla manualmente en
+  - Cada vendedor CONSERVA sus clientes (no se reasignan entre vendedores).
+  - Los clientes activos sin rutero ("huérfanos") se asignan al vendedor cuyo
+    territorio les quede más cerca.
+  - Los 5 días de cada vendedor se rebalancean por CARGA DE VISITAS/MES
+    (derivada de las facturas por mes y las ventas), manteniendo compactas las
+    zonas geográficas.
+  - La secuencia de cada día se optimiza por vecino más cercano.
+
+SOLO LECTURA: la propuesta se entrega en Excel para cargarla manualmente en
 Odoo. Los clientes sin GPS quedan fuera del plan, en una lista aparte.
 """
 from __future__ import annotations
@@ -21,11 +25,7 @@ import plotly.express as px
 import streamlit as st
 
 from src.auth import logout_button, require_auth
-from src.data_loader import (
-    load_invoice_lines,
-    load_route_partners,
-    load_sr_routes,
-)
+from src.data_loader import load_invoice_lines, load_route_partners, load_sr_routes
 from src import route_module as rm
 from src import rutero_optimizer as ro
 from src.rutero_planner import DIAS
@@ -36,12 +36,12 @@ st.set_page_config(page_title="Rutero | Cartera", page_icon="🧭", layout="wide
 require_auth()
 logout_button()
 
-st.title("🧭 Rutero")
+st.title("🧭 Rutero — rebalanceo")
 st.caption(
-    "Sobre los datos reales del módulo **Ventas en Ruta** de Odoo. La "
-    "**frecuencia** se sugiere según las ventas y las facturas por mes de cada "
-    "cliente; el **día** por zona geográfica (la zona de menor venta va el "
-    "lunes, por los festivos); y la **secuencia** se optimiza por cercanía."
+    "Universo: clientes **activos en ruta** en la app. Cada vendedor conserva "
+    "sus clientes; se rebalancean sus 5 días por **carga de visitas/mes** "
+    "(según facturas/mes y ventas) manteniendo zonas compactas. La zona de "
+    "menor venta va el lunes, por los festivos."
 )
 
 
@@ -61,22 +61,20 @@ desde = hoy - timedelta(days=365)
 routes = load_sr_routes()
 if routes is None or routes.empty:
     st.error(
-        "No se pudieron leer los ruteros (`sr.route`). Verifica que el usuario "
-        "de API tenga permiso de lectura sobre el módulo de Ventas en Ruta."
+        "No se pudieron leer los ruteros (`sr.route`). Verifica los permisos "
+        "del usuario de API sobre el módulo de Ventas en Ruta."
     )
     st.stop()
 
-# Universo del rutero = clientes ACTIVOS EN RUTA en la app móvil
-# (`sr_active_in_route`). NO se filtra por empresa: en Odoo los contactos
-# suelen ser compartidos entre compañías (company_id vacío) y ese filtro
-# dejaría fuera a la mayoría. El filtro de empresa sí aplica a las ventas.
+# Universo = activos en ruta. Sin filtrar por empresa: los contactos suelen ser
+# compartidos entre compañías y el filtro dejaría fuera a la mayoría.
 partners = load_route_partners(solo_activos=True)
 lines = load_invoice_lines(
     company_ids=tuple(company_ids) if company_ids else None,
     date_from=desde.isoformat(), date_to=hoy.isoformat(),
 )
 
-# Día único por rutero (cada sr.route tiene un solo día activo)
+
 def _dia_de_ruta(r) -> str:
     for c in rm.DAY_COLS:
         if r.get(c):
@@ -86,15 +84,13 @@ def _dia_de_ruta(r) -> str:
 
 routes = routes.copy()
 routes["dia"] = routes.apply(_dia_de_ruta, axis=1)
-# (vendedor, día) -> route_id, para poder reasignar el rutero al escribir
-ruta_por_dia = {
-    (str(r["user_name"]), str(r["dia"])): int(r["id"])
-    for _, r in routes.iterrows()
-}
+ruta_por_dia = {(str(r["user_name"]), str(r["dia"])): int(r["id"])
+                for _, r in routes.iterrows()}
 dia_de_route_id = dict(zip(routes["id"].astype(int), routes["dia"]))
-vendedor_de_route_id = dict(zip(routes["id"].astype(int), routes["user_name"]))
+vend_de_route_id = dict(zip(routes["id"].astype(int), routes["user_name"]))
+vend_validos = set(routes["user_name"].dropna().astype(str))
 
-with st.expander("📋 Ruteros configurados en Odoo", expanded=False):
+with st.expander("📋 Ruteros actuales en Odoo", expanded=False):
     st.dataframe(
         routes[["name", "user_name", "dia", "partner_count"]],
         use_container_width=True, hide_index=True,
@@ -102,42 +98,31 @@ with st.expander("📋 Ruteros configurados en Odoo", expanded=False):
                        "dia": "Día", "partner_count": "# Clientes"},
     )
 
-# ── Universo de ruta: clientes ACTIVOS EN RUTA ──
+# ── Universo ──
 p = partners.copy()
 for c in ["sr_active_in_route", "sr_has_geo"]:
     if c not in p.columns:
         p[c] = False
     p[c] = p[c].fillna(False).astype(bool)
 
-activos = p[p["sr_active_in_route"]]          # el universo real
-en_ruta = activos[activos["sr_has_geo"]].copy()   # entran al plan
-sin_gps = activos[~activos["sr_has_geo"]].copy()  # quedan fuera, lista aparte
-
+activos = p[p["sr_active_in_route"]].copy()
 if activos.empty:
-    st.warning(
-        "No hay clientes marcados como **activos en ruta** en la app. "
-        "En Odoo: Contactos → marcar «Activo en ruta»."
-    )
+    st.warning("No hay clientes marcados como «Activo en ruta» en Odoo.")
     st.stop()
+
+en_ruta = activos[activos["sr_has_geo"]].copy()
+sin_gps = activos[~activos["sr_has_geo"]].copy()
 if en_ruta.empty:
-    st.warning(
-        f"Hay {len(activos):,} clientes activos en ruta, pero ninguno tiene "
-        "coordenadas GPS, así que no se puede optimizar."
-    )
+    st.warning(f"Los {len(activos):,} clientes activos no tienen coordenadas GPS.")
     st.stop()
 
-# Vendedor y día actual del cliente (desde su rutero)
-en_ruta["route_id_num"] = pd.to_numeric(en_ruta["sr_route_id"], errors="coerce")
-en_ruta["vendedor"] = en_ruta["route_id_num"].map(vendedor_de_route_id)
-en_ruta["dia_actual"] = en_ruta["route_id_num"].map(dia_de_route_id).fillna("—")
-en_ruta["vendedor"] = en_ruta["vendedor"].fillna(en_ruta.get("user_name"))
-en_ruta = en_ruta[en_ruta["vendedor"].notna()]
+en_ruta["lat"] = pd.to_numeric(en_ruta["partner_latitude"], errors="coerce")
+en_ruta["lon"] = pd.to_numeric(en_ruta["partner_longitude"], errors="coerce")
+en_ruta = en_ruta.dropna(subset=["lat", "lon"])
 
-if en_ruta.empty:
-    st.warning("Los clientes activos con GPS no tienen rutero ni vendedor asignado.")
-    st.stop()
-
-# ── Métricas y frecuencia sugerida (ventas + facturas/mes) ──
+# ── Frecuencia sugerida (ventas + facturas/mes) ──
+# Se calcula ANTES de repartir huérfanos, porque el reparto equilibra por la
+# carga de visitas/mes, que se deriva de la frecuencia.
 met = ro.metricas_clientes(lines, meses=12)
 sug = ro.sugerir_frecuencias(met)
 en_ruta = en_ruta.merge(sug, left_on="id", right_on="partner_id", how="left")
@@ -147,18 +132,87 @@ en_ruta["facturas_mes"] = en_ruta["facturas_mes"].fillna(0.0)
 en_ruta["frecuencia_code"] = en_ruta["frecuencia_code"].fillna("on_demand")
 en_ruta["frecuencia"] = en_ruta["frecuencia"].fillna("Bajo demanda")
 en_ruta["semanas"] = en_ruta["semanas"].fillna("1")
-en_ruta["lat"] = pd.to_numeric(en_ruta["partner_latitude"], errors="coerce")
-en_ruta["lon"] = pd.to_numeric(en_ruta["partner_longitude"], errors="coerce")
+en_ruta["partner_id"] = en_ruta["id"]
 
+# Vendedor actual: por su rutero; si no, por el comercial asignado (solo si
+# ese comercial tiene ruteros). El resto son "huérfanos".
+en_ruta["route_id_num"] = pd.to_numeric(en_ruta["sr_route_id"], errors="coerce")
+en_ruta["vendedor"] = en_ruta["route_id_num"].map(vend_de_route_id)
+en_ruta["dia_actual"] = en_ruta["route_id_num"].map(dia_de_route_id).fillna("—")
+_fb = en_ruta["user_name"].where(en_ruta["user_name"].astype(str).isin(vend_validos))
+en_ruta["vendedor"] = en_ruta["vendedor"].fillna(_fb)
+
+con_vend = en_ruta[en_ruta["vendedor"].notna()].copy()
+huerfanos = en_ruta[en_ruta["vendedor"].isna()].copy()
+n_huerfanos = len(huerfanos)
+huerf_detalle = pd.DataFrame()
+
+if n_huerfanos:
+    st.markdown("#### 🏙️ Reparto de clientes sin rutero")
+    st.caption(
+        f"Hay **{n_huerfanos}** clientes activos sin rutero. Se asignan por "
+        "**ciudad**; los que no tienen ciudad registrada se resuelven por "
+        "cercanía GPS a esas cabeceras."
+    )
+    opciones = sorted(vend_validos)
+
+    def _default(patrones: list[str]) -> int:
+        for i, v in enumerate(opciones):
+            if any(p in v.lower() for p in patrones):
+                return i
+        return 0
+
+    ca, cb = st.columns(2)
+    with ca:
+        v_quibdo = st.selectbox("Quibdó y alrededores →", opciones,
+                                index=_default(["vanessa", "yarley"]))
+    with cb:
+        v_istmina = st.selectbox("Istmina y alrededores →", opciones,
+                                 index=_default(["felipe"]))
+
+    anclas = [
+        {"ciudad": "Quibdó", "lat": ro.CIUDAD_COORDS["QUIBDO"][0],
+         "lon": ro.CIUDAD_COORDS["QUIBDO"][1], "vendedor": v_quibdo},
+        {"ciudad": "Istmina", "lat": ro.CIUDAD_COORDS["ISTMINA"][0],
+         "lon": ro.CIUDAD_COORDS["ISTMINA"][1], "vendedor": v_istmina},
+    ]
+    huerfanos = ro.asignar_huerfanos_por_ciudad(huerfanos, anclas)
+    huerf_detalle = huerfanos[["name", "city", "vendedor", "asignado_por"]].copy()
+
+    rep = huerfanos["vendedor"].value_counts()
+    st.write(" · ".join(f"**{v}**: {n} clientes" for v, n in rep.items()))
+    with st.expander("Ver el detalle del reparto y por qué"):
+        st.dataframe(
+            huerf_detalle.rename(columns={
+                "name": "Cliente", "city": "Ciudad",
+                "vendedor": "Vendedor asignado", "asignado_por": "Criterio"}),
+            use_container_width=True, hide_index=True,
+        )
+    en_ruta = pd.concat([con_vend, huerfanos], ignore_index=True)
+else:
+    en_ruta = con_vend
+
+st.divider()
 m = st.columns(5)
 m[0].metric("Activos en ruta", f"{len(activos):,}")
 m[1].metric("En el plan (con GPS)", f"{len(en_ruta):,}")
-m[2].metric("Sin GPS (fuera del plan)", f"{len(sin_gps):,}")
-m[3].metric("Vendedores", f"{en_ruta['vendedor'].nunique():,}")
+m[2].metric("Sin GPS (fuera)", f"{len(sin_gps):,}")
+m[3].metric("Sin rutero (repartidos)", f"{n_huerfanos:,}")
 m[4].metric("Ventas 12m", fmt_money(en_ruta["ventas"].sum()))
 
 st.divider()
+tol = st.slider(
+    "Prioridad del rebalanceo", 0.05, 0.60, 0.15, step=0.05,
+    help="Bajo = carga muy pareja entre días (pero más kilómetros). "
+         "Alto = rutas más compactas (pero días más desiguales).",
+    format="%.2f",
+)
+st.caption(
+    "⬅️ Más balance de carga · Más compacidad geográfica ➡️ &nbsp;&nbsp; "
+    "Revisa la tabla de carga y los km por día antes de decidir."
+)
 
+# ── Rebalanceo por vendedor ──
 vendedores = sorted(en_ruta["vendedor"].dropna().unique().tolist())
 propuestas: dict[str, pd.DataFrame] = {}
 tabs = st.tabs(vendedores)
@@ -166,124 +220,118 @@ tabs = st.tabs(vendedores)
 for nombre, tab in zip(vendedores, tabs):
     with tab:
         sub = en_ruta[en_ruta["vendedor"] == nombre].copy()
-        base = sub[["id", "name", "city", "lat", "lon", "ventas", "n_facturas",
-                    "facturas_mes", "frecuencia_code", "frecuencia", "semanas",
-                    "dia_actual", "sr_route_sequence"]].rename(
-            columns={"id": "partner_id", "name": "cliente"})
-        opt = ro.optimizar_rutero(
-            base.rename(columns={"cliente": "partner_name"}), dias=5,
-        )
-        if opt.empty:
+        base = sub[["partner_id", "name", "city", "lat", "lon", "ventas",
+                    "n_facturas", "facturas_mes", "frecuencia_code",
+                    "frecuencia", "semanas", "dia_actual", "sr_route_sequence"]]
+        reb = ro.rebalancear(base, dias=5, tol=float(tol))
+        if reb.empty:
             st.info(f"{nombre} no tiene clientes con coordenadas.")
             continue
-        opt = opt.rename(columns={"partner_name": "cliente"})
-        # Rutero (sr.route) que corresponde al día propuesto, MISMO vendedor.
-        opt["route_id_propuesto"] = opt["dia"].map(
+        reb["route_id_propuesto"] = reb["dia"].map(
             lambda d: ruta_por_dia.get((nombre, d))
         )
-        propuestas[nombre] = opt
+        propuestas[nombre] = reb
 
-        km = ro.km_por_dia(opt)
+        res = ro.resumen_carga(reb)
         c = st.columns(4)
-        c[0].metric("Clientes", f"{len(opt):,}")
-        c[1].metric("Ventas 12m", fmt_money(opt["ventas"].sum()))
-        c[2].metric("Km/semana", f"{km['km_ruta'].sum():.0f}")
-        cambian_dia = int((opt["dia"] != opt["dia_actual"]).sum())
-        c[3].metric("Cambian de día", f"{cambian_dia:,}")
+        c[0].metric("Clientes", f"{len(reb):,}")
+        c[1].metric("Carga total (visitas/mes)", f"{reb['carga'].sum():.0f}")
+        c[2].metric("Km/semana", f"{res['km_ruta'].sum():.0f}")
+        c[3].metric("Cambian de día", f"{int((reb['dia'] != reb['dia_actual']).sum()):,}")
+
+        st.markdown("#### ⚖️ Carga por día (propuesta)")
+        desv = res["carga_visitas_mes"].std()
+        st.caption(
+            f"Objetivo por día: **{reb['carga'].sum() / 5:.1f}** visitas/mes · "
+            f"desviación lograda: **{desv:.2f}**"
+        )
+        st.dataframe(
+            res, use_container_width=True, hide_index=True,
+            column_config={
+                "dia": "Día", "n_clientes": "# Clientes",
+                "carga_visitas_mes": st.column_config.NumberColumn("Carga (visitas/mes)", format="%.1f"),
+                "ventas": st.column_config.NumberColumn("Ventas 12m", format="localized"),
+                "km_ruta": st.column_config.NumberColumn("Km", format="%.1f"),
+            },
+        )
 
         st.plotly_chart(
             px.scatter_mapbox(
-                opt, lat="lat", lon="lon", color="dia",
-                category_orders={"dia": DIAS}, hover_name="cliente",
+                reb, lat="lat", lon="lon", color="dia",
+                category_orders={"dia": DIAS}, hover_name="name",
                 hover_data={"secuencia": True, "frecuencia": True,
-                            "ventas": ":,.0f", "dia_actual": True,
-                            "lat": False, "lon": False, "dia": False},
+                            "carga": True, "ventas": ":,.0f",
+                            "dia_actual": True, "lat": False, "lon": False,
+                            "dia": False},
                 zoom=8, height=520,
             ).update_layout(mapbox_style="open-street-map",
                             margin=dict(l=0, r=0, t=0, b=0), legend_title="Día"),
             use_container_width=True,
         )
 
-        st.markdown("#### 📅 Carga por día (propuesta)")
-        st.dataframe(
-            km, use_container_width=True, hide_index=True,
-            column_config={
-                "dia": "Día", "n_clientes": "# Clientes",
-                "ventas": st.column_config.NumberColumn("Ventas 12m", format="localized"),
-                "km_ruta": st.column_config.NumberColumn("Km", format="%.1f"),
-            },
-        )
-
         st.markdown("#### 🔄 Actual vs propuesto")
-        comp = opt[["cliente", "city", "dia_actual", "dia",
-                    "sr_route_sequence", "secuencia", "frecuencia",
-                    "facturas_mes", "ventas"]]
         st.dataframe(
-            comp, use_container_width=True, hide_index=True,
+            reb[["name", "city", "dia_actual", "dia", "sr_route_sequence",
+                 "secuencia", "frecuencia", "carga", "facturas_mes", "ventas"]],
+            use_container_width=True, hide_index=True,
             column_config={
-                "cliente": "Cliente", "city": "Ciudad",
+                "name": "Cliente", "city": "Ciudad",
                 "dia_actual": "Día actual", "dia": "Día propuesto",
-                "sr_route_sequence": "Secuencia actual",
-                "secuencia": "Secuencia propuesta",
-                "frecuencia": "Frecuencia sugerida",
+                "sr_route_sequence": "Sec. actual", "secuencia": "Sec. propuesta",
+                "frecuencia": "Frecuencia", "carga": st.column_config.NumberColumn("Visitas/mes", format="%.1f"),
                 "facturas_mes": st.column_config.NumberColumn("Fact./mes", format="%.2f"),
                 "ventas": st.column_config.NumberColumn("Ventas 12m", format="localized"),
             },
         )
 
-# ── Clientes activos sin GPS ──
+# ── Sin GPS ──
 if not sin_gps.empty:
     st.divider()
-    st.markdown("### 📍 Activos en ruta sin GPS (por geolocalizar)")
-    st.caption("Están marcados como activos en ruta pero no tienen coordenadas, "
-               "así que no entran a la optimización.")
+    st.markdown("### 📍 Activos sin GPS (fuera del plan)")
+    st.caption("Los agregas tú manualmente; no entran a la optimización.")
     cols = [c for c in ["name", "city", "user_name"] if c in sin_gps.columns]
-    st.dataframe(sin_gps[cols].rename(columns={"name": "Cliente", "city": "Ciudad",
-                                               "user_name": "Vendedor"}),
-                 use_container_width=True, hide_index=True)
+    st.dataframe(
+        sin_gps[cols].rename(columns={"name": "Cliente", "city": "Ciudad",
+                                      "user_name": "Vendedor"}),
+        use_container_width=True, hide_index=True,
+    )
 
-# ── Export Excel (para cargar manualmente en Odoo) ──
+# ── Excel ──
 if propuestas:
     st.divider()
     st.markdown("### 📥 Descargar la propuesta")
-    st.caption(
-        "La app **no escribe nada en Odoo**. El Excel trae una hoja por "
-        "vendedor para revisar, una hoja **«Importar Odoo»** con solo las "
-        "columnas necesarias para la importación, y la hoja **«Sin GPS»** con "
-        "los clientes que quedaron fuera del plan."
-    )
-
-    # Hoja de importación: solo lo mínimo, con el ID de base de datos.
     imp_rows = []
-    for nombre, opt in propuestas.items():
-        for _, r in opt.iterrows():
+    for nombre, reb in propuestas.items():
+        for _, r in reb.iterrows():
             imp_rows.append({
                 ".id": int(r["partner_id"]),
                 "sr_route_sequence": int(r["secuencia"]),
                 "sr_route_id/.id": (int(r["route_id_propuesto"])
                                     if pd.notna(r["route_id_propuesto"]) else ""),
                 "sr_visit_frequency": r["frecuencia_code"],
-                "Cliente (referencia)": r["cliente"],
+                "Cliente (referencia)": r["name"],
                 "Vendedor (referencia)": nombre,
+                "Día (referencia)": r["dia"],
             })
-    imp = pd.DataFrame(imp_rows)
 
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
-        for nombre, opt in propuestas.items():
-            base_n = "".join(ch for ch in nombre if ch.isalnum() or ch == " ")[:22].strip()
-            opt[["dia", "secuencia", "cliente", "city", "frecuencia", "semanas",
+        for nombre, reb in propuestas.items():
+            base_n = "".join(ch for ch in nombre if ch.isalnum() or ch == " ")[:20].strip()
+            reb[["dia", "secuencia", "name", "city", "frecuencia", "carga",
                  "ventas", "facturas_mes", "dia_actual", "sr_route_sequence",
                  "lat", "lon"]].rename(
-                columns={"dia": "Día propuesto", "secuencia": "Secuencia propuesta",
-                         "cliente": "Cliente", "city": "Ciudad",
-                         "frecuencia": "Frecuencia sugerida", "semanas": "Semanas",
+                columns={"dia": "Día propuesto", "secuencia": "Secuencia",
+                         "name": "Cliente", "city": "Ciudad",
+                         "frecuencia": "Frecuencia", "carga": "Visitas/mes",
                          "ventas": "Ventas 12m", "facturas_mes": "Fact./mes",
                          "dia_actual": "Día actual",
-                         "sr_route_sequence": "Secuencia actual",
+                         "sr_route_sequence": "Sec. actual",
                          "lat": "Lat", "lon": "Lon"}
             ).to_excel(xw, sheet_name=f"Rutero {base_n}"[:31], index=False)
-        imp.to_excel(xw, sheet_name="Importar Odoo", index=False)
+            ro.resumen_carga(reb).to_excel(
+                xw, sheet_name=f"Carga {base_n}"[:31], index=False)
+        pd.DataFrame(imp_rows).to_excel(xw, sheet_name="Importar Odoo", index=False)
         if not sin_gps.empty:
             sin_gps[[c for c in ["name", "city", "user_name"] if c in sin_gps.columns]] \
                 .rename(columns={"name": "Cliente", "city": "Ciudad",
@@ -291,22 +339,23 @@ if propuestas:
                 .to_excel(xw, sheet_name="Sin GPS", index=False)
 
     st.download_button(
-        "⬇️ Descargar propuesta en Excel", buf.getvalue(),
-        "rutero_propuesta.xlsx",
+        "⬇️ Descargar rebalanceo en Excel", buf.getvalue(),
+        "rutero_rebalanceo.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         type="primary",
     )
 
     with st.expander("ℹ️ Cómo cargarlo en Odoo"):
         st.markdown(
-            "1. Abre la hoja **«Importar Odoo»** y borra las dos columnas de "
-            "referencia (Cliente / Vendedor); son solo para que revises.\n"
+            "1. En la hoja **«Importar Odoo»**, borra las columnas de referencia "
+            "(Cliente / Vendedor / Día); son solo para que revises.\n"
             "2. En Odoo: **Contactos → vista Lista → Favoritos → Importar registros**.\n"
-            "3. Sube el archivo y en el mapeo de columnas asegúrate de que:\n"
-            "   - `.id` → **Database ID** (así actualiza en vez de crear).\n"
+            "3. Mapea las columnas así:\n"
+            "   - `.id` → **Database ID** (actualiza en vez de crear).\n"
             "   - `sr_route_sequence` → *Secuencia en rutero*.\n"
             "   - `sr_route_id/.id` → *Rutero principal* (por Database ID).\n"
             "   - `sr_visit_frequency` → *Frecuencia de visita*.\n"
-            "4. Usa **Probar** antes de **Importar**. Si solo quieres cambiar el "
-            "orden y no el día, borra la columna `sr_route_id/.id`."
+            "4. Usa **Probar** antes de **Importar**.\n\n"
+            "Si solo quieres cambiar el orden y no mover a nadie de día, borra "
+            "la columna `sr_route_id/.id`."
         )
