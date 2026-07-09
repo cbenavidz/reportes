@@ -183,44 +183,6 @@ def frecuencia_config(valor) -> tuple[str, list[int]]:
     return FREQ_LABEL.get(v, "Semanal"), FREQ_SEMANAS.get(v, [1, 2, 3, 4])
 
 
-# ---------------------------------------------------------------------------
-# Escritura en Odoo (secuencia / frecuencia / rutero)
-# ---------------------------------------------------------------------------
-CAMPOS_ESCRIBIBLES = {"sr_route_sequence", "sr_visit_frequency", "sr_route_id"}
-
-
-def escribir_partners(
-    client: OdooClient,
-    updates: list[dict],
-    dry_run: bool = True,
-) -> dict:
-    """
-    Actualiza campos de ruta en res.partner.
-
-    `updates`: [{"id": partner_id, "vals": {"sr_route_sequence": 10, ...}}, ...]
-
-    Por seguridad `dry_run=True` por defecto: NO escribe, solo valida y
-    reporta cuántos registros se tocarían. La página debe pasar
-    `dry_run=False` únicamente tras una confirmación explícita del usuario.
-    """
-    # Validación: solo permitimos campos de ruta conocidos.
-    limpias = []
-    for u in updates or []:
-        vals = {k: v for k, v in (u.get("vals") or {}).items()
-                if k in CAMPOS_ESCRIBIBLES}
-        if vals and u.get("id"):
-            limpias.append({"id": int(u["id"]), "vals": vals})
-
-    if dry_run:
-        return {"dry_run": True, "a_escribir": len(limpias), "ok": 0, "errores": []}
-
-    ok = 0
-    errores: list[tuple[int, str]] = []
-    for u in limpias:
-        try:
-            client.execute_kw("res.partner", "write", [[u["id"]], u["vals"]])
-            ok += 1
-        except Exception as exc:  # noqa: BLE001
-            errores.append((u["id"], str(exc)))
-            logger.warning("No se pudo escribir partner %s: %s", u["id"], exc)
-    return {"dry_run": False, "a_escribir": len(limpias), "ok": ok, "errores": errores}
+# NOTA: este módulo es de SOLO LECTURA por decisión del negocio. Las
+# propuestas de rutero se entregan en Excel para cargarlas manualmente en
+# Odoo; no se escribe en `res.partner` desde aquí.

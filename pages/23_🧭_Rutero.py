@@ -5,8 +5,11 @@ Página: Rutero (sobre los datos reales del módulo `sales_route_mobile`).
 Lee los ruteros reales de Odoo (sr.route) y los clientes activos en ruta con
 GPS, calcula la frecuencia sugerida (ventas + facturas/mes), propone una
 zonificación en 5 días (Lun-Vie, zona de menor venta el lunes) y una secuencia
-optimizada por cercanía. Permite exportar a Excel y —con confirmación
-explícita— escribir la secuencia/día/frecuencia de vuelta en Odoo.
+optimizada por cercanía.
+
+SOLO LECTURA: cada vendedor conserva sus clientes (no se reasignan entre
+vendedores) y la propuesta se entrega en Excel para cargarla manualmente en
+Odoo. Los clientes sin GPS quedan fuera del plan, en una lista aparte.
 """
 from __future__ import annotations
 
@@ -19,7 +22,6 @@ import streamlit as st
 
 from src.auth import logout_button, require_auth
 from src.data_loader import (
-    get_odoo_client,
     load_invoice_lines,
     load_route_partners,
     load_sr_routes,
@@ -163,6 +165,10 @@ for nombre, tab in zip(vendedores, tabs):
             st.info(f"{nombre} no tiene clientes con coordenadas.")
             continue
         opt = opt.rename(columns={"partner_name": "cliente"})
+        # Rutero (sr.route) que corresponde al día propuesto, MISMO vendedor.
+        opt["route_id_propuesto"] = opt["dia"].map(
+            lambda d: ruta_por_dia.get((nombre, d))
+        )
         propuestas[nombre] = opt
 
         km = ro.km_por_dia(opt)
@@ -224,82 +230,71 @@ if not sin_gps.empty:
                                                "user_name": "Vendedor"}),
                  use_container_width=True, hide_index=True)
 
-# ── Export Excel ──
+# ── Export Excel (para cargar manualmente en Odoo) ──
 if propuestas:
     st.divider()
+    st.markdown("### 📥 Descargar la propuesta")
+    st.caption(
+        "La app **no escribe nada en Odoo**. El Excel trae una hoja por "
+        "vendedor para revisar, una hoja **«Importar Odoo»** con solo las "
+        "columnas necesarias para la importación, y la hoja **«Sin GPS»** con "
+        "los clientes que quedaron fuera del plan."
+    )
+
+    # Hoja de importación: solo lo mínimo, con el ID de base de datos.
+    imp_rows = []
+    for nombre, opt in propuestas.items():
+        for _, r in opt.iterrows():
+            imp_rows.append({
+                ".id": int(r["partner_id"]),
+                "sr_route_sequence": int(r["secuencia"]),
+                "sr_route_id/.id": (int(r["route_id_propuesto"])
+                                    if pd.notna(r["route_id_propuesto"]) else ""),
+                "sr_visit_frequency": r["frecuencia_code"],
+                "Cliente (referencia)": r["cliente"],
+                "Vendedor (referencia)": nombre,
+            })
+    imp = pd.DataFrame(imp_rows)
+
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
         for nombre, opt in propuestas.items():
             base_n = "".join(ch for ch in nombre if ch.isalnum() or ch == " ")[:22].strip()
             opt[["dia", "secuencia", "cliente", "city", "frecuencia", "semanas",
-                 "ventas", "facturas_mes", "dia_actual", "lat", "lon"]].rename(
-                columns={"dia": "Día", "secuencia": "Secuencia", "cliente": "Cliente",
-                         "city": "Ciudad", "frecuencia": "Frecuencia",
-                         "semanas": "Semanas", "ventas": "Ventas 12m",
-                         "facturas_mes": "Fact./mes", "dia_actual": "Día actual",
+                 "ventas", "facturas_mes", "dia_actual", "sr_route_sequence",
+                 "lat", "lon"]].rename(
+                columns={"dia": "Día propuesto", "secuencia": "Secuencia propuesta",
+                         "cliente": "Cliente", "city": "Ciudad",
+                         "frecuencia": "Frecuencia sugerida", "semanas": "Semanas",
+                         "ventas": "Ventas 12m", "facturas_mes": "Fact./mes",
+                         "dia_actual": "Día actual",
+                         "sr_route_sequence": "Secuencia actual",
                          "lat": "Lat", "lon": "Lon"}
             ).to_excel(xw, sheet_name=f"Rutero {base_n}"[:31], index=False)
+        imp.to_excel(xw, sheet_name="Importar Odoo", index=False)
         if not sin_gps.empty:
-            sin_gps[[c for c in ["name", "city"] if c in sin_gps.columns]].to_excel(
-                xw, sheet_name="Sin GPS", index=False)
+            sin_gps[[c for c in ["name", "city", "user_name"] if c in sin_gps.columns]] \
+                .rename(columns={"name": "Cliente", "city": "Ciudad",
+                                 "user_name": "Vendedor"}) \
+                .to_excel(xw, sheet_name="Sin GPS", index=False)
+
     st.download_button(
         "⬇️ Descargar propuesta en Excel", buf.getvalue(),
         "rutero_propuesta.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        type="primary",
     )
 
-# ── Escritura en Odoo (con confirmación explícita) ──
-if propuestas:
-    st.divider()
-    with st.expander("⚙️ Aplicar la propuesta en Odoo (escritura)", expanded=False):
-        st.warning(
-            "Esto **modifica datos en tu Odoo**. Revisa la vista previa antes "
-            "de confirmar. Nada se escribe hasta que marques la casilla y "
-            "presiones el botón."
+    with st.expander("ℹ️ Cómo cargarlo en Odoo"):
+        st.markdown(
+            "1. Abre la hoja **«Importar Odoo»** y borra las dos columnas de "
+            "referencia (Cliente / Vendedor); son solo para que revises.\n"
+            "2. En Odoo: **Contactos → vista Lista → Favoritos → Importar registros**.\n"
+            "3. Sube el archivo y en el mapeo de columnas asegúrate de que:\n"
+            "   - `.id` → **Database ID** (así actualiza en vez de crear).\n"
+            "   - `sr_route_sequence` → *Secuencia en rutero*.\n"
+            "   - `sr_route_id/.id` → *Rutero principal* (por Database ID).\n"
+            "   - `sr_visit_frequency` → *Frecuencia de visita*.\n"
+            "4. Usa **Probar** antes de **Importar**. Si solo quieres cambiar el "
+            "orden y no el día, borra la columna `sr_route_id/.id`."
         )
-        c1, c2, c3 = st.columns(3)
-        w_seq = c1.checkbox("Secuencia de visita", value=True)
-        w_dia = c2.checkbox("Día / rutero", value=False)
-        w_freq = c3.checkbox("Frecuencia sugerida", value=False)
-
-        updates: list[dict] = []
-        preview_rows: list[dict] = []
-        for nombre, opt in propuestas.items():
-            for _, r in opt.iterrows():
-                vals: dict = {}
-                if w_seq and int(r["secuencia"]) != int(r.get("sr_route_sequence") or 0):
-                    vals["sr_route_sequence"] = int(r["secuencia"])
-                if w_dia and r["dia"] != r["dia_actual"]:
-                    rid = ruta_por_dia.get((nombre, r["dia"]))
-                    if rid:
-                        vals["sr_route_id"] = rid
-                if w_freq:
-                    vals["sr_visit_frequency"] = r["frecuencia_code"]
-                if vals:
-                    updates.append({"id": int(r["partner_id"]), "vals": vals})
-                    preview_rows.append({
-                        "Vendedor": nombre, "Cliente": r["cliente"],
-                        "Campos": ", ".join(vals.keys()),
-                        "Secuencia": vals.get("sr_route_sequence", "—"),
-                        "Día": r["dia"] if "sr_route_id" in vals else "—",
-                        "Frecuencia": vals.get("sr_visit_frequency", "—"),
-                    })
-
-        if not updates:
-            st.info("No hay cambios para aplicar con las opciones seleccionadas.")
-        else:
-            st.caption(f"Se actualizarían **{len(updates)}** clientes.")
-            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True,
-                         hide_index=True)
-            confirmar = st.checkbox(
-                f"Confirmo que quiero escribir {len(updates)} clientes en Odoo"
-            )
-            if st.button("✍️ Escribir en Odoo", type="primary",
-                         disabled=not confirmar):
-                res = rm.escribir_partners(get_odoo_client(), updates, dry_run=False)
-                if res["ok"]:
-                    st.success(f"✅ {res['ok']} clientes actualizados en Odoo.")
-                    st.cache_data.clear()
-                if res["errores"]:
-                    st.error(f"{len(res['errores'])} errores:")
-                    st.write(res["errores"][:10])
