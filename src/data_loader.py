@@ -958,3 +958,37 @@ def test_connection_summary() -> dict:
         return {"status": "error", "error": str(exc)}
     except Exception as exc:
         return {"status": "error", "error": f"Error inesperado: {exc}"}
+
+
+# ---------------------------------------------------------------------------
+# Loaders del módulo de Ventas en Ruta (sales_route_mobile)
+# ---------------------------------------------------------------------------
+@st.cache_data(ttl=600, show_spinner="Cargando ruteros de Odoo...")
+def load_sr_routes() -> "pd.DataFrame":
+    """Ruteros (sr.route) con vendedor responsable y días de visita."""
+    from .route_module import extract_sr_routes
+    return extract_sr_routes(get_odoo_client())
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando clientes de ruta...")
+def load_route_partners(
+    company_ids: tuple[int, ...] | None = None,
+    solo_activos: bool = False,
+) -> "pd.DataFrame":
+    """Clientes con su configuración de ruta (campos sr_*)."""
+    from .route_module import extract_route_partners
+    return extract_route_partners(
+        get_odoo_client(),
+        company_ids=list(company_ids) if company_ids else None,
+        solo_activos=solo_activos,
+    )
+
+
+@st.cache_data(ttl=600, show_spinner="Cargando visitas de ruta...")
+def load_sr_visits(
+    date_from: str | None = None,
+    date_to: str | None = None,
+) -> "pd.DataFrame":
+    """Visitas reales (sr.visit) del período."""
+    from .route_module import extract_sr_visits
+    return extract_sr_visits(get_odoo_client(), date_from, date_to)

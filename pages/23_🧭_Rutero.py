@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-Página: Rutero de vendedores externos.
+Página: Rutero (sobre los datos reales del módulo `sales_route_mobile`).
 
-Arma un plan de visitas semanal (Lun-Vie) para cada vendedor externo a partir
-de la georreferenciación de sus clientes y su ritmo histórico de compra
-(últimos 12 meses por defecto). Un rutero por vendedor. Los clientes sin
-coordenadas GPS quedan en una lista aparte "por geolocalizar".
+Lee los ruteros reales de Odoo (sr.route) y los clientes activos en ruta con
+GPS, calcula la frecuencia sugerida (ventas + facturas/mes), propone una
+zonificación en 5 días (Lun-Vie, zona de menor venta el lunes) y una secuencia
+optimizada por cercanía. Permite exportar a Excel y —con confirmación
+explícita— escribir la secuencia/día/frecuencia de vuelta en Odoo.
 """
 from __future__ import annotations
 
@@ -17,36 +18,29 @@ import plotly.express as px
 import streamlit as st
 
 from src.auth import logout_button, require_auth
-from src.data_loader import compute_full_analysis, load_invoice_lines
-from src.route_sales import (
-    build_geo_dataframe,
-    compute_visit_frequency,
-    get_partners_for_sellers,
+from src.data_loader import (
+    get_odoo_client,
+    load_invoice_lines,
+    load_route_partners,
+    load_sr_routes,
 )
-from src import rutero_planner as rp
-from src.ui_components import render_company_context, render_sidebar_filters
+from src import route_module as rm
+from src import rutero_optimizer as ro
+from src.rutero_planner import DIAS
+from src.ui_components import render_sidebar_filters
 
 st.set_page_config(page_title="Rutero | Cartera", page_icon="🧭", layout="wide")
 
 require_auth()
 logout_button()
 
-st.title("🧭 Rutero de vendedores externos")
+st.title("🧭 Rutero")
 st.caption(
-    "Plan de visitas semanal (Lun-Vie) por vendedor, según la georreferencia "
-    "de los clientes y su ritmo histórico de compra. El **día** lo define la "
-    "zona geográfica; la **frecuencia** (semanal/quincenal/mensual) sale de la "
-    "cadencia de compra; el **orden** de cada día se optimiza por cercanía. "
-    "Los clientes sin GPS quedan en una lista aparte para geolocalizar."
+    "Sobre los datos reales del módulo **Ventas en Ruta** de Odoo. La "
+    "**frecuencia** se sugiere según las ventas y las facturas por mes de cada "
+    "cliente; el **día** por zona geográfica (la zona de menor venta va el "
+    "lunes, por los festivos); y la **secuencia** se optimiza por cercanía."
 )
-st.info(
-    "🗓️ **Festivos en lunes:** como en Colombia muchos festivos caen en lunes "
-    "(Ley Emiliani), el rutero coloca la **zona de menor venta el lunes**, para "
-    "arriesgar lo mínimo cuando sea festivo. Si un lunes es festivo, reprograma "
-    "esa ruta al día disponible más cercano de la semana."
-)
-
-DEFAULT_SELLERS = ["luis felipe", "felipe", "yarley", "vanessa", "vannesa"]
 
 
 def fmt_money(x) -> str:
@@ -56,257 +50,256 @@ def fmt_money(x) -> str:
         return "$0"
 
 
-# ── Filtros ──
 filters = render_sidebar_filters()
-if filters["company_ids"] is not None and len(filters["company_ids"]) == 0:
-    st.warning("Selecciona al menos una empresa en el sidebar.")
-    st.stop()
 company_ids = filters["company_ids"]
-
 hoy = date.today()
 desde = hoy - timedelta(days=365)
 
-with st.spinner("Cargando clientes y ventas (últimos 12 meses)..."):
-    data = compute_full_analysis(
-        months_back=max(filters["months_back"], 12),
-        rotation_period_days=filters["period_days"],
-        company_ids=company_ids,
-        exclude_cash_sales=filters["exclude_cash_sales"],
-        analysis_window_days=filters.get("analysis_window_days"),
+# ── Carga ──
+routes = load_sr_routes()
+if routes is None or routes.empty:
+    st.error(
+        "No se pudieron leer los ruteros (`sr.route`). Verifica que el usuario "
+        "de API tenga permiso de lectura sobre el módulo de Ventas en Ruta."
     )
-    partners_all = data.get("raw_partners")
-    invoices_all = data.get("raw_invoices")
-    lines_all = load_invoice_lines(
-        company_ids=tuple(company_ids) if company_ids else None,
-        date_from=desde.isoformat(), date_to=hoy.isoformat(),
-    )
-
-render_company_context(data.get("companies"), company_ids)
-
-if partners_all is None or partners_all.empty:
-    st.error("No se pudieron cargar los clientes.")
     st.stop()
 
-# ── Detectar vendedores ──
-seller_df = pd.DataFrame()
-if (
-    invoices_all is not None and not invoices_all.empty
-    and "invoice_user_id" in invoices_all.columns
-    and "invoice_user_id_name" in invoices_all.columns
-):
-    seller_df = (
-        invoices_all[["invoice_user_id", "invoice_user_id_name"]]
-        .dropna(subset=["invoice_user_id"]).drop_duplicates("invoice_user_id")
-        .rename(columns={"invoice_user_id": "user_id",
-                         "invoice_user_id_name": "user_name"})
-    )
-if seller_df.empty and "user_id" in partners_all.columns:
-    seller_df = (
-        partners_all[["user_id", "user_name"]]
-        .dropna(subset=["user_id"]).drop_duplicates("user_id")
-    )
-if seller_df.empty:
-    st.error("No se detectaron vendedores en facturas ni en clientes.")
-    st.stop()
-seller_df["user_id"] = seller_df["user_id"].astype(int)
-seller_df = seller_df.sort_values("user_name").reset_index(drop=True)
-
-opciones = seller_df["user_name"].astype(str).tolist()
-default_sel = [n for n in opciones if any(d in n.lower() for d in DEFAULT_SELLERS)]
-seleccion = st.multiselect(
-    "Vendedores para el rutero",
-    options=opciones,
-    default=default_sel if default_sel else opciones[:2],
-    help="Por defecto: Luis Felipe y Yarley Vanessa. Se arma un rutero por cada uno.",
+partners = load_route_partners(
+    company_ids=tuple(company_ids) if company_ids else None,
 )
-if not seleccion:
-    st.warning("Selecciona al menos un vendedor.")
+lines = load_invoice_lines(
+    company_ids=tuple(company_ids) if company_ids else None,
+    date_from=desde.isoformat(), date_to=hoy.isoformat(),
+)
+
+# Día único por rutero (cada sr.route tiene un solo día activo)
+def _dia_de_ruta(r) -> str:
+    for c in rm.DAY_COLS:
+        if r.get(c):
+            return rm.DAY_LABELS[c[4:]]
+    return "—"
+
+
+routes = routes.copy()
+routes["dia"] = routes.apply(_dia_de_ruta, axis=1)
+# (vendedor, día) -> route_id, para poder reasignar el rutero al escribir
+ruta_por_dia = {
+    (str(r["user_name"]), str(r["dia"])): int(r["id"])
+    for _, r in routes.iterrows()
+}
+dia_de_route_id = dict(zip(routes["id"].astype(int), routes["dia"]))
+vendedor_de_route_id = dict(zip(routes["id"].astype(int), routes["user_name"]))
+
+with st.expander("📋 Ruteros configurados en Odoo", expanded=False):
+    st.dataframe(
+        routes[["name", "user_name", "dia", "partner_count"]],
+        use_container_width=True, hide_index=True,
+        column_config={"name": "Rutero", "user_name": "Vendedor",
+                       "dia": "Día", "partner_count": "# Clientes"},
+    )
+
+# ── Universo de ruta: activos con GPS ──
+p = partners.copy()
+for c in ["sr_active_in_route", "sr_has_geo"]:
+    if c not in p.columns:
+        p[c] = False
+    p[c] = p[c].fillna(False).astype(bool)
+
+activos = p[p["sr_active_in_route"]]
+en_ruta = activos[activos["sr_has_geo"]].copy()
+sin_gps = activos[~activos["sr_has_geo"]].copy()
+
+if en_ruta.empty:
+    st.warning("No hay clientes activos en ruta con GPS válido.")
     st.stop()
 
+# Vendedor y día actual del cliente (desde su rutero)
+en_ruta["route_id_num"] = pd.to_numeric(en_ruta["sr_route_id"], errors="coerce")
+en_ruta["vendedor"] = en_ruta["route_id_num"].map(vendedor_de_route_id)
+en_ruta["dia_actual"] = en_ruta["route_id_num"].map(dia_de_route_id).fillna("—")
+en_ruta["vendedor"] = en_ruta["vendedor"].fillna(en_ruta.get("user_name"))
+en_ruta = en_ruta[en_ruta["vendedor"].notna()]
 
-# ── Cálculo del rutero por vendedor ──
-def rutero_de_vendedor(user_id: int):
-    assigned = get_partners_for_sellers(partners_all, invoices_all, [user_id])
-    if assigned is None or assigned.empty:
-        return None, None, None
+if en_ruta.empty:
+    st.warning("Los clientes activos con GPS no tienen rutero ni vendedor asignado.")
+    st.stop()
 
-    # Líneas emitidas por el vendedor (invoice_user_id) o, si no se detectan,
-    # de sus clientes asignados.
-    moves_v: set[int] = set()
-    if (
-        invoices_all is not None and not invoices_all.empty
-        and "invoice_user_id" in invoices_all.columns
-    ):
-        idv = pd.to_numeric(invoices_all["invoice_user_id"], errors="coerce")
-        moves_v = set(pd.to_numeric(
-            invoices_all.loc[idv == user_id, "id"], errors="coerce"
-        ).dropna().astype(int))
-    if lines_all is not None and not lines_all.empty and moves_v:
-        lines_v = lines_all[
-            pd.to_numeric(lines_all["move_id"], errors="coerce").isin(moves_v)
-        ].copy()
-    elif lines_all is not None and not lines_all.empty:
-        asig_ids = set(assigned["id"].astype(int))
-        lines_v = lines_all[lines_all["partner_id"].isin(asig_ids)].copy()
-    else:
-        lines_v = pd.DataFrame()
+# ── Métricas y frecuencia sugerida (ventas + facturas/mes) ──
+met = ro.metricas_clientes(lines, meses=12)
+sug = ro.sugerir_frecuencias(met)
+en_ruta = en_ruta.merge(sug, left_on="id", right_on="partner_id", how="left")
+en_ruta["ventas"] = en_ruta["ventas"].fillna(0.0)
+en_ruta["n_facturas"] = en_ruta["n_facturas"].fillna(0).astype(int)
+en_ruta["facturas_mes"] = en_ruta["facturas_mes"].fillna(0.0)
+en_ruta["frecuencia_code"] = en_ruta["frecuencia_code"].fillna("on_demand")
+en_ruta["frecuencia"] = en_ruta["frecuencia"].fillna("Bajo demanda")
+en_ruta["semanas"] = en_ruta["semanas"].fillna("1")
+en_ruta["lat"] = pd.to_numeric(en_ruta["partner_latitude"], errors="coerce")
+en_ruta["lon"] = pd.to_numeric(en_ruta["partner_longitude"], errors="coerce")
 
-    geo = build_geo_dataframe(assigned, lines_v, desde, hoy, company_ids)
-    freq = compute_visit_frequency(lines_v, assigned, desde, hoy, company_ids)
-    rutero = rp.build_rutero(geo, freq, dias=5)
+m = st.columns(4)
+m[0].metric("Clientes en ruta (con GPS)", f"{len(en_ruta):,}")
+m[1].metric("Activos sin GPS", f"{len(sin_gps):,}")
+m[2].metric("Vendedores", f"{en_ruta['vendedor'].nunique():,}")
+m[3].metric("Ventas 12m", fmt_money(en_ruta["ventas"].sum()))
 
-    # Clientes activos sin GPS (con ventas > 0 pero sin coordenadas)
-    sin_gps = pd.DataFrame()
-    if lines_v is not None and not lines_v.empty:
-        ventas_pid = (
-            lines_v.groupby("partner_id")["price_subtotal_signed"].sum()
-        )
-        activos = ventas_pid[ventas_pid > 0]
-        con_gps = set(rutero["partner_id"].astype(int)) if not rutero.empty else set()
-        faltan = [int(p) for p in activos.index if int(p) not in con_gps]
-        if faltan:
-            nm = (
-                lines_v.dropna(subset=["partner_name"])
-                .drop_duplicates("partner_id").set_index("partner_id")["partner_name"]
-                .to_dict()
-            )
-            city_map = {}
-            if "city" in assigned.columns:
-                city_map = (
-                    assigned[["id", "city"]].set_index("id")["city"].to_dict()
-                )
-            sin_gps = pd.DataFrame([{
-                "partner_name": nm.get(p, "—"),
-                "city": city_map.get(p, "—") or "—",
-                "ventas_periodo": float(activos.get(p, 0.0)),
-            } for p in faltan]).sort_values("ventas_periodo", ascending=False)
-    return rutero, rp.resumen_por_dia(rutero), sin_gps
+st.divider()
 
+vendedores = sorted(en_ruta["vendedor"].dropna().unique().tolist())
+propuestas: dict[str, pd.DataFrame] = {}
+tabs = st.tabs(vendedores)
 
-# Mapa user_name -> user_id de la selección
-sel_ids = [
-    (n, int(seller_df.loc[seller_df["user_name"] == n, "user_id"].iloc[0]))
-    for n in seleccion
-]
-
-resultados = {}
-tabs = st.tabs([n for n, _ in sel_ids])
-for (nombre, uid), tab in zip(sel_ids, tabs):
+for nombre, tab in zip(vendedores, tabs):
     with tab:
-        rutero, resumen, sin_gps = rutero_de_vendedor(uid)
-        resultados[nombre] = (rutero, sin_gps)
-        if rutero is None or rutero.empty:
-            st.info(
-                f"**{nombre}** no tiene clientes con GPS y ventas en el período. "
-                "Revisa que sus clientes tengan coordenadas en Odoo."
-            )
-            if sin_gps is not None and not sin_gps.empty:
-                st.markdown("#### 📍 Clientes sin GPS (por geolocalizar)")
-                st.dataframe(sin_gps, use_container_width=True, hide_index=True)
-            continue
-
-        m = st.columns(4)
-        m[0].metric("Clientes en ruta", f"{len(rutero):,}")
-        m[1].metric("Sin GPS", f"{0 if sin_gps is None else len(sin_gps):,}")
-        m[2].metric("Ventas 12m (con GPS)", fmt_money(rutero["ventas_periodo"].sum()))
-        m[3].metric("Km totales/semana", f"{resumen['km_ruta'].sum():.0f}")
-
-        # Mapa por día
-        figm = px.scatter_mapbox(
-            rutero, lat="lat", lon="lon", color="dia",
-            category_orders={"dia": rp.DIAS},
-            hover_name="partner_name",
-            hover_data={"orden": True, "frecuencia": True, "semanas": True,
-                        "ventas_periodo": ":,.0f", "city": True,
-                        "lat": False, "lon": False, "dia": False},
-            zoom=8, height=520,
+        sub = en_ruta[en_ruta["vendedor"] == nombre].copy()
+        base = sub[["id", "name", "city", "lat", "lon", "ventas", "n_facturas",
+                    "facturas_mes", "frecuencia_code", "frecuencia", "semanas",
+                    "dia_actual", "sr_route_sequence"]].rename(
+            columns={"id": "partner_id", "name": "cliente"})
+        opt = ro.optimizar_rutero(
+            base.rename(columns={"cliente": "partner_name"}), dias=5,
         )
-        figm.update_layout(mapbox_style="open-street-map",
-                           margin=dict(l=0, r=0, t=0, b=0),
-                           legend_title="Día")
-        st.plotly_chart(figm, use_container_width=True)
+        if opt.empty:
+            st.info(f"{nombre} no tiene clientes con coordenadas.")
+            continue
+        opt = opt.rename(columns={"partner_name": "cliente"})
+        propuestas[nombre] = opt
 
-        # Resumen por día
-        st.markdown("#### 📅 Resumen por día")
+        km = ro.km_por_dia(opt)
+        c = st.columns(4)
+        c[0].metric("Clientes", f"{len(opt):,}")
+        c[1].metric("Ventas 12m", fmt_money(opt["ventas"].sum()))
+        c[2].metric("Km/semana", f"{km['km_ruta'].sum():.0f}")
+        cambian_dia = int((opt["dia"] != opt["dia_actual"]).sum())
+        c[3].metric("Cambian de día", f"{cambian_dia:,}")
+
+        st.plotly_chart(
+            px.scatter_mapbox(
+                opt, lat="lat", lon="lon", color="dia",
+                category_orders={"dia": DIAS}, hover_name="cliente",
+                hover_data={"secuencia": True, "frecuencia": True,
+                            "ventas": ":,.0f", "dia_actual": True,
+                            "lat": False, "lon": False, "dia": False},
+                zoom=8, height=520,
+            ).update_layout(mapbox_style="open-street-map",
+                            margin=dict(l=0, r=0, t=0, b=0), legend_title="Día"),
+            use_container_width=True,
+        )
+
+        st.markdown("#### 📅 Carga por día (propuesta)")
         st.dataframe(
-            resumen, use_container_width=True, hide_index=True,
+            km, use_container_width=True, hide_index=True,
             column_config={
-                "dia": "Día",
-                "n_clientes": "# Clientes",
-                "ventas_periodo": st.column_config.NumberColumn("Ventas 12m", format="localized"),
-                "km_ruta": st.column_config.NumberColumn("Km ruta", format="%.1f"),
+                "dia": "Día", "n_clientes": "# Clientes",
+                "ventas": st.column_config.NumberColumn("Ventas 12m", format="localized"),
+                "km_ruta": st.column_config.NumberColumn("Km", format="%.1f"),
             },
         )
 
-        # Calendario detallado por día
-        st.markdown("#### 🗺️ Rutero detallado")
-        for dia in rp.DIAS:
-            sub = rutero[rutero["dia"] == dia]
-            if sub.empty:
-                continue
-            with st.expander(f"{dia} — {len(sub)} clientes", expanded=(dia == "Lunes")):
-                st.dataframe(
-                    sub[["orden", "partner_name", "city", "frecuencia",
-                         "semanas", "ventas_periodo", "cadencia_dias"]],
-                    use_container_width=True, hide_index=True,
-                    column_config={
-                        "orden": "Orden",
-                        "partner_name": "Cliente",
-                        "city": "Ciudad",
-                        "frecuencia": "Frecuencia",
-                        "semanas": "Semanas del mes",
-                        "ventas_periodo": st.column_config.NumberColumn("Ventas 12m", format="localized"),
-                        "cadencia_dias": st.column_config.NumberColumn("Cadencia (días)", format="%.0f"),
-                    },
-                )
+        st.markdown("#### 🔄 Actual vs propuesto")
+        comp = opt[["cliente", "city", "dia_actual", "dia",
+                    "sr_route_sequence", "secuencia", "frecuencia",
+                    "facturas_mes", "ventas"]]
+        st.dataframe(
+            comp, use_container_width=True, hide_index=True,
+            column_config={
+                "cliente": "Cliente", "city": "Ciudad",
+                "dia_actual": "Día actual", "dia": "Día propuesto",
+                "sr_route_sequence": "Secuencia actual",
+                "secuencia": "Secuencia propuesta",
+                "frecuencia": "Frecuencia sugerida",
+                "facturas_mes": st.column_config.NumberColumn("Fact./mes", format="%.2f"),
+                "ventas": st.column_config.NumberColumn("Ventas 12m", format="localized"),
+            },
+        )
 
-        # Lista sin GPS
-        if sin_gps is not None and not sin_gps.empty:
-            st.markdown("#### 📍 Clientes sin GPS (por geolocalizar)")
-            st.caption(
-                "Tienen ventas pero no coordenadas en Odoo, así que no entran a la "
-                "ruta. Geolocalízalos en Odoo (Contactos → Acción → Geolocalizar) "
-                "y volverán a aparecer, priorizando los de mayor venta."
-            )
-            st.dataframe(
-                sin_gps, use_container_width=True, hide_index=True,
-                column_config={
-                    "partner_name": "Cliente", "city": "Ciudad",
-                    "ventas_periodo": st.column_config.NumberColumn("Ventas 12m", format="localized"),
-                },
-            )
+# ── Clientes activos sin GPS ──
+if not sin_gps.empty:
+    st.divider()
+    st.markdown("### 📍 Activos en ruta sin GPS (por geolocalizar)")
+    st.caption("Están marcados como activos en ruta pero no tienen coordenadas, "
+               "así que no entran a la optimización.")
+    cols = [c for c in ["name", "city", "user_name"] if c in sin_gps.columns]
+    st.dataframe(sin_gps[cols].rename(columns={"name": "Cliente", "city": "Ciudad",
+                                               "user_name": "Vendedor"}),
+                 use_container_width=True, hide_index=True)
 
-
-# ── Export a Excel ──
-def build_excel(resultados: dict) -> bytes:
+# ── Export Excel ──
+if propuestas:
+    st.divider()
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="xlsxwriter") as xw:
-        for nombre, (rutero, sin_gps) in resultados.items():
-            base = "".join(c for c in nombre if c.isalnum() or c == " ")[:22].strip()
-            if rutero is not None and not rutero.empty:
-                out = rutero[[
-                    "dia", "orden", "partner_name", "city", "frecuencia",
-                    "semanas", "ventas_periodo", "cadencia_dias", "lat", "lon",
-                ]].rename(columns={
-                    "dia": "Día", "orden": "Orden", "partner_name": "Cliente",
-                    "city": "Ciudad", "frecuencia": "Frecuencia",
-                    "semanas": "Semanas", "ventas_periodo": "Ventas 12m",
-                    "cadencia_dias": "Cadencia (días)", "lat": "Lat", "lon": "Lon",
-                })
-                out.to_excel(xw, sheet_name=f"Rutero {base}"[:31], index=False)
-            if sin_gps is not None and not sin_gps.empty:
-                sin_gps.rename(columns={
-                    "partner_name": "Cliente", "city": "Ciudad",
-                    "ventas_periodo": "Ventas 12m",
-                }).to_excel(xw, sheet_name=f"SinGPS {base}"[:31], index=False)
-    return buf.getvalue()
-
-
-if resultados:
-    st.divider()
-    xls = build_excel(resultados)
+        for nombre, opt in propuestas.items():
+            base_n = "".join(ch for ch in nombre if ch.isalnum() or ch == " ")[:22].strip()
+            opt[["dia", "secuencia", "cliente", "city", "frecuencia", "semanas",
+                 "ventas", "facturas_mes", "dia_actual", "lat", "lon"]].rename(
+                columns={"dia": "Día", "secuencia": "Secuencia", "cliente": "Cliente",
+                         "city": "Ciudad", "frecuencia": "Frecuencia",
+                         "semanas": "Semanas", "ventas": "Ventas 12m",
+                         "facturas_mes": "Fact./mes", "dia_actual": "Día actual",
+                         "lat": "Lat", "lon": "Lon"}
+            ).to_excel(xw, sheet_name=f"Rutero {base_n}"[:31], index=False)
+        if not sin_gps.empty:
+            sin_gps[[c for c in ["name", "city"] if c in sin_gps.columns]].to_excel(
+                xw, sheet_name="Sin GPS", index=False)
     st.download_button(
-        "⬇️ Descargar rutero en Excel (imprimible)",
-        xls, "rutero_vendedores.xlsx",
+        "⬇️ Descargar propuesta en Excel", buf.getvalue(),
+        "rutero_propuesta.xlsx",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
+
+# ── Escritura en Odoo (con confirmación explícita) ──
+if propuestas:
+    st.divider()
+    with st.expander("⚙️ Aplicar la propuesta en Odoo (escritura)", expanded=False):
+        st.warning(
+            "Esto **modifica datos en tu Odoo**. Revisa la vista previa antes "
+            "de confirmar. Nada se escribe hasta que marques la casilla y "
+            "presiones el botón."
+        )
+        c1, c2, c3 = st.columns(3)
+        w_seq = c1.checkbox("Secuencia de visita", value=True)
+        w_dia = c2.checkbox("Día / rutero", value=False)
+        w_freq = c3.checkbox("Frecuencia sugerida", value=False)
+
+        updates: list[dict] = []
+        preview_rows: list[dict] = []
+        for nombre, opt in propuestas.items():
+            for _, r in opt.iterrows():
+                vals: dict = {}
+                if w_seq and int(r["secuencia"]) != int(r.get("sr_route_sequence") or 0):
+                    vals["sr_route_sequence"] = int(r["secuencia"])
+                if w_dia and r["dia"] != r["dia_actual"]:
+                    rid = ruta_por_dia.get((nombre, r["dia"]))
+                    if rid:
+                        vals["sr_route_id"] = rid
+                if w_freq:
+                    vals["sr_visit_frequency"] = r["frecuencia_code"]
+                if vals:
+                    updates.append({"id": int(r["partner_id"]), "vals": vals})
+                    preview_rows.append({
+                        "Vendedor": nombre, "Cliente": r["cliente"],
+                        "Campos": ", ".join(vals.keys()),
+                        "Secuencia": vals.get("sr_route_sequence", "—"),
+                        "Día": r["dia"] if "sr_route_id" in vals else "—",
+                        "Frecuencia": vals.get("sr_visit_frequency", "—"),
+                    })
+
+        if not updates:
+            st.info("No hay cambios para aplicar con las opciones seleccionadas.")
+        else:
+            st.caption(f"Se actualizarían **{len(updates)}** clientes.")
+            st.dataframe(pd.DataFrame(preview_rows), use_container_width=True,
+                         hide_index=True)
+            confirmar = st.checkbox(
+                f"Confirmo que quiero escribir {len(updates)} clientes en Odoo"
+            )
+            if st.button("✍️ Escribir en Odoo", type="primary",
+                         disabled=not confirmar):
+                res = rm.escribir_partners(get_odoo_client(), updates, dry_run=False)
+                if res["ok"]:
+                    st.success(f"✅ {res['ok']} clientes actualizados en Odoo.")
+                    st.cache_data.clear()
+                if res["errores"]:
+                    st.error(f"{len(res['errores'])} errores:")
+                    st.write(res["errores"][:10])
