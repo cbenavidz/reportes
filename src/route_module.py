@@ -103,11 +103,11 @@ def extract_route_partners(
     usa `solo_activos=True` y NO pases `company_ids`.
     """
     fields = [
-        "id", "name", "city", "state_id", "user_id",
+        "id", "name", "city", "state_id", "user_id", "phone",
         "partner_latitude", "partner_longitude",
         "sr_has_geo", "sr_geo_accuracy", "sr_geo_source",
         "sr_visit_frequency", "sr_active_in_route",
-        "sr_route_id", "sr_route_sequence", "sr_use_own_days",
+        "sr_route_id", "sr_route_ids", "sr_route_sequence", "sr_use_own_days",
         *SR_DAY_COLS,
     ]
     domain = [("customer_rank", ">", 0)]

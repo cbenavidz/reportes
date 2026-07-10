@@ -489,12 +489,79 @@ def rebalancear(
     return df.sort_values(["_d", "secuencia"]).drop(columns=["_d"]).reset_index(drop=True)
 
 
-def resumen_carga(rutero: pd.DataFrame) -> pd.DataFrame:
-    """Por día: clientes, carga (visitas/mes), ventas y km de recorrido."""
+def asignar_a_ruteros(
+    nuevos: pd.DataFrame,
+    rutas: pd.DataFrame,
+    factor_cercania: float = 1.5,
+) -> pd.DataFrame:
+    """
+    Asigna clientes NUEVOS a ruteros existentes, combinando cercanía y carga.
+
+    `nuevos`: df con al menos lat, lon (y opcional `carga`).
+    `rutas` : df con route_id, route_name, lat_c, lon_c, carga_actual.
+
+    Para cada cliente: entre las rutas cuyo centroide está a <=
+    `factor_cercania` × la distancia mínima, elige la de MENOR carga acumulada.
+    Devuelve `nuevos` con route_id_sugerido, route_name_sugerido, dist_km.
+    """
+    out = nuevos.copy()
+    if out.empty or rutas is None or rutas.empty:
+        out["route_id_sugerido"] = None
+        out["route_name_sugerido"] = None
+        out["dist_km"] = np.nan
+        return out
+
+    cargas = {int(r["route_id"]): float(r.get("carga_actual", 0) or 0)
+              for _, r in rutas.iterrows()}
+    rid_name = {int(r["route_id"]): r["route_name"] for _, r in rutas.iterrows()}
+    rlat = {int(r["route_id"]): float(r["lat_c"]) for _, r in rutas.iterrows()}
+    rlon = {int(r["route_id"]): float(r["lon_c"]) for _, r in rutas.iterrows()}
+    ids = list(cargas.keys())
+
+    sug_id, sug_name, sug_dist = [], [], []
+    # Orden estable: primero los de mayor carga propia (para colocarlos donde
+    # aún hay espacio), luego el resto.
+    orden = out.assign(_c=out.get("carga", 1.0)).sort_values(
+        "_c", ascending=False).index
+    asign_por_idx: dict = {}
+    for i in orden:
+        r = out.loc[i]
+        dists = {rid: haversine(float(r["lat"]), float(r["lon"]),
+                                rlat[rid], rlon[rid]) for rid in ids}
+        dmin = min(dists.values())
+        candidatos = [rid for rid in ids
+                      if dists[rid] <= max(dmin * factor_cercania, dmin + 0.5)]
+        elegido = min(candidatos, key=lambda rid: (cargas[rid], dists[rid]))
+        cargas[elegido] += float(r.get("carga", 1.0) or 1.0)
+        asign_por_idx[i] = (elegido, dists[elegido])
+
+    for i in out.index:
+        rid, d = asign_por_idx.get(i, (None, np.nan))
+        sug_id.append(rid)
+        sug_name.append(rid_name.get(rid) if rid else None)
+        sug_dist.append(round(d, 1) if rid else np.nan)
+    out["route_id_sugerido"] = sug_id
+    out["route_name_sugerido"] = sug_name
+    out["dist_km"] = sug_dist
+    return out
+
+
+def resumen_carga(
+    rutero: pd.DataFrame,
+    min_por_visita: float = 20.0,
+    vel_kmh: float = 40.0,
+) -> pd.DataFrame:
+    """
+    Por día: clientes, carga (visitas/mes), ventas, km y tiempo estimado.
+
+    El tiempo es el que realmente limita a un vendedor puerta a puerta:
+        horas = (n_clientes × min_por_visita + km ÷ vel_kmh × 60) ÷ 60
+    """
+    cols = ["dia", "n_clientes", "carga_visitas_mes", "ventas", "km_ruta",
+            "horas_estimadas"]
     filas = []
     if rutero is None or rutero.empty:
-        return pd.DataFrame(columns=["dia", "n_clientes", "carga_visitas_mes",
-                                     "ventas", "km_ruta"])
+        return pd.DataFrame(columns=cols)
     for dia in DIAS:
         sub = rutero[rutero["dia"] == dia].sort_values("secuencia")
         if sub.empty:
@@ -503,14 +570,17 @@ def resumen_carga(rutero: pd.DataFrame) -> pd.DataFrame:
         lon = sub["lon"].to_numpy(dtype=float)
         km = sum(haversine(lat[i - 1], lon[i - 1], lat[i], lon[i])
                  for i in range(1, len(sub)))
+        n = int(len(sub))
+        minutos = n * float(min_por_visita) + (km / max(vel_kmh, 1.0)) * 60.0
         filas.append({
             "dia": dia,
-            "n_clientes": int(len(sub)),
+            "n_clientes": n,
             "carga_visitas_mes": round(float(sub["carga"].sum()), 1),
             "ventas": float(sub["ventas"].sum()) if "ventas" in sub.columns else 0.0,
             "km_ruta": round(km, 1),
+            "horas_estimadas": round(minutos / 60.0, 1),
         })
-    return pd.DataFrame(filas)
+    return pd.DataFrame(filas, columns=cols)
 
 
 def km_por_dia(rutero: pd.DataFrame) -> pd.DataFrame:
