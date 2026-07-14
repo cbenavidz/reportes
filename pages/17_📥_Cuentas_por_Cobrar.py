@@ -24,6 +24,7 @@ import streamlit as st
 
 from src.auth import logout_button, require_auth
 from src.data_loader import (
+    compute_full_analysis,
     load_companies,
     load_invoice_lines,
     load_receivables,
@@ -39,7 +40,11 @@ from src.receivables_analyzer import (
     compute_top_clientes,
     enrich_receivables,
 )
-from src.ui_components import render_company_context, render_sidebar_filters
+from src.ui_components import (
+    render_company_context,
+    render_sidebar_filters,
+    render_sidebar_vendedor_filter,
+)
 
 
 st.set_page_config(
@@ -53,8 +58,10 @@ logout_button()
 
 st.title("📥 Cuentas por Cobrar")
 st.caption(
-    "Vista operativa de la cartera: qué cobrar y cuándo, clientes en mora, "
-    "calendario de cobros, proyección de ingresos y rotación de cartera."
+    "Vista única de la cartera: aging, facturas abiertas, clientes en mora, "
+    "calendario de cobros, proyección de ingresos y rotación/DSO. "
+    "Respeta los filtros de cartera del sidebar (empresa, ventas de contado, "
+    "ventana de análisis) y permite filtrar **por vendedor**."
 )
 
 # Sidebar
@@ -100,11 +107,65 @@ with st.spinner("Cargando facturas de cliente..."):
         tuple(filters["company_ids"]) if filters["company_ids"] else None
     )
     receivables = load_receivables(company_ids=company_ids)
+    # Pipeline de cartera: define QUÉ facturas cuentan (respeta «excluir
+    # ventas de contado» y la ventana de análisis) y trae los clientes con su
+    # vendedor asignado. Sin esto, el aging de esta página no coincidiría con
+    # el resto del tablero.
+    analysis = compute_full_analysis(
+        months_back=filters["months_back"],
+        rotation_period_days=filters["period_days"],
+        company_ids=filters["company_ids"],
+        exclude_cash_sales=filters["exclude_cash_sales"],
+        analysis_window_days=filters.get("analysis_window_days"),
+    )
 
 if receivables is None or receivables.empty:
     st.success(
         "🎉 No hay facturas de cliente pendientes de cobro. "
         "Toda la cartera está al día."
+    )
+    st.stop()
+
+# ── Alinear con el pipeline de cartera ──
+open_inv = analysis.get("open_invoices")
+if open_inv is not None and not open_inv.empty and "id" in open_inv.columns:
+    ids_cartera = set(pd.to_numeric(open_inv["id"], errors="coerce")
+                      .dropna().astype(int))
+    antes = len(receivables)
+    receivables = receivables[
+        pd.to_numeric(receivables["id"], errors="coerce").isin(ids_cartera)
+    ].copy()
+    excluidas = antes - len(receivables)
+    if excluidas > 0:
+        st.caption(
+            f"ℹ️ {excluidas} facturas quedaron fuera por los filtros de cartera "
+            "del sidebar (ventas de contado / ventana de análisis). Así el "
+            "aging coincide con el resto del tablero."
+        )
+
+# ── Filtro por vendedor ──
+partners_df = analysis.get("raw_partners")
+vendedor_user_ids = render_sidebar_vendedor_filter(partners_df)
+if vendedor_user_ids and partners_df is not None and not partners_df.empty \
+        and "user_id" in partners_df.columns:
+    keep = set(
+        partners_df.loc[partners_df["user_id"].isin(list(vendedor_user_ids)), "id"]
+        .dropna().astype(int).tolist()
+    )
+    receivables = receivables[
+        pd.to_numeric(receivables["partner_id"], errors="coerce").isin(keep)
+    ].copy()
+    names = (
+        partners_df.loc[partners_df["user_id"].isin(list(vendedor_user_ids)),
+                        "user_name"].dropna().unique().tolist()
+    )
+    if names:
+        st.info(f"👤 Filtrando por vendedor(es): **{', '.join(names)}**")
+
+if receivables.empty:
+    st.warning(
+        "No hay facturas por cobrar con los filtros seleccionados "
+        "(empresa, vendedor o filtros de cartera)."
     )
     st.stop()
 
