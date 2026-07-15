@@ -5,15 +5,17 @@ Página: Rutero — rebalanceo sobre los datos reales de `sales_route_mobile`.
 Universo: los clientes ACTIVOS EN RUTA en la app móvil (`sr_active_in_route`).
 
   - Cada vendedor CONSERVA sus clientes (no se reasignan entre vendedores).
-  - Los clientes activos sin rutero ("huérfanos") se asignan al vendedor cuyo
-    territorio les quede más cerca.
   - Los 5 días de cada vendedor se rebalancean por CARGA DE VISITAS/MES
     (derivada de las facturas por mes y las ventas), manteniendo compactas las
     zonas geográficas.
   - La secuencia de cada día se optimiza por vecino más cercano.
+  - Se estima el TIEMPO por día (visitas + desplazamiento), que es lo que de
+    verdad limita a un vendedor puerta a puerta.
 
-SOLO LECTURA: la propuesta se entrega en Excel para cargarla manualmente en
-Odoo. Los clientes sin GPS quedan fuera del plan, en una lista aparte.
+Quedan FUERA del plan, en listas aparte, los clientes sin GPS y los que no
+tienen vendedor asignado (a estos últimos se les sugiere uno por ciudad).
+
+SOLO LECTURA: la propuesta se entrega en Excel para cargarla manualmente.
 """
 from __future__ import annotations
 
@@ -142,18 +144,13 @@ en_ruta["dia_actual"] = en_ruta["route_id_num"].map(dia_de_route_id).fillna("—
 _fb = en_ruta["user_name"].where(en_ruta["user_name"].astype(str).isin(vend_validos))
 en_ruta["vendedor"] = en_ruta["vendedor"].fillna(_fb)
 
+# Los clientes SIN vendedor quedan FUERA del plan (los asignas tú en Odoo).
+# Igual les calculamos un vendedor SUGERIDO por ciudad, como ayuda.
 con_vend = en_ruta[en_ruta["vendedor"].notna()].copy()
-huerfanos = en_ruta[en_ruta["vendedor"].isna()].copy()
-n_huerfanos = len(huerfanos)
-huerf_detalle = pd.DataFrame()
+sin_vendedor = en_ruta[en_ruta["vendedor"].isna()].copy()
+n_sin_vend = len(sin_vendedor)
 
-if n_huerfanos:
-    st.markdown("#### 🏙️ Reparto de clientes sin rutero")
-    st.caption(
-        f"Hay **{n_huerfanos}** clientes activos sin rutero. Se asignan por "
-        "**ciudad**; los que no tienen ciudad registrada se resuelven por "
-        "cercanía GPS a esas cabeceras."
-    )
+if n_sin_vend:
     opciones = sorted(vend_validos)
 
     def _default(patrones: list[str]) -> int:
@@ -162,54 +159,43 @@ if n_huerfanos:
                 return i
         return 0
 
-    ca, cb = st.columns(2)
-    with ca:
-        v_quibdo = st.selectbox("Quibdó y alrededores →", opciones,
-                                index=_default(["vanessa", "yarley"]))
-    with cb:
-        v_istmina = st.selectbox("Istmina y alrededores →", opciones,
-                                 index=_default(["felipe"]))
-
     anclas = [
         {"ciudad": "Quibdó", "lat": ro.CIUDAD_COORDS["QUIBDO"][0],
-         "lon": ro.CIUDAD_COORDS["QUIBDO"][1], "vendedor": v_quibdo},
+         "lon": ro.CIUDAD_COORDS["QUIBDO"][1],
+         "vendedor": opciones[_default(["vanessa", "yarley"])]},
         {"ciudad": "Istmina", "lat": ro.CIUDAD_COORDS["ISTMINA"][0],
-         "lon": ro.CIUDAD_COORDS["ISTMINA"][1], "vendedor": v_istmina},
+         "lon": ro.CIUDAD_COORDS["ISTMINA"][1],
+         "vendedor": opciones[_default(["felipe"])]},
     ]
-    huerfanos = ro.asignar_huerfanos_por_ciudad(huerfanos, anclas)
-    huerf_detalle = huerfanos[["name", "city", "vendedor", "asignado_por"]].copy()
+    sin_vendedor = ro.asignar_huerfanos_por_ciudad(sin_vendedor, anclas)
+    sin_vendedor = sin_vendedor.rename(columns={"vendedor": "vendedor_sugerido"})
 
-    rep = huerfanos["vendedor"].value_counts()
-    st.write(" · ".join(f"**{v}**: {n} clientes" for v, n in rep.items()))
-    with st.expander("Ver el detalle del reparto y por qué"):
-        st.dataframe(
-            huerf_detalle.rename(columns={
-                "name": "Cliente", "city": "Ciudad",
-                "vendedor": "Vendedor asignado", "asignado_por": "Criterio"}),
-            use_container_width=True, hide_index=True,
-        )
-    en_ruta = pd.concat([con_vend, huerfanos], ignore_index=True)
-else:
-    en_ruta = con_vend
+en_ruta = con_vend
 
 st.divider()
 m = st.columns(5)
 m[0].metric("Activos en ruta", f"{len(activos):,}")
-m[1].metric("En el plan (con GPS)", f"{len(en_ruta):,}")
+m[1].metric("En el plan", f"{len(en_ruta):,}")
 m[2].metric("Sin GPS (fuera)", f"{len(sin_gps):,}")
-m[3].metric("Sin rutero (repartidos)", f"{n_huerfanos:,}")
+m[3].metric("Sin vendedor (fuera)", f"{n_sin_vend:,}")
 m[4].metric("Ventas 12m", fmt_money(en_ruta["ventas"].sum()))
 
 st.divider()
-tol = st.slider(
-    "Prioridad del rebalanceo", 0.05, 0.60, 0.15, step=0.05,
-    help="Bajo = carga muy pareja entre días (pero más kilómetros). "
-         "Alto = rutas más compactas (pero días más desiguales).",
-    format="%.2f",
-)
+s1, s2, s3 = st.columns(3)
+with s1:
+    tol = st.slider(
+        "Prioridad del rebalanceo", 0.05, 0.60, 0.15, step=0.05, format="%.2f",
+        help="Bajo = carga muy pareja entre días (pero más kilómetros). "
+             "Alto = rutas más compactas (pero días más desiguales).",
+    )
+with s2:
+    min_visita = st.slider("Minutos por visita", 5, 60, 20, step=5)
+with s3:
+    vel_kmh = st.slider("Velocidad promedio (km/h)", 10, 80, 40, step=5)
 st.caption(
-    "⬅️ Más balance de carga · Más compacidad geográfica ➡️ &nbsp;&nbsp; "
-    "Revisa la tabla de carga y los km por día antes de decidir."
+    "El **tiempo estimado** por día = clientes × minutos por visita + "
+    "km ÷ velocidad. Es lo que realmente limita a un vendedor puerta a puerta: "
+    "una ruta urbana densa y una rural dispersa pueden costar lo mismo."
 )
 
 # ── Rebalanceo por vendedor ──
@@ -232,12 +218,14 @@ for nombre, tab in zip(vendedores, tabs):
         )
         propuestas[nombre] = reb
 
-        res = ro.resumen_carga(reb)
-        c = st.columns(4)
+        res = ro.resumen_carga(reb, min_por_visita=float(min_visita),
+                               vel_kmh=float(vel_kmh))
+        c = st.columns(5)
         c[0].metric("Clientes", f"{len(reb):,}")
-        c[1].metric("Carga total (visitas/mes)", f"{reb['carga'].sum():.0f}")
+        c[1].metric("Carga (visitas/mes)", f"{reb['carga'].sum():.0f}")
         c[2].metric("Km/semana", f"{res['km_ruta'].sum():.0f}")
-        c[3].metric("Cambian de día", f"{int((reb['dia'] != reb['dia_actual']).sum()):,}")
+        c[3].metric("Horas/semana", f"{res['horas_estimadas'].sum():.1f}")
+        c[4].metric("Cambian de día", f"{int((reb['dia'] != reb['dia_actual']).sum()):,}")
 
         st.markdown("#### ⚖️ Carga por día (propuesta)")
         desv = res["carga_visitas_mes"].std()
@@ -252,6 +240,7 @@ for nombre, tab in zip(vendedores, tabs):
                 "carga_visitas_mes": st.column_config.NumberColumn("Carga (visitas/mes)", format="%.1f"),
                 "ventas": st.column_config.NumberColumn("Ventas 12m", format="localized"),
                 "km_ruta": st.column_config.NumberColumn("Km", format="%.1f"),
+                "horas_estimadas": st.column_config.NumberColumn("Horas", format="%.1f"),
             },
         )
 
@@ -284,17 +273,42 @@ for nombre, tab in zip(vendedores, tabs):
             },
         )
 
-# ── Sin GPS ──
-if not sin_gps.empty:
-    st.divider()
-    st.markdown("### 📍 Activos sin GPS (fuera del plan)")
-    st.caption("Los agregas tú manualmente; no entran a la optimización.")
-    cols = [c for c in ["name", "city", "user_name"] if c in sin_gps.columns]
-    st.dataframe(
-        sin_gps[cols].rename(columns={"name": "Cliente", "city": "Ciudad",
-                                      "user_name": "Vendedor"}),
-        use_container_width=True, hide_index=True,
-    )
+# ── Fuera del plan ──
+st.divider()
+st.markdown("### 🚧 Clientes fuera del plan")
+st.caption("Los asignas tú manualmente en Odoo; no entran a la optimización.")
+
+f1, f2 = st.tabs([f"Sin vendedor ({n_sin_vend})", f"Sin GPS ({len(sin_gps)})"])
+
+with f1:
+    if n_sin_vend == 0:
+        st.success("Todos los clientes activos tienen vendedor.")
+    else:
+        st.caption(
+            "Activos en ruta pero sin rutero ni comercial asignado. Te dejo un "
+            "**vendedor sugerido** según su ciudad (Quibdó / Istmina), o por "
+            "cercanía GPS si no tienen ciudad, para que te sirva al asignarlos."
+        )
+        cols_sv = [c for c in ["name", "city", "vendedor_sugerido", "asignado_por"]
+                   if c in sin_vendedor.columns]
+        st.dataframe(
+            sin_vendedor[cols_sv].rename(columns={
+                "name": "Cliente", "city": "Ciudad",
+                "vendedor_sugerido": "Vendedor sugerido",
+                "asignado_por": "Criterio"}),
+            use_container_width=True, hide_index=True,
+        )
+
+with f2:
+    if sin_gps.empty:
+        st.success("Todos los clientes activos tienen GPS.")
+    else:
+        cols = [c for c in ["name", "city", "user_name"] if c in sin_gps.columns]
+        st.dataframe(
+            sin_gps[cols].rename(columns={"name": "Cliente", "city": "Ciudad",
+                                          "user_name": "Vendedor"}),
+            use_container_width=True, hide_index=True,
+        )
 
 # ── Excel ──
 if propuestas:
@@ -329,9 +343,16 @@ if propuestas:
                          "sr_route_sequence": "Sec. actual",
                          "lat": "Lat", "lon": "Lon"}
             ).to_excel(xw, sheet_name=f"Rutero {base_n}"[:31], index=False)
-            ro.resumen_carga(reb).to_excel(
+            ro.resumen_carga(reb, float(min_visita), float(vel_kmh)).to_excel(
                 xw, sheet_name=f"Carga {base_n}"[:31], index=False)
         pd.DataFrame(imp_rows).to_excel(xw, sheet_name="Importar Odoo", index=False)
+        if n_sin_vend:
+            sin_vendedor[[c for c in ["name", "city", "vendedor_sugerido",
+                                      "asignado_por"] if c in sin_vendedor.columns]] \
+                .rename(columns={"name": "Cliente", "city": "Ciudad",
+                                 "vendedor_sugerido": "Vendedor sugerido",
+                                 "asignado_por": "Criterio"}) \
+                .to_excel(xw, sheet_name="Sin vendedor", index=False)
         if not sin_gps.empty:
             sin_gps[[c for c in ["name", "city", "user_name"] if c in sin_gps.columns]] \
                 .rename(columns={"name": "Cliente", "city": "Ciudad",
