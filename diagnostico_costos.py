@@ -37,6 +37,11 @@ pd.set_option("display.width", 200)
 
 def main():
     args = sys.argv[1:]
+    cat_filtro = None
+    if "--cat" in args:
+        i = args.index("--cat")
+        cat_filtro = args[i + 1].lower()
+        args = args[:i] + args[i + 2:]
     if len(args) >= 2:
         d_from = date.fromisoformat(args[0])
         d_to = date.fromisoformat(args[1])
@@ -45,7 +50,10 @@ def main():
     else:
         d_from = d_to = date.today()
 
-    print(f"=== Diagnóstico de costos — {d_from} a {d_to} ===\n")
+    print(f"=== Diagnóstico de costos — {d_from} a {d_to} ===")
+    if cat_filtro:
+        print(f"    Filtrando categoría que contenga: '{cat_filtro}'")
+    print()
 
     client = OdooClient.from_env()
     client.authenticate()
@@ -78,7 +86,38 @@ def main():
         print("2) No hay líneas de factura en ese período. Prueba otra fecha.")
         return
 
-    print(f"2) Líneas traídas: {len(df)}\n")
+    if cat_filtro and "product_categ_name" in df.columns:
+        antes = len(df)
+        df = df[df["product_categ_name"].fillna("").str.lower()
+                .str.contains(cat_filtro)]
+        print(f"2) Líneas traídas: {antes} → {len(df)} tras filtrar categoría\n")
+        if df.empty:
+            print("   No hay líneas de esa categoría en el período.")
+            return
+    else:
+        print(f"2) Líneas traídas: {len(df)}\n")
+
+    # 2b) Unidades de medida en juego (clave para el tema de las cajas)
+    if "product_uom_name" in df.columns:
+        print("2b) Unidad de medida de las líneas (product_uom_id):")
+        print(df["product_uom_name"].fillna("(vacía)").value_counts().to_string())
+        if "uom_factor" in df.columns:
+            print("\n    Factor de conversión aplicado (unidades por UoM):")
+            print(df.groupby(df["product_uom_name"].fillna("(vacía)"))["uom_factor"]
+                  .agg(["min", "max"]).to_string())
+            n1 = int((pd.to_numeric(df["uom_factor"], errors="coerce") == 1).sum())
+            print(f"\n    Líneas con factor = 1 (sin caja): {n1} de {len(df)}")
+        print()
+
+    # 2c) Productos con costo cero (inflan el margen)
+    if "product_standard_price" in df.columns:
+        sp = pd.to_numeric(df["product_standard_price"], errors="coerce").fillna(0)
+        cero = df[sp == 0]
+        print(f"2c) Líneas con product_standard_price = 0: {len(cero)} de {len(df)}")
+        if not cero.empty and "product_name" in cero.columns:
+            print("    Productos sin costo configurado:")
+            print(cero["product_name"].value_counts().head(15).to_string())
+        print()
 
     # 3) De dónde salió el costo
     if "cost_source" in df.columns:
@@ -114,15 +153,31 @@ def main():
         print(f"   Líneas con product_standard_price == 0:  {n0sp} de {len(df)}")
     print()
 
-    # 6) Muestra de las primeras líneas
+    # 6) Detalle por línea con el margen implícito (los inflados arriba)
+    d = df.copy()
+    vta = pd.to_numeric(d.get("price_subtotal_signed", 0), errors="coerce").fillna(0)
+    cst = pd.to_numeric(d.get("line_cost", 0), errors="coerce").fillna(0)
+    qty = pd.to_numeric(d.get("quantity", 0), errors="coerce").replace(0, pd.NA)
+    d["margen_%"] = ((vta - cst) / vta.replace(0, pd.NA) * 100).round(1)
+    d["precio_unit"] = (vta / qty).round(0)
+    # Cuántas veces el precio unitario supera al costo unitario del producto:
+    # si sale ~24 o ~36, la cantidad está en CAJAS y el costo en UNIDADES.
+    sp = pd.to_numeric(d.get("product_standard_price", 0), errors="coerce")
+    d["precio/costo"] = (d["precio_unit"] / sp.replace(0, pd.NA)).round(1)
     cols = [c for c in [
         "product_default_code", "product_uom_name", "quantity",
-        "uom_factor", "quantity_base", "product_standard_price",
-        "line_cost", "price_subtotal_signed", "line_margin",
-    ] if c in df.columns]
-    print("6) Muestra (primeras 15 líneas) — revisa que line_cost = "
-          "standard_price × quantity_base:")
-    print(df[cols].head(15).to_string(index=False))
+        "uom_factor", "product_uom_factor", "quantity_base",
+        "product_standard_price", "precio_unit", "precio/costo",
+        "line_cost", "price_subtotal_signed", "margen_%",
+    ] if c in d.columns]
+    print("6) Detalle por línea (ordenado por margen; los inflados arriba):\n")
+    print("   Cómo leerlo:")
+    print("   · uom_factor = 1  → la caja NO está en la unidad de medida.")
+    print("   · precio/costo ≈ 24 o 36 → la cantidad viene en CAJAS pero el")
+    print("     costo es por UNIDAD: ahí está el margen inflado.")
+    print("   · product_standard_price = 0 → producto sin costo en Odoo.\n")
+    print(d.sort_values("margen_%", ascending=False)[cols]
+          .head(20).to_string(index=False))
 
 
 if __name__ == "__main__":

@@ -276,6 +276,107 @@ def _resolve_invoice_line_fields(client: OdooClient) -> tuple[list[str], list[st
     return final, margin_fields
 
 
+# Cache de factores de UoM por base de datos.
+_UOM_FIELDS_CACHE: dict[str, set[str]] = {}
+
+
+def _get_uom_factor_map(client: OdooClient, uom_ids: list[int]) -> dict[int, float]:
+    """
+    Devuelve {uom_id: unidades de referencia por 1 unidad de esa UoM}.
+    P.ej. "Caja * 24" -> 24.0.
+
+    Compatible con distintas versiones de Odoo:
+      - Clásico (<= 17): `factor_inv` (unidades por UoM) o `factor` (inverso).
+      - Nuevo (18/19+):  `relative_factor` + `relative_uom_id` (cadena de
+        UoM relativas que hay que multiplicar hasta la UoM de referencia).
+    Los campos se detectan vía fields_get (cacheado por DB) para no pedir
+    campos inexistentes — pedir un campo inválido tumba TODO el read().
+    """
+    cache_key = client.credentials.db
+    available = _UOM_FIELDS_CACHE.get(cache_key)
+    if available is None:
+        try:
+            available = set(
+                client.fields_get("uom.uom", attributes=["string"]).keys()
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("fields_get(uom.uom) falló: %s", exc)
+            available = set()
+        _UOM_FIELDS_CACHE[cache_key] = available
+
+    fmap: dict[int, float] = {i: 1.0 for i in uom_ids}
+
+    # --- Esquema clásico (<= 17): factor_inv presente ---
+    # factor_inv = unidades de referencia por UoM (Caja*24 -> 24)
+    # factor     = inverso (Caja*24 -> 0.041667)
+    if "factor_inv" in available:
+        fields = ["id", "factor_inv"] + (
+            ["factor"] if "factor" in available else []
+        )
+        for u in client.read("uom.uom", ids=uom_ids, fields=fields):
+            fi = u.get("factor_inv") or 0
+            f = u.get("factor") or 0
+            if fi and float(fi) > 0:
+                fmap[int(u["id"])] = float(fi)
+            elif f and float(f) > 0:
+                fmap[int(u["id"])] = 1.0 / float(f)
+        return fmap
+
+    # --- Esquema nuevo (Odoo 18/19+): relative_factor + relative_uom_id ---
+    if "relative_factor" in available:
+        has_parent = "relative_uom_id" in available
+        fields = ["id", "relative_factor"] + (
+            ["relative_uom_id"] if has_parent else []
+        )
+        recs: dict[int, dict] = {}
+        pending = list(uom_ids)
+        # Traer también las UoM padre de la cadena (máx. 5 niveles).
+        for _ in range(5):
+            missing = [i for i in pending if i not in recs]
+            if not missing:
+                break
+            for u in client.read("uom.uom", ids=missing, fields=fields):
+                recs[int(u["id"])] = u
+            pending = []
+            if has_parent:
+                for u in recs.values():
+                    rel = u.get("relative_uom_id")
+                    pid = rel[0] if isinstance(rel, (list, tuple)) else rel
+                    if pid and int(pid) not in recs:
+                        pending.append(int(pid))
+
+        def _abs_factor(uid: int, depth: int = 0) -> float:
+            u = recs.get(uid)
+            if u is None or depth > 5:
+                return 1.0
+            f = float(u.get("relative_factor") or 1.0)
+            rel = u.get("relative_uom_id")
+            pid = rel[0] if isinstance(rel, (list, tuple)) else rel
+            if pid:
+                return f * _abs_factor(int(pid), depth + 1)
+            return f
+
+        for i in uom_ids:
+            fmap[i] = _abs_factor(i)
+        return fmap
+
+    # --- Esquema nuevo sin relative_factor: `factor` a secas ---
+    # En Odoo nuevo (sin factor_inv), `factor` YA significa unidades de
+    # referencia por UoM (Caja*24 -> 24). NO se invierte.
+    if "factor" in available:
+        for u in client.read("uom.uom", ids=uom_ids, fields=["id", "factor"]):
+            f = u.get("factor") or 0
+            if f and float(f) > 0:
+                fmap[int(u["id"])] = float(f)
+        return fmap
+
+    logger.warning(
+        "uom.uom sin campos de factor conocidos (%s); usando factor 1.0",
+        sorted(available)[:10],
+    )
+    return fmap
+
+
 def _resolve_partner_fields(client: OdooClient) -> list[str]:
     """
     Devuelve la lista de campos de res.partner que están realmente disponibles
@@ -721,19 +822,7 @@ def extract_invoice_lines(
             .dropna().astype(int).unique().tolist()
         )
         if uom_ids:
-            uom_recs = client.read(
-                "uom.uom", ids=uom_ids, fields=["id", "factor", "factor_inv"],
-            )
-            fmap: dict[int, float] = {}
-            for u in uom_recs:
-                fi = u.get("factor_inv") or 0
-                f = u.get("factor") or 0
-                if fi and float(fi) > 0:
-                    fmap[int(u["id"])] = float(fi)          # unidades por UoM
-                elif f and float(f) > 0:
-                    fmap[int(u["id"])] = 1.0 / float(f)
-                else:
-                    fmap[int(u["id"])] = 1.0
+            fmap = _get_uom_factor_map(client, uom_ids)
             df["uom_factor"] = (
                 pd.to_numeric(df["product_uom_id"], errors="coerce")
                 .map(fmap).fillna(1.0)
@@ -780,7 +869,7 @@ def extract_invoice_lines(
                 ids=product_ids,
                 fields=[
                     "id", "categ_id", "default_code", "name", "volume",
-                    "standard_price", "product_tmpl_id",
+                    "standard_price", "product_tmpl_id", "uom_id",
                 ],
                 context=product_context,
             )
@@ -804,7 +893,7 @@ def extract_invoice_lines(
                         ids=missing_ids,
                         fields=[
                             "id", "categ_id", "default_code", "name",
-                            "standard_price",
+                            "standard_price", "uom_id",
                         ],
                         context=product_context,
                     )
@@ -818,6 +907,7 @@ def extract_invoice_lines(
                             "name": t.get("name"),
                             "volume": 0,
                             "standard_price": t.get("standard_price", 0),
+                            "uom_id": t.get("uom_id"),
                         })
                     logger.info(
                         "Resueltos %d productos adicionales vía product.template.",
@@ -831,7 +921,11 @@ def extract_invoice_lines(
             code_map: dict[int, str | None] = {}
             volume_map: dict[int, float] = {}
             cost_map: dict[int, float] = {}
+            prod_uom_map: dict[int, int] = {}
             for p in prod_records:
+                uid, _ = _unpack_m2o(p.get("uom_id"))
+                if uid:
+                    prod_uom_map[int(p["id"])] = int(uid)
                 cid, cname = _unpack_m2o(p.get("categ_id"))
                 cat_map[int(p["id"])] = (cid, cname)
                 code_map[int(p["id"])] = p.get("default_code") or None
@@ -887,6 +981,36 @@ def extract_invoice_lines(
             df["product_volume"] = df["product_id"].map(_vol)
             df["product_standard_price"] = df["product_id"].map(_cost)
 
+            # --- Factor de la UoM PROPIA del producto ---
+            # `standard_price` está expresado en la UoM del producto
+            # (`uom_id`), que NO siempre es la unidad suelta: hay productos
+            # cuya UoM base ya es "Caja * 24" y su costo es POR CAJA. En ese
+            # caso quantity_base (convertida a unidades sueltas) sobrevalora
+            # el costo 24×. La cantidad correcta para costear es:
+            #   qty_costeo = quantity × factor(uom_línea) / factor(uom_producto)
+            prod_uom_factor: dict[int, float] = {}
+            try:
+                own_uom_ids = sorted(set(prod_uom_map.values()))
+                if own_uom_ids:
+                    own_fmap = _get_uom_factor_map(client, own_uom_ids)
+                    prod_uom_factor = {
+                        pid: own_fmap.get(uid, 1.0)
+                        for pid, uid in prod_uom_map.items()
+                    }
+            except Exception as exc_uom:  # noqa: BLE001
+                logger.warning(
+                    "No se pudo leer la UoM propia de los productos: %s",
+                    exc_uom,
+                )
+
+            def _prod_factor(i):
+                if pd.isna(i):
+                    return 1.0
+                return prod_uom_factor.get(int(i), 1.0)
+
+            df["product_uom_factor"] = df["product_id"].map(_prod_factor)
+            df.loc[df["product_uom_factor"] <= 0, "product_uom_factor"] = 1.0
+
             # --- Cálculo de costo y margen ---
             # Prioridad para `line_cost`:
             #   1. `purchase_price` × `quantity` × signo  (Enterprise, histórico)
@@ -913,15 +1037,18 @@ def extract_invoice_lines(
                 )
                 df["cost_source"] = "purchase_price (Enterprise, histórico)"
             else:
-                # Fallback: costo actual del producto. `standard_price` está en
-                # la UoM de referencia, por eso usamos `quantity_base` (cantidad
-                # convertida a unidades base) para respetar el embalaje.
+                # Fallback: costo actual del producto. `standard_price` está
+                # en la UoM PROPIA del producto (uom_id), así que la cantidad
+                # se convierte de la UoM de la línea a la UoM del producto:
+                #   qty_base / product_uom_factor
+                # (si el producto se maneja en unidades sueltas, el divisor
+                # es 1 y equivale al comportamiento anterior).
                 df["line_cost"] = (
                     df["product_standard_price"].fillna(0)
-                    * qty_base
+                    * (qty_base / df["product_uom_factor"])
                     * sign_series
                 )
-                df["cost_source"] = "standard_price × UoM base (actual)"
+                df["cost_source"] = "standard_price × qty en UoM del producto"
 
             if "margin_signed" in df.columns:
                 df["line_margin"] = pd.to_numeric(
@@ -1062,9 +1189,20 @@ def extract_chart_of_accounts(
         except (TypeError, ValueError):
             company_ids_clean = None
 
-    base_domain_with_co = (
-        [("company_id", "in", company_ids_clean)]
-        if company_ids_clean else []
+    # En Odoo <= 17 account.account tiene `company_id`; en 18/19+ es
+    # `company_ids` (M2M multi-compañía). Detectar cuál existe para no
+    # romper el domain (un campo inválido lanza ValueError en el server).
+    co_field = "company_id"
+    try:
+        acc_fields = set(
+            client.fields_get("account.account", attributes=["string"]).keys()
+        )
+        if "company_id" not in acc_fields and "company_ids" in acc_fields:
+            co_field = "company_ids"
+    except Exception:  # noqa: BLE001
+        pass
+    base_domain_with_co: list = (
+        [(co_field, "in", company_ids_clean)] if company_ids_clean else []
     )
 
     # Cada nivel tiene SU PROPIO domain y order (más defensivo)
@@ -1089,7 +1227,7 @@ def extract_chart_of_accounts(
         },
         # Nivel 3: sin tipo, con company
         {
-            "fields": ["id", "code", "name", "company_id"],
+            "fields": ["id", "code", "name", co_field],
             "domain": base_domain_with_co,
             "order": "code asc",
         },

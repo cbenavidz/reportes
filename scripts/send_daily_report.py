@@ -221,7 +221,20 @@ def main():
         fecha = date.fromisoformat(sys.argv[1])
     print(f"=== Informe Diario CDM — {fecha.isoformat()} ===")
     pdf_bytes, empresa, nit = generar_pdf_dia(fecha)
-    enviar_pdf_correo(pdf_bytes, fecha, empresa)
+    if os.environ.get("SMTP_HOST"):
+        enviar_pdf_correo(pdf_bytes, fecha, empresa)
+    else:
+        # Sin SMTP configurado (corrida local): guardar el PDF en outputs/
+        # para poder revisarlo, en vez de reventar con KeyError.
+        out_dir = os.path.join(_ROOT, "outputs")
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(
+            out_dir, f"informe_diario_cdm_{fecha.strftime('%Y%m%d')}.pdf",
+        )
+        with open(out_path, "wb") as fh:
+            fh.write(pdf_bytes)
+        print("⚠ SMTP_HOST no configurado — no se envió correo.")
+        print(f"✓ PDF guardado en: {out_path}")
 
 
 if __name__ == "__main__":
