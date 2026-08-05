@@ -10,6 +10,7 @@ totales cuadran con el resto del tablero. Solo lectura.
 """
 from __future__ import annotations
 
+import importlib.util
 import io
 from datetime import date
 
@@ -146,12 +147,15 @@ if piv.empty:
 es_dinero = metrica in ("Saldo por cobrar", "Saldo vencido", "Total facturado")
 fmt = "{:,.0f}" if es_dinero or metrica.startswith("#") else "{:,.1f}"
 
-st.dataframe(
-    piv.style.format(fmt).background_gradient(
+styled = piv.style.format(fmt)
+# background_gradient necesita matplotlib; si no está instalado (p. ej. en el
+# deploy de Streamlit Cloud), mostramos la tabla sin el degradado de color.
+if importlib.util.find_spec("matplotlib") is not None:
+    styled = styled.background_gradient(
         cmap="Reds" if "vencid" in metrica.lower() else "Blues", axis=None,
-    ),
-    use_container_width=True,
-)
+    )
+
+st.dataframe(styled, use_container_width=True)
 
 # ── Gráfica del cruce ──
 try:
