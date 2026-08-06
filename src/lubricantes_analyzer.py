@@ -64,11 +64,20 @@ def enriquecer(
     else:
         qty = pd.to_numeric(df.get("quantity", 0), errors="coerce").fillna(0)
     vol_unit = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
+    # `product.volume` se expresa por 1 unidad de la UoM PROPIA del producto.
+    # Si la UoM propia ya es el embalaje ("Caja * 24"), el volume es POR CAJA:
+    # hay que dividir quantity_base (unidades sueltas) por product_uom_factor
+    # antes de multiplicar. Mismo ajuste que el costo en el informe diario.
+    if "product_uom_factor" in df.columns:
+        pfac = pd.to_numeric(df["product_uom_factor"], errors="coerce").fillna(1.0)
+        pfac = pfac.where(pfac > 0, 1.0)
+    else:
+        pfac = 1.0
 
     df["ventas"] = pd.to_numeric(
         df.get("price_subtotal_signed", 0), errors="coerce"
     ).fillna(0)
-    df["volumen"] = qty * vol_unit * sign
+    df["volumen"] = (qty / pfac) * vol_unit * sign
     df["cantidad"] = qty * sign
     df["costo"] = pd.to_numeric(df.get("line_cost", 0), errors="coerce").fillna(0)
     df["margen"] = df["ventas"] - df["costo"]

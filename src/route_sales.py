@@ -41,6 +41,34 @@ def _qty_base(df: pd.DataFrame) -> pd.Series:
     return pd.to_numeric(df[col], errors="coerce").fillna(0)
 
 
+def _volumen_linea(df: pd.DataFrame) -> pd.Series:
+    """
+    Volumen físico por línea, con signo del move_type.
+
+    `product.volume` en Odoo se expresa por 1 unidad de la UoM PROPIA del
+    producto (`uom_id`). Hay productos cuya UoM propia ya es el embalaje
+    (p.ej. "Caja * 24"): su `volume` es POR CAJA. Como `quantity_base`
+    está en unidades sueltas, hay que dividir por `product_uom_factor`
+    (unidades por UoM propia) para volver a la UoM del producto antes de
+    multiplicar por el volumen. Es el mismo ajuste que se hizo para el
+    costo (`standard_price`) en el informe diario de ventas.
+
+      volumen = (quantity_base / product_uom_factor) × product.volume × signo
+    """
+    qty = _qty_base(df)
+    if "product_volume" in df.columns:
+        unit_vol = pd.to_numeric(df["product_volume"], errors="coerce").fillna(0)
+    else:
+        unit_vol = 0.0
+    if "product_uom_factor" in df.columns:
+        pf = pd.to_numeric(df["product_uom_factor"], errors="coerce").fillna(1.0)
+        pf = pf.where(pf > 0, 1.0)
+    else:
+        pf = 1.0
+    sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
+    return (qty / pf) * unit_vol * sign
+
+
 def get_partners_for_sellers(
     partners: pd.DataFrame,
     invoices: pd.DataFrame | None,
@@ -130,13 +158,9 @@ def compute_monthly_clients_kpi(
     else:
         df = df.copy()
         df["mes"] = df["_d"].dt.to_period("M")
-        # Volumen físico = quantity × product.volume × signo del move_type.
-        # `product_volume` viene del extractor (campo `volume` de product.product).
-        # Para Casa de los Mineros, esto da el volumen en galones.
-        sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
-        qty = _qty_base(df)
-        unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
-        df["_qty_signed"] = qty * unit_vol * sign
+        # Volumen físico (galones para Casa de los Mineros) respetando
+        # embalajes tipo "Caja x 24" — ver _volumen_linea().
+        df["_qty_signed"] = _volumen_linea(df)
         is_fac = df["move_type"] == "out_invoice"
         # Clientes atendidos por mes: solo aquellos con VENTA NETA > 0 ese mes.
         # Si el cliente facturó y luego devolvió todo (neto = 0), no cuenta.
@@ -217,12 +241,9 @@ def compute_sales_by_city(
 
     df["city"] = df["city"].fillna("Sin ciudad").replace("", "Sin ciudad")
     is_fac = df["move_type"] == "out_invoice"
-    # Volumen físico = quantity × product.volume × signo
-    sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
+    # Volumen físico respetando embalajes ("Caja x 24") — ver _volumen_linea()
     df = df.copy()
-    qty = _qty_base(df)
-    unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
-    df["_qty_signed"] = qty * unit_vol * sign
+    df["_qty_signed"] = _volumen_linea(df)
     grp_cols = ["city"] + (["state_name"] if "state_name" in df.columns else [])
 
     # Clientes únicos por ciudad: solo los con VENTA NETA > 0 en esa ciudad.
@@ -309,12 +330,9 @@ def compute_visit_frequency(
         .sort_values(["partner_id", "_d"])
     )
     ventas_pid = df.groupby("partner_id")["price_subtotal_signed"].sum().to_dict()
-    # Volumen físico = quantity × product.volume × signo
-    sign = df["move_type"].map({"out_invoice": 1, "out_refund": -1}).fillna(1)
+    # Volumen físico respetando embalajes ("Caja x 24") — ver _volumen_linea()
     df = df.copy()
-    qty = _qty_base(df)
-    unit_vol = pd.to_numeric(df.get("product_volume", 0), errors="coerce").fillna(0)
-    df["_qty_signed"] = qty * unit_vol * sign
+    df["_qty_signed"] = _volumen_linea(df)
     volumen_pid = df.groupby("partner_id")["_qty_signed"].sum().to_dict()
     name_pid = (
         df.dropna(subset=["partner_name"])
